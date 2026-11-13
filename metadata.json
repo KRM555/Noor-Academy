@@ -1,0 +1,6 @@
+{
+  "name": "أكاديمية نور وبيان | Noor & Bayan Academy",
+  "description": "أكاديمية تعليمية دافئة وموثوقة لتعليم القرآن الكريم واللغة العربية للأطفال بمناهج نور البيان والتجويد وألعاب تفاعلية.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
