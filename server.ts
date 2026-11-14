@@ -18,11 +18,30 @@ import {
   broadcastRealtimeEvent,
 } from './server/supabaseClient.ts';
 import { AppError, asyncHandler, apiNotFoundHandler, globalErrorHandler } from './server/errorHandler.ts';
+import {
+  getExamVaultConfig,
+  saveExamVaultConfig,
+  getExamSubmission,
+  saveExamSubmission,
+  deleteExamSubmissionRecord,
+  listExamSubmissionsForExam,
+  uploadExamBinaryFile,
+  createExamSignedUrl,
+  removeExamBinaryFile,
+  isExamAvailableYet,
+  isExamPastDeadline,
+  sanitizeExamConfigForViewer,
+  sanitizeSubmissionForViewer,
+  invalidateExamCache,
+  type ExamVaultConfig,
+  type ExamSubmissionRecord,
+  type QuizQuestionConfig,
+} from './server/examVault.ts';
 
 dotenv.config();
 
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-const ALLOW_DEMO_LOGIN = !IS_PRODUCTION && process.env.ALLOW_DEMO_LOGIN !== 'false';
+const ALLOW_DEMO_LOGIN = !IS_PRODUCTION && process.env.ALLOW_DEMO_LOGIN === 'true';
 
 if (IS_PRODUCTION && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 24)) {
   throw new Error('FATAL: SESSION_SECRET environment variable (min 24 chars) is required in production.');
@@ -77,11 +96,32 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
-// Security Headers
+// Security Headers (including environment-aware Content Security Policy)
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  const frameAncestors =
+    IS_PRODUCTION && process.env.ALLOW_IFRAME_EMBED !== 'true'
+      ? "'self'"
+      : "'self' https://aistudio.google.com https://*.google.com";
+  res.setHeader(
+    'Content-Security-Policy',
+    [
+      "default-src 'self'",
+      "script-src 'self' 'unsafe-inline'",
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      "font-src 'self' https://fonts.gstatic.com data:",
+      "img-src 'self' data: blob: https:",
+      "connect-src 'self' https://*.supabase.co wss://*.supabase.co ws: wss:",
+      "worker-src 'self' blob:",
+      "manifest-src 'self'",
+      "object-src 'none'",
+      "base-uri 'self'",
+      "form-action 'self'",
+      `frame-ancestors ${frameAncestors}`,
+    ].join('; ')
+  );
   if (IS_PRODUCTION && (req.secure || req.headers['x-forwarded-proto'] === 'https')) {
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   }
@@ -117,18 +157,34 @@ app.use((req, res, next) => {
 // Lightweight In-Memory Sliding-Window Rate Limiter
 function createRateLimiter(windowMs: number, maxRequests: number) {
   const buckets = new Map<string, number[]>();
+  const MAX_BUCKETS = 5000;
   return (req: Request, res: Response, next: NextFunction) => {
-    const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
     const key = `${req.path}:${ip}`;
     const now = Date.now();
     const recent = (buckets.get(key) || []).filter((ts) => now - ts < windowMs);
     if (recent.length >= maxRequests) {
+      buckets.set(key, recent);
       res.status(429).json({ error: 'Too many requests. Please wait a few minutes and try again.' });
       return;
     }
     recent.push(now);
+    buckets.delete(key);
     buckets.set(key, recent);
-    if (buckets.size > 5000) buckets.clear();
+    if (buckets.size > MAX_BUCKETS) {
+      for (const [bKey, timestamps] of buckets.entries()) {
+        const active = timestamps.filter((ts) => now - ts < windowMs);
+        if (active.length === 0) {
+          buckets.delete(bKey);
+        }
+        if (buckets.size <= MAX_BUCKETS) break;
+      }
+      while (buckets.size > MAX_BUCKETS) {
+        const oldestKey = buckets.keys().next().value;
+        if (oldestKey === undefined) break;
+        buckets.delete(oldestKey);
+      }
+    }
     next();
   };
 }
@@ -136,6 +192,8 @@ function createRateLimiter(windowMs: number, maxRequests: number) {
 const loginLimiter = createRateLimiter(15 * 60 * 1000, 30);
 const publicSubmitLimiter = createRateLimiter(15 * 60 * 1000, 15);
 const verifyLimiter = createRateLimiter(15 * 60 * 1000, 40);
+const guardianVerifyLimiter = createRateLimiter(15 * 60 * 1000, 6);
+const examUploadLimiter = createRateLimiter(15 * 60 * 1000, 25);
 
 function generateTempPassword(): string {
   return `NB-${crypto.randomBytes(6).toString('base64url')}`;
@@ -189,13 +247,89 @@ interface AuthRequest extends Request {
   user?: AuthUser;
 }
 
-function signToken(payload: { id: string; role: string; exp: number }): string {
-  const data = Buffer.from(JSON.stringify(payload)).toString('base64url');
+const SESSION_COOKIE_NAME = 'nb_session';
+const revokedTokens = new Map<string, number>();
+
+function pruneRevokedTokens(now = Date.now()): void {
+  for (const [jti, exp] of revokedTokens.entries()) {
+    if (exp <= now) revokedTokens.delete(jti);
+  }
+  while (revokedTokens.size > 10_000) {
+    const oldest = revokedTokens.keys().next().value;
+    if (oldest === undefined) break;
+    revokedTokens.delete(oldest);
+  }
+}
+
+function revokeTokenJti(jti: string | undefined, exp: number): void {
+  if (!jti) return;
+  pruneRevokedTokens();
+  revokedTokens.set(jti, exp);
+}
+
+function parseCookies(header?: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  if (!header) return result;
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx <= 0) continue;
+    const key = part.slice(0, idx).trim();
+    const val = part.slice(idx + 1).trim();
+    if (key) {
+      try {
+        result[key] = decodeURIComponent(val);
+      } catch {
+        result[key] = val;
+      }
+    }
+  }
+  return result;
+}
+
+function extractRequestToken(req: Request): string | null {
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    const bearer = authHeader.slice(7).trim();
+    if (bearer) return bearer;
+  }
+  const cookies = parseCookies(req.headers.cookie);
+  return cookies[SESSION_COOKIE_NAME] || null;
+}
+
+function setSessionCookie(req: Request, res: Response, token: string): void {
+  const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  const parts = [
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${7 * 24 * 60 * 60}`,
+  ];
+  if (isHttps) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function clearSessionCookie(req: Request, res: Response): void {
+  const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  const parts = [
+    `${SESSION_COOKIE_NAME}=`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    'Max-Age=0',
+  ];
+  if (isHttps) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function signToken(payload: { id: string; role: string; exp: number; jti?: string }): string {
+  const tokenPayload = { ...payload, jti: payload.jti || crypto.randomUUID() };
+  const data = Buffer.from(JSON.stringify(tokenPayload)).toString('base64url');
   const sig = crypto.createHmac('sha256', TOKEN_SECRET).update(data).digest('base64url');
   return `${data}.${sig}`;
 }
 
-function verifyToken(token: string): { id: string; role: string; exp: number } | null {
+function verifyToken(token: string): { id: string; role: string; exp: number; jti?: string } | null {
   try {
     const [data, sig] = token.split('.');
     if (!data || !sig) return null;
@@ -203,9 +337,19 @@ function verifyToken(token: string): { id: string; role: string; exp: number } |
     const a = Buffer.from(sig);
     const b = Buffer.from(expected);
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
-    const parsed = JSON.parse(Buffer.from(data, 'base64url').toString('utf8'));
-    if (!parsed?.id || parsed.exp < Date.now()) return null;
-    return parsed;
+    const parsed = JSON.parse(Buffer.from(data, 'base64url').toString('utf8')) as {
+      id?: string;
+      role?: string;
+      exp?: number;
+      jti?: string;
+    };
+    if (!parsed?.id || !parsed.exp || parsed.exp < Date.now()) return null;
+    if (parsed.jti && revokedTokens.has(parsed.jti)) {
+      const exp = revokedTokens.get(parsed.jti)!;
+      if (exp > Date.now()) return null;
+      revokedTokens.delete(parsed.jti);
+    }
+    return parsed as { id: string; role: string; exp: number; jti?: string };
   } catch {
     return null;
   }
@@ -240,8 +384,7 @@ async function writeAuditLog(
 }
 
 const authenticate = asyncHandler<AuthRequest>(async (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  const token = extractRequestToken(req);
   if (!token) {
     res.status(401).json({ error: 'Authentication required' });
     return;
@@ -545,11 +688,7 @@ app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req,
     insertRowSafe('consents', { email: guardian_email, doc_type: 'privacy', doc_version: '1.0' }),
   ]);
 
-  void broadcastRealtimeEvent('admission:created', {
-    admissionId: inserted.id,
-    student_name,
-    status: 'pending',
-  });
+  void broadcastRealtimeEvent('admission:created', { kind: 'admission' });
 
   res.status(201).json({ id: inserted.id, status: 'pending', syncedToSupabase: true });
 }));
@@ -627,6 +766,7 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
   }
 
   const token = signToken({ id: profile.id, role: profile.role, exp: Date.now() + 1000 * 60 * 60 * 24 * 7 });
+  setSessionCookie(req, res, token);
   res.json({
     token,
     user: {
@@ -637,6 +777,41 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
       preferred_lang: profile.preferred_lang,
     },
   });
+}));
+
+app.post('/api/auth/logout', (req, res) => {
+  const token = extractRequestToken(req);
+  if (token) {
+    const decoded = verifyToken(token);
+    if (decoded?.jti) {
+      revokeTokenJti(decoded.jti, decoded.exp);
+    }
+  }
+  clearSessionCookie(req, res);
+  res.json({ ok: true });
+});
+
+app.get('/api/auth/session', asyncHandler(async (req, res) => {
+  const token = extractRequestToken(req);
+  const decoded = token ? verifyToken(token) : null;
+  if (!decoded) {
+    res.json({ user: null });
+    return;
+  }
+  const sb = requireSupabaseAdmin();
+  const { data: profile, error } = await sb
+    .from('profiles')
+    .select('id, email, full_name, role, is_active, preferred_lang')
+    .eq('id', String(decoded.id))
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (error || !profile || !profile.is_active) {
+    clearSessionCookie(req, res);
+    res.json({ user: null });
+    return;
+  }
+  res.json({ user: profile });
 }));
 
 app.get('/api/auth/me', authenticate, (req: AuthRequest, res) => {
@@ -690,6 +865,128 @@ app.post('/api/auth/forgot-password', loginLimiter, asyncHandler(async (req, res
     ok: true,
     emailSentViaSupabase: result.sent,
     mode: result.sent ? 'supabase_email' : 'admin_assisted',
+  });
+}));
+
+app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(async (req, res) => {
+  const schema = z.object({
+    full_name: z.string().trim().min(2).max(120),
+    email: z.string().trim().email().max(160),
+    password: z.string().min(8).max(128),
+    student_code: z.string().trim().min(4).max(40),
+    phone: z.string().trim().max(32).optional(),
+    relation: z.string().trim().max(40).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: 'Please fill all required fields accurately (password min 8 chars, valid email and student code).',
+    });
+    return;
+  }
+
+  const cleanEmail = parsed.data.email.toLowerCase();
+  const cleanCode = parsed.data.student_code.trim().toUpperCase();
+  const sb = requireSupabaseAdmin();
+
+  const { data: studentRow } = await sb
+    .from('students')
+    .select('id, student_code, full_name_ar, guardian_id, guardians(id, profile_id, full_name, email, phone)')
+    .ilike('student_code', cleanCode)
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (!studentRow) {
+    res.status(404).json({ error: 'Student code not found. Please check the code from your child profile or administration.' });
+    return;
+  }
+
+  const rawGuardian = Array.isArray(studentRow.guardians) ? studentRow.guardians[0] : studentRow.guardians;
+  const guardianRecord = (rawGuardian ?? null) as unknown as {
+    id: number;
+    profile_id: string | null;
+    full_name: string;
+    email: string;
+    phone: string;
+  } | null;
+
+  const registeredGuardianEmail = guardianRecord?.email?.trim().toLowerCase() || '';
+  if (!guardianRecord || !registeredGuardianEmail || registeredGuardianEmail !== cleanEmail) {
+    res.status(403).json({
+      error: 'Email does not match the registered guardian email for this student code. Contact Academy administration to update it.',
+    });
+    return;
+  }
+
+  if (guardianRecord.profile_id) {
+    res.status(409).json({
+      error: 'This student is already linked to a guardian account. Please sign in with that account or contact administration.',
+    });
+    return;
+  }
+
+  const { data: existingProfile } = await sb
+    .from('profiles')
+    .select('id, role')
+    .ilike('email', cleanEmail)
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (existingProfile) {
+    res.status(409).json({
+      error:
+        existingProfile.role === 'guardian'
+          ? 'A guardian account with this email already exists. Please sign in and link additional children from your dashboard.'
+          : 'This email is already registered under another academy account role.',
+    });
+    return;
+  }
+
+  const { user } = await provisionSupabaseAuthUser(cleanEmail, parsed.data.password, parsed.data.full_name, 'guardian');
+  const { error: profErr } = await sb.from('profiles').upsert(
+    {
+      id: user.id,
+      email: cleanEmail,
+      full_name: parsed.data.full_name,
+      role: 'guardian',
+      is_active: true,
+      preferred_lang: 'ar',
+    },
+    { onConflict: 'id' }
+  );
+  if (profErr) {
+    res.status(500).json({ error: profErr.message });
+    return;
+  }
+
+  await sb
+    .from('guardians')
+    .update({
+      profile_id: user.id,
+      full_name: parsed.data.full_name,
+      email: cleanEmail,
+      ...(parsed.data.phone ? { phone: parsed.data.phone } : {}),
+      ...(parsed.data.relation ? { relation: parsed.data.relation } : {}),
+    })
+    .eq('id', guardianRecord.id);
+
+  await writeAuditLog(user.id, parsed.data.full_name, 'REGISTER_GUARDIAN_LINK', 'guardian', guardianRecord.id, {
+    student_id: studentRow.id,
+    student_code: studentRow.student_code,
+  });
+
+  const token = signToken({ id: user.id, role: 'guardian', exp: Date.now() + 1000 * 60 * 60 * 24 * 7 });
+  setSessionCookie(req, res, token);
+  res.status(201).json({
+    token,
+    user: {
+      id: user.id,
+      email: cleanEmail,
+      full_name: parsed.data.full_name,
+      role: 'guardian',
+      preferred_lang: 'ar',
+    },
+    student_code: studentRow.student_code,
   });
 }));
 
@@ -774,6 +1071,7 @@ app.get('/api/student/dashboard', authenticate, requireRole('student'), asyncHan
   const [
     lessonsRes,
     attendanceRes,
+    courseExamsRes,
     examResultsRes,
     recitationsRes,
     evaluationsRes,
@@ -793,6 +1091,14 @@ app.get('/api/student/dashboard', authenticate, requireRole('student'), asyncHan
           .order('start_time', { ascending: true })
       : Promise.resolve({ data: [] }),
     sb.from('attendance').select('*, lessons(title_ar, title_en, lesson_date)').eq('student_id', student.id),
+    courseIds.length
+      ? sb
+          .from('exams')
+          .select('*, courses(title_ar, title_en)')
+          .in('course_id', courseIds)
+          .is('deleted_at', null)
+          .order('exam_date', { ascending: false })
+      : Promise.resolve({ data: [] }),
     sb
       .from('exam_results')
       .select('*, exams!inner(title_ar, title_en, exam_date, max_score, deleted_at, courses(title_ar, title_en))')
@@ -911,12 +1217,49 @@ app.get('/api/student/dashboard', authenticate, requireRole('student'), asyncHan
     };
   });
 
+  const resultByExamId = new Map<number, Record<string, unknown>>();
+  for (const er of examResults) {
+    resultByExamId.set(Number((er as Record<string, unknown>).exam_id), er as Record<string, unknown>);
+  }
+
+  const exams = await Promise.all(
+    (courseExamsRes.data || []).map(async (ex: Record<string, unknown>) => {
+      const c = ex.courses as { title_ar?: string; title_en?: string } | null;
+      const { courses: _c, ...rest } = ex;
+      const eid = Number(rest.id);
+      const [cfg, sub] = await Promise.all([
+        getExamVaultConfig(sb, eid),
+        getExamSubmission(sb, eid, student.id),
+      ]);
+      const resultRow = resultByExamId.get(eid) || null;
+      const hasSubmittedOrGraded = Boolean(sub || resultRow);
+      const canRevealAnswers = Boolean(hasSubmittedOrGraded && cfg.show_answers_after_submit);
+      return {
+        ...rest,
+        id: eid,
+        course_title_ar: c?.title_ar ?? null,
+        course_title_en: c?.title_en ?? null,
+        ...sanitizeExamConfigForViewer(cfg, { isPrivileged: false, canRevealAnswers }),
+        submission: sanitizeSubmissionForViewer(sub),
+        result: resultRow
+          ? {
+              score: resultRow.score,
+              feedback_ar: resultRow.feedback_ar,
+              feedback_en: resultRow.feedback_en,
+              graded_at: resultRow.graded_at,
+            }
+          : null,
+      };
+    })
+  );
+
   res.json({
     student,
     enrollments,
     lessons,
     lessonLinks,
     attendance,
+    exams,
     examResults,
     recitations,
     evaluations,
@@ -1024,6 +1367,7 @@ app.get('/api/guardian/dashboard', authenticate, requireRole('guardian'), asyncH
       enrollments: [],
       attendance: [],
       recitations: [],
+      exams: [],
       examResults: [],
       evaluations: [],
       certificates: [],
@@ -1134,16 +1478,159 @@ app.get('/api/guardian/dashboard', authenticate, requireRole('guardian'), asyncH
     return { ...rest, course_title_ar: c?.title_ar ?? null, course_title_en: c?.title_en ?? null };
   });
 
+  const childCoursePairs = enrollments.map((e: Record<string, unknown>) => ({
+    student_id: Number(e.student_id),
+    course_id: Number(e.course_id),
+  }));
+  const allChildCourseIds = Array.from(new Set(childCoursePairs.map((p) => p.course_id)));
+  const guardianExamsRaw = allChildCourseIds.length
+    ? (
+        await sb
+          .from('exams')
+          .select('*, courses(title_ar, title_en)')
+          .in('course_id', allChildCourseIds)
+          .is('deleted_at', null)
+          .order('exam_date', { ascending: false })
+      ).data || []
+    : [];
+
+  const guardianExamResultMap = new Map<string, Record<string, unknown>>();
+  for (const er of examResults) {
+    const rec = er as Record<string, unknown>;
+    guardianExamResultMap.set(`${Number(rec.exam_id)}:${Number(rec.student_id)}`, rec);
+  }
+
+  const guardianExamConfigs = new Map<number, ExamVaultConfig>();
+  await Promise.all(
+    guardianExamsRaw.map(async (ex: Record<string, unknown>) => {
+      const eid = Number(ex.id);
+      guardianExamConfigs.set(eid, await getExamVaultConfig(sb, eid));
+    })
+  );
+
+  const guardianExams: Array<Record<string, unknown>> = [];
+  await Promise.all(
+    childCoursePairs.map(async ({ student_id, course_id }) => {
+      const matching = guardianExamsRaw.filter((ex: Record<string, unknown>) => Number(ex.course_id) === course_id);
+      for (const ex of matching) {
+        const eid = Number(ex.id);
+        const c = ex.courses as { title_ar?: string; title_en?: string } | null;
+        const cfg = guardianExamConfigs.get(eid)!;
+        const sub = await getExamSubmission(sb, eid, student_id);
+        const resRow = guardianExamResultMap.get(`${eid}:${student_id}`) || null;
+        guardianExams.push({
+          id: eid,
+          student_id,
+          course_id,
+          title_ar: ex.title_ar,
+          title_en: ex.title_en,
+          exam_date: ex.exam_date,
+          max_score: ex.max_score,
+          course_title_ar: c?.title_ar ?? null,
+          course_title_en: c?.title_en ?? null,
+          ...sanitizeExamConfigForViewer(cfg, { isPrivileged: false, canRevealAnswers: false }),
+          submission: sanitizeSubmissionForViewer(sub),
+          result: resRow
+            ? {
+                score: resRow.score,
+                feedback_ar: resRow.feedback_ar,
+                feedback_en: resRow.feedback_en,
+                graded_at: resRow.graded_at,
+              }
+            : null,
+        });
+      }
+    })
+  );
+
   res.json({
     guardian,
     children,
     enrollments,
     attendance,
     recitations,
+    exams: guardianExams,
     examResults,
     evaluations,
     certificates,
   });
+}));
+
+app.post('/api/guardian/link-child', authenticate, requireRole('guardian'), guardianVerifyLimiter, asyncHandler<AuthRequest>(async (req, res) => {
+  const schema = z.object({
+    student_code: z.string().trim().min(4).max(40),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Valid student code is required.' });
+    return;
+  }
+
+  const cleanCode = parsed.data.student_code.trim().toUpperCase();
+  const cleanUserEmail = req.user!.email.trim().toLowerCase();
+  const sb = requireSupabaseAdmin();
+
+  let { data: myGuardian } = await sb
+    .from('guardians')
+    .select('id, email')
+    .eq('profile_id', req.user!.id)
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (!myGuardian) {
+    myGuardian = await insertRowSafe<{ id: number; email: string }>('guardians', {
+      profile_id: req.user!.id,
+      full_name: req.user!.full_name,
+      phone: '',
+      email: cleanUserEmail,
+      relation: 'ولي أمر',
+    });
+  }
+
+  const { data: studentRow } = await sb
+    .from('students')
+    .select('id, student_code, full_name_ar, guardian_id, guardians(id, profile_id, email)')
+    .ilike('student_code', cleanCode)
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (!studentRow) {
+    res.status(404).json({ error: 'Student code not found.' });
+    return;
+  }
+
+  const rawCurrentGuardian = Array.isArray(studentRow.guardians) ? studentRow.guardians[0] : studentRow.guardians;
+  const currentGuardian = (rawCurrentGuardian ?? null) as unknown as {
+    id: number;
+    profile_id: string | null;
+    email: string;
+  } | null;
+  const studentGuardianEmail = currentGuardian?.email?.trim().toLowerCase() || '';
+
+  if (!studentGuardianEmail || studentGuardianEmail !== cleanUserEmail) {
+    res.status(403).json({
+      error: 'Your account email does not match the registered guardian email for this student.',
+    });
+    return;
+  }
+
+  if (currentGuardian?.profile_id && currentGuardian.profile_id !== req.user!.id) {
+    res.status(409).json({
+      error: 'This student is already linked to a different guardian account.',
+    });
+    return;
+  }
+
+  if (studentRow.guardian_id !== myGuardian.id) {
+    await sb.from('students').update({ guardian_id: myGuardian.id }).eq('id', studentRow.id);
+  }
+
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'GUARDIAN_LINK_CHILD', 'student', studentRow.id, {
+    student_code: studentRow.student_code,
+    guardian_id: myGuardian.id,
+  });
+
+  res.json({ ok: true, student_code: studentRow.student_code, full_name_ar: studentRow.full_name_ar });
 }));
 
 // ============================================================================
@@ -1302,36 +1789,62 @@ app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), asyncHan
   });
 
   const lessonIds = lessons.map((l) => l.id);
-  const attendance = lessonIds.length
-    ? ((await sb.from('attendance').select('*, lessons!inner(course_id)').in('lesson_id', lessonIds)).data || []).map((a: Record<string, unknown>) => {
-        const l = a.lessons as { course_id?: number } | null;
-        const { lessons: _l, ...rest } = a;
-        return { ...rest, course_id: l?.course_id ?? null };
-      })
+  const [attendanceRes, lessonLinksRes] = await Promise.all([
+    lessonIds.length
+      ? sb.from('attendance').select('*, lessons!inner(course_id)').in('lesson_id', lessonIds)
+      : Promise.resolve({ data: [] }),
+    lessonIds.length
+      ? sb.from('lesson_links').select('*').in('lesson_id', lessonIds).order('id', { ascending: true })
+      : Promise.resolve({ data: [] }),
+  ]);
+
+  const attendance = (attendanceRes.data || []).map((a: Record<string, unknown>) => {
+    const l = a.lessons as { course_id?: number } | null;
+    const { lessons: _l, ...rest } = a;
+    return { ...rest, course_id: l?.course_id ?? null };
+  });
+  const lessonLinks = lessonLinksRes.data || [];
+
+  const rawExams = examsRes.data || [];
+  const rawExamIds = rawExams.map((ex: Record<string, unknown>) => Number(ex.id));
+  const examResultsRows = rawExamIds.length
+    ? ((await sb.from('exam_results').select('*, exams(course_id, title_ar), students(full_name_ar)').in('exam_id', rawExamIds)).data || [])
     : [];
 
-  const exams = (examsRes.data || []).map((ex: Record<string, unknown>) => {
-    const c = ex.courses as { title_ar?: string; title_en?: string } | null;
-    const { courses: _c, ...rest } = ex;
-    return { ...rest, id: Number(rest.id), course_title_ar: c?.title_ar ?? null, course_title_en: c?.title_en ?? null };
+  const examResults = examResultsRows.map((er: Record<string, unknown>) => {
+    const ex = er.exams as { course_id?: number; title_ar?: string } | null;
+    const s = er.students as { full_name_ar?: string } | null;
+    const { exams: _ex, students: _s, ...rest } = er;
+    return {
+      ...rest,
+      course_id: ex?.course_id ?? null,
+      exam_title_ar: ex?.title_ar ?? null,
+      student_name_ar: s?.full_name_ar ?? null,
+    };
   });
 
-  const examIds = exams.map((ex) => ex.id);
-  const examResults = examIds.length
-    ? ((await sb.from('exam_results').select('*, exams(course_id, title_ar), students(full_name_ar)').in('exam_id', examIds)).data || []).map(
-        (er: Record<string, unknown>) => {
-          const ex = er.exams as { course_id?: number; title_ar?: string } | null;
-          const s = er.students as { full_name_ar?: string } | null;
-          const { exams: _ex, students: _s, ...rest } = er;
-          return {
-            ...rest,
-            course_id: ex?.course_id ?? null,
-            exam_title_ar: ex?.title_ar ?? null,
-            student_name_ar: s?.full_name_ar ?? null,
-          };
-        }
-      )
-    : [];
+  const exams = await Promise.all(
+    rawExams.map(async (ex: Record<string, unknown>) => {
+      const c = ex.courses as { title_ar?: string; title_en?: string } | null;
+      const { courses: _c, ...rest } = ex;
+      const eid = Number(rest.id);
+      const [cfg, subs] = await Promise.all([
+        getExamVaultConfig(sb, eid),
+        listExamSubmissionsForExam(sb, eid),
+      ]);
+      const gradedCount = examResultsRows.filter((er: Record<string, unknown>) => Number(er.exam_id) === eid).length;
+      return {
+        ...rest,
+        id: eid,
+        course_title_ar: c?.title_ar ?? null,
+        course_title_en: c?.title_en ?? null,
+        ...sanitizeExamConfigForViewer(cfg, { isPrivileged: true }),
+        submission_count: subs.length,
+        pending_grading_count: subs.filter((s) => s.status === 'submitted_pending').length,
+        graded_count: gradedCount,
+      };
+    })
+  );
 
   const recitations = (recRes.data || []).map((r: Record<string, unknown>) => {
     const s = r.students as { full_name_ar?: string } | null;
@@ -1368,6 +1881,7 @@ app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), asyncHan
     courses,
     students,
     lessons,
+    lessonLinks,
     attendance,
     exams,
     examResults,
@@ -1443,12 +1957,7 @@ app.post('/api/teacher/attendance', authenticate, requireRole('teacher'), asyncH
     });
   }
 
-  void broadcastRealtimeEvent('attendance:updated', {
-    lesson_id: lesson.id,
-    course_id: lesson.course_id,
-    student_id: Number(student_id),
-    status,
-  });
+  void broadcastRealtimeEvent('attendance:updated', { kind: 'attendance' });
 
   res.json({ ok: true });
 }));
@@ -1459,7 +1968,7 @@ app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyn
   const sb = requireSupabaseAdmin();
   const { data: exam } = await sb
     .from('exams')
-    .select('id, course_id')
+    .select('id, course_id, title_ar, title_en, max_score')
     .eq('id', Number(exam_id))
     .is('deleted_at', null)
     .maybeSingle();
@@ -1474,6 +1983,13 @@ app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyn
     return;
   }
 
+  const numericScore = Number(score);
+  const maxScore = Number(exam.max_score || 100);
+  if (!Number.isFinite(numericScore) || numericScore < 0 || numericScore > maxScore) {
+    res.status(400).json({ error: `Score must be between 0 and ${maxScore}` });
+    return;
+  }
+
   const { data: existing } = await sb
     .from('exam_results')
     .select('id')
@@ -1481,34 +1997,52 @@ app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyn
     .eq('student_id', Number(student_id))
     .maybeSingle();
 
+  const gradedAt = new Date().toISOString();
   if (existing) {
     await sb
       .from('exam_results')
       .update({
-        score: Number(score),
+        score: numericScore,
         feedback_ar: feedback_ar || '',
         feedback_en: feedback_en || '',
         graded_by: req.user!.id,
-        graded_at: new Date().toISOString(),
+        graded_at: gradedAt,
       })
       .eq('id', existing.id);
   } else {
     await insertRowSafe('exam_results', {
       exam_id: exam.id,
       student_id: Number(student_id),
-      score: Number(score),
+      score: numericScore,
       feedback_ar: feedback_ar || '',
       feedback_en: feedback_en || '',
       graded_by: req.user!.id,
-      graded_at: new Date().toISOString(),
+      graded_at: gradedAt,
     });
   }
 
-  void broadcastRealtimeEvent('academic:updated', {
-    kind: 'exam_result',
-    exam_id: exam.id,
+  const existingSub = await getExamSubmission(sb, exam.id, Number(student_id));
+  if (existingSub) {
+    await saveExamSubmission(sb, {
+      ...existingSub,
+      status: 'graded',
+      graded_at: gradedAt,
+    });
+  }
+
+  await notifyStudentAndGuardian(
+    sb,
+    Number(student_id),
+    `تم رصد درجة: ${exam.title_ar}`,
+    `Exam Graded: ${exam.title_en}`,
+    `درجتك: ${numericScore} / ${maxScore}`,
+    `Score: ${numericScore} / ${maxScore}`
+  );
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'GRADE_EXAM', 'exam', exam.id, {
     student_id: Number(student_id),
+    score: numericScore,
   });
+  void broadcastRealtimeEvent('academic:updated', { kind: 'exam_result' });
 
   res.json({ ok: true });
 }));
@@ -1538,12 +2072,7 @@ app.post('/api/teacher/recitations', authenticate, requireRole('teacher'), async
     recorded_by: req.user!.id,
   });
 
-  void broadcastRealtimeEvent('academic:updated', {
-    kind: 'recitation',
-    recitation_id: inserted.id,
-    student_id: Number(student_id),
-    course_id: Number(course_id),
-  });
+  void broadcastRealtimeEvent('academic:updated', { kind: 'recitation' });
 
   res.status(201).json({ id: inserted.id });
 }));
@@ -1572,12 +2101,7 @@ app.post('/api/teacher/evaluations', authenticate, requireRole('teacher'), async
     evaluated_by: req.user!.id,
   });
 
-  void broadcastRealtimeEvent('academic:updated', {
-    kind: 'evaluation',
-    evaluation_id: inserted.id,
-    student_id: Number(student_id),
-    course_id: Number(course_id),
-  });
+  void broadcastRealtimeEvent('academic:updated', { kind: 'evaluation' });
 
   res.status(201).json({ id: inserted.id });
 }));
@@ -1626,6 +2150,1208 @@ app.put('/api/teacher/payout-details', authenticate, requireRole('teacher'), asy
 }));
 
 // ============================================================================
+// LESSON LINKS, RECORDINGS & MATERIAL STORAGE (Role-Scoped)
+// ============================================================================
+const LESSON_MATERIALS_BUCKET = 'lesson-materials';
+const STORAGE_PREFIX = `storage://${LESSON_MATERIALS_BUCKET}/`;
+const MAX_MATERIAL_BYTES = 8 * 1024 * 1024;
+const ALLOWED_MATERIAL_EXTENSIONS = new Set([
+  'pdf', 'png', 'jpg', 'jpeg', 'webp', 'doc', 'docx', 'ppt', 'pptx', 'mp3', 'm4a',
+]);
+const DISALLOWED_VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'mkv', 'avi', 'webm', 'wmv', 'flv', 'm4v']);
+
+async function ensureMaterialsBucket(sb: ReturnType<typeof requireSupabaseAdmin>) {
+  const { data: bucket } = await sb.storage.getBucket(LESSON_MATERIALS_BUCKET);
+  if (!bucket) {
+    const { error } = await sb.storage.createBucket(LESSON_MATERIALS_BUCKET, {
+      public: false,
+      fileSizeLimit: MAX_MATERIAL_BYTES,
+    });
+    if (error && !String(error.message || '').toLowerCase().includes('already exists')) {
+      throw new AppError(500, `Storage bucket initialization failed: ${error.message}`);
+    }
+  }
+}
+
+async function assertCanManageLesson(user: AuthUser, lessonId: number) {
+  const sb = requireSupabaseAdmin();
+  const { data: lesson } = await sb
+    .from('lessons')
+    .select('id, course_id, courses!inner(id, teacher_id)')
+    .eq('id', lessonId)
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (!lesson) {
+    throw new AppError(404, 'Lesson not found');
+  }
+
+  if (user.role === 'admin') {
+    return { sb, lesson };
+  }
+
+  if (user.role === 'teacher') {
+    const teacher = await getTeacherByProfile(user.id);
+    const course = lesson.courses as { teacher_id?: number | null } | null;
+    if (teacher && course?.teacher_id === teacher.id) {
+      return { sb, lesson };
+    }
+  }
+
+  throw new AppError(403, 'Forbidden: cannot modify lesson links outside your courses');
+}
+
+async function assertCanAccessLesson(user: AuthUser, lessonId: number) {
+  const sb = requireSupabaseAdmin();
+  const { data: lesson } = await sb
+    .from('lessons')
+    .select('id, course_id, courses!inner(id, teacher_id)')
+    .eq('id', lessonId)
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (!lesson) {
+    throw new AppError(404, 'Lesson not found');
+  }
+
+  if (user.role === 'admin') return { sb, lesson };
+
+  if (user.role === 'teacher') {
+    const teacher = await getTeacherByProfile(user.id);
+    const course = lesson.courses as { teacher_id?: number | null } | null;
+    if (teacher && course?.teacher_id === teacher.id) return { sb, lesson };
+  }
+
+  if (user.role === 'student') {
+    const { data: student } = await sb
+      .from('students')
+      .select('id')
+      .eq('profile_id', user.id)
+      .is('deleted_at', null)
+      .maybeSingle();
+    if (student) {
+      const { data: enroll } = await sb
+        .from('enrollments')
+        .select('id')
+        .eq('student_id', student.id)
+        .eq('course_id', lesson.course_id)
+        .is('deleted_at', null)
+        .maybeSingle();
+      if (enroll) return { sb, lesson };
+    }
+  }
+
+  if (user.role === 'guardian') {
+    const { data: guardian } = await sb
+      .from('guardians')
+      .select('id')
+      .eq('profile_id', user.id)
+      .is('deleted_at', null)
+      .maybeSingle();
+    if (guardian) {
+      const { data: children } = await sb
+        .from('students')
+        .select('id')
+        .eq('guardian_id', guardian.id)
+        .is('deleted_at', null);
+      const childIds = (children || []).map((c: { id: number }) => c.id);
+      if (childIds.length) {
+        const { data: enroll } = await sb
+          .from('enrollments')
+          .select('id')
+          .in('student_id', childIds)
+          .eq('course_id', lesson.course_id)
+          .is('deleted_at', null)
+          .limit(1);
+        if (enroll && enroll.length > 0) return { sb, lesson };
+      }
+    }
+  }
+
+  throw new AppError(403, 'Forbidden: not enrolled in this course');
+}
+
+app.post('/api/lessons/:lessonId/links', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+  const lessonId = Number(req.params.lessonId);
+  await assertCanManageLesson(req.user!, lessonId);
+
+  const schema = z.object({
+    title_ar: z.string().trim().min(1).max(160),
+    title_en: z.string().trim().max(160).optional(),
+    url: z
+      .string()
+      .trim()
+      .url()
+      .refine((v) => /^https?:\/\//i.test(v), 'URL must start with http:// or https://'),
+    link_type: z.enum(['zoom', 'meet', 'material', 'recording']),
+  });
+
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Valid link title, type, and https:// URL are required.' });
+    return;
+  }
+
+  const inserted = await insertRowSafe<{ id: number; lesson_id: number; title_ar: string; title_en: string; url: string; link_type: string }>(
+    'lesson_links',
+    {
+      lesson_id: lessonId,
+      title_ar: parsed.data.title_ar,
+      title_en: parsed.data.title_en || parsed.data.title_ar,
+      url: parsed.data.url,
+      link_type: parsed.data.link_type,
+    }
+  );
+
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'ADD_LESSON_LINK', 'lesson', lessonId, {
+    link_type: parsed.data.link_type,
+    title_ar: parsed.data.title_ar,
+  });
+
+  res.status(201).json({ link: inserted });
+}));
+
+app.post(
+  '/api/lessons/:lessonId/upload-material',
+  express.json({ limit: '14mb' }),
+  authenticate,
+  requireRole('admin', 'teacher'),
+  asyncHandler<AuthRequest>(async (req, res) => {
+    const lessonId = Number(req.params.lessonId);
+    const { sb } = await assertCanManageLesson(req.user!, lessonId);
+
+    const schema = z.object({
+      fileName: z.string().trim().min(1).max(180),
+      mimeType: z.string().trim().min(1).max(120),
+      base64Data: z.string().min(1),
+      title_ar: z.string().trim().max(160).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid file upload payload.' });
+      return;
+    }
+
+    const rawName = parsed.data.fileName;
+    const ext = rawName.includes('.') ? rawName.split('.').pop()!.toLowerCase() : '';
+    if (DISALLOWED_VIDEO_EXTENSIONS.has(ext)) {
+      res.status(400).json({
+        error: 'Direct video uploads are disabled to protect storage quota. Please upload the video to Google Drive or YouTube Unlisted and paste its link as a Recording.',
+      });
+      return;
+    }
+    if (!ALLOWED_MATERIAL_EXTENSIONS.has(ext)) {
+      res.status(400).json({
+        error: 'Unsupported file type. Allowed: PDF, PNG, JPG, WEBP, DOC/DOCX, PPT/PPTX, MP3/M4A.',
+      });
+      return;
+    }
+
+    const base64Clean = parsed.data.base64Data.includes(',')
+      ? parsed.data.base64Data.split(',').pop() || ''
+      : parsed.data.base64Data;
+    const buffer = Buffer.from(base64Clean, 'base64');
+    if (!buffer.length || buffer.length > MAX_MATERIAL_BYTES) {
+      res.status(400).json({ error: 'File exceeds maximum allowed size of 8 MB.' });
+      return;
+    }
+
+    await ensureMaterialsBucket(sb);
+    const safeBase = rawName.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || `file.${ext}`;
+    const objectPath = `lessons/${lessonId}/${Date.now()}-${crypto.randomBytes(3).toString('hex')}-${safeBase}`;
+
+    const { error: uploadErr } = await sb.storage
+      .from(LESSON_MATERIALS_BUCKET)
+      .upload(objectPath, buffer, {
+        contentType: parsed.data.mimeType,
+        upsert: false,
+      });
+
+    if (uploadErr) {
+      res.status(500).json({ error: `Upload failed: ${uploadErr.message}` });
+      return;
+    }
+
+    const storedUrl = `${STORAGE_PREFIX}${objectPath}`;
+    const displayTitle = parsed.data.title_ar?.trim() || rawName;
+    const inserted = await insertRowSafe<{ id: number; lesson_id: number; title_ar: string; title_en: string; url: string; link_type: string }>(
+      'lesson_links',
+      {
+        lesson_id: lessonId,
+        title_ar: displayTitle,
+        title_en: displayTitle,
+        url: storedUrl,
+        link_type: 'material',
+      }
+    );
+
+    await writeAuditLog(req.user!.id, req.user!.full_name, 'UPLOAD_LESSON_MATERIAL', 'lesson', lessonId, {
+      fileName: rawName,
+      bytes: buffer.length,
+    });
+
+    res.status(201).json({ link: inserted });
+  })
+);
+
+app.delete('/api/lesson-links/:id', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+  const linkId = Number(req.params.id);
+  const sb = requireSupabaseAdmin();
+  const { data: linkRow } = await sb.from('lesson_links').select('*').eq('id', linkId).maybeSingle();
+  if (!linkRow) {
+    res.status(404).json({ error: 'Lesson link not found' });
+    return;
+  }
+
+  await assertCanManageLesson(req.user!, Number(linkRow.lesson_id));
+
+  if (typeof linkRow.url === 'string' && linkRow.url.startsWith(STORAGE_PREFIX)) {
+    const objectPath = linkRow.url.slice(STORAGE_PREFIX.length);
+    await sb.storage.from(LESSON_MATERIALS_BUCKET).remove([objectPath]).catch(() => {});
+  }
+
+  await sb.from('lesson_links').delete().eq('id', linkId);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'DELETE_LESSON_LINK', 'lesson_link', linkId, {
+    lesson_id: linkRow.lesson_id,
+  });
+
+  res.json({ ok: true });
+}));
+
+app.get('/api/lesson-links/:id/access', authenticate, asyncHandler<AuthRequest>(async (req, res) => {
+  const linkId = Number(req.params.id);
+  const sb = requireSupabaseAdmin();
+  const { data: linkRow } = await sb.from('lesson_links').select('*').eq('id', linkId).maybeSingle();
+  if (!linkRow) {
+    res.status(404).json({ error: 'Lesson attachment not found' });
+    return;
+  }
+
+  await assertCanAccessLesson(req.user!, Number(linkRow.lesson_id));
+
+  if (typeof linkRow.url === 'string' && linkRow.url.startsWith(STORAGE_PREFIX)) {
+    const objectPath = linkRow.url.slice(STORAGE_PREFIX.length);
+    const { data, error } = await sb.storage.from(LESSON_MATERIALS_BUCKET).createSignedUrl(objectPath, 300);
+    if (error || !data?.signedUrl) {
+      res.status(500).json({ error: error?.message || 'Unable to generate download link' });
+      return;
+    }
+    res.json({ url: data.signedUrl });
+    return;
+  }
+
+  res.json({ url: linkRow.url });
+}));
+
+// ============================================================================
+// HARDENED HYBRID EXAM SYSTEM (PDF/Image Vault + Auto-Graded Online Quizzes)
+// ============================================================================
+async function notifyStudentAndGuardian(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  studentId: number,
+  titleAr: string,
+  titleEn: string,
+  bodyAr: string,
+  bodyEn: string
+) {
+  const { data: studentRow } = await sb
+    .from('students')
+    .select('profile_id, guardians(profile_id)')
+    .eq('id', studentId)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (!studentRow) return;
+
+  const profileIds = new Set<string>();
+  if (studentRow.profile_id) profileIds.add(String(studentRow.profile_id));
+  const rawG = Array.isArray(studentRow.guardians) ? studentRow.guardians[0] : studentRow.guardians;
+  const gObj = rawG as { profile_id?: string | null } | null;
+  if (gObj?.profile_id) profileIds.add(String(gObj.profile_id));
+
+  for (const pid of profileIds) {
+    await insertRowSafe('notifications', {
+      profile_id: pid,
+      title_ar: titleAr,
+      title_en: titleEn,
+      body_ar: bodyAr,
+      body_en: bodyEn,
+    }).catch(() => {});
+  }
+}
+
+async function notifyCourseExamPublished(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  courseId: number,
+  examTitleAr: string,
+  examTitleEn: string
+) {
+  const { data: enrolls } = await sb
+    .from('enrollments')
+    .select('student_id')
+    .eq('course_id', courseId)
+    .eq('status', 'active')
+    .is('deleted_at', null);
+
+  for (const row of enrolls || []) {
+    await notifyStudentAndGuardian(
+      sb,
+      Number((row as { student_id: number }).student_id),
+      `امتحان جديد: ${examTitleAr}`,
+      `New Exam Published: ${examTitleEn}`,
+      'تم نشر امتحان جديد في حلقتك. يرجى مراجعة تبويب الامتحانات والالتزام بموعد التسليم.',
+      'A new exam has been published for your course. Please check the Exams tab.'
+    );
+  }
+  void broadcastRealtimeEvent('notification:created', { kind: 'exam' });
+}
+
+async function assertCanManageExam(user: AuthUser, examId: number) {
+  const sb = requireSupabaseAdmin();
+  const { data: exam } = await sb
+    .from('exams')
+    .select('*, courses!inner(id, teacher_id, title_ar, title_en)')
+    .eq('id', examId)
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (!exam) throw new AppError(404, 'Exam not found');
+
+  if (user.role === 'admin') {
+    return { sb, exam };
+  }
+
+  if (user.role === 'teacher') {
+    const teacher = await getTeacherByProfile(user.id);
+    const rawC = Array.isArray(exam.courses) ? exam.courses[0] : exam.courses;
+    const course = rawC as { teacher_id?: number | null } | null;
+    if (teacher && course?.teacher_id === teacher.id) {
+      return { sb, exam };
+    }
+  }
+
+  throw new AppError(403, 'Forbidden: cannot manage exams outside your courses');
+}
+
+async function assertCanAccessExam(user: AuthUser, examId: number) {
+  const sb = requireSupabaseAdmin();
+  const { data: exam } = await sb
+    .from('exams')
+    .select('*, courses!inner(id, teacher_id)')
+    .eq('id', examId)
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (!exam) throw new AppError(404, 'Exam not found');
+
+  if (user.role === 'admin') return { sb, exam, studentId: null as number | null };
+
+  if (user.role === 'teacher') {
+    const teacher = await getTeacherByProfile(user.id);
+    const rawC = Array.isArray(exam.courses) ? exam.courses[0] : exam.courses;
+    const course = rawC as { teacher_id?: number | null } | null;
+    if (teacher && course?.teacher_id === teacher.id) {
+      return { sb, exam, studentId: null as number | null };
+    }
+  }
+
+  if (user.role === 'student') {
+    const { data: student } = await sb
+      .from('students')
+      .select('id')
+      .eq('profile_id', user.id)
+      .is('deleted_at', null)
+      .maybeSingle();
+    if (student) {
+      const { data: enroll } = await sb
+        .from('enrollments')
+        .select('id')
+        .eq('student_id', student.id)
+        .eq('course_id', exam.course_id)
+        .eq('status', 'active')
+        .is('deleted_at', null)
+        .maybeSingle();
+      if (enroll) return { sb, exam, studentId: Number(student.id) };
+    }
+  }
+
+  if (user.role === 'guardian') {
+    const { data: guardian } = await sb
+      .from('guardians')
+      .select('id')
+      .eq('profile_id', user.id)
+      .is('deleted_at', null)
+      .maybeSingle();
+    if (guardian) {
+      const { data: children } = await sb
+        .from('students')
+        .select('id')
+        .eq('guardian_id', guardian.id)
+        .is('deleted_at', null);
+      const childIds = (children || []).map((c: { id: number }) => c.id);
+      if (childIds.length) {
+        const { data: enroll } = await sb
+          .from('enrollments')
+          .select('student_id')
+          .in('student_id', childIds)
+          .eq('course_id', exam.course_id)
+          .is('deleted_at', null)
+          .limit(1)
+          .maybeSingle();
+        if (enroll) return { sb, exam, studentId: Number(enroll.student_id) };
+      }
+    }
+  }
+
+  throw new AppError(403, 'Forbidden: not authorized for this course exam');
+}
+
+const quizQuestionSchema = z.object({
+  id: z.string().trim().min(1).max(64).optional(),
+  q_type: z.enum(['mcq', 'tf']),
+  prompt_ar: z.string().trim().min(1).max(600),
+  prompt_en: z.string().trim().max(600).optional(),
+  options_ar: z.array(z.string().trim().min(1).max(250)).min(2).max(6),
+  options_en: z.array(z.string().trim().max(250)).optional(),
+  correct_index: z.coerce.number().int().min(0).max(5),
+  points: z.coerce.number().positive().max(100).default(1),
+});
+
+const examCreateOrUpdateSchema = z.object({
+  course_id: z.coerce.number().int().positive(),
+  title_ar: z.string().trim().min(2).max(180),
+  title_en: z.string().trim().max(180).optional(),
+  exam_date: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/),
+  max_score: z.coerce.number().positive().max(1000).default(100),
+  exam_mode: z.enum(['file', 'quiz', 'hybrid']).default('file'),
+  instructions_ar: z.string().trim().max(2000).optional(),
+  instructions_en: z.string().trim().max(2000).optional(),
+  available_from: z.string().trim().max(40).nullable().optional(),
+  due_at: z.string().trim().max(40).nullable().optional(),
+  allow_late_submission: z.boolean().default(true),
+  show_answers_after_submit: z.boolean().default(true),
+  notify_students: z.boolean().default(true),
+  questions: z.array(quizQuestionSchema).max(60).default([]),
+});
+
+function normalizeQuestions(raw: Array<z.infer<typeof quizQuestionSchema>>): QuizQuestionConfig[] {
+  return raw.map((q, idx) => {
+    const safeOptions = q.q_type === 'tf' ? ['صح', 'خطأ'] : q.options_ar;
+    const safeOptionsEn = q.q_type === 'tf' ? ['True', 'False'] : (q.options_en?.length ? q.options_en : safeOptions);
+    if (q.correct_index < 0 || q.correct_index >= safeOptions.length) {
+      throw new AppError(400, `Question ${idx + 1}: correct option index is out of range.`);
+    }
+    return {
+      id: q.id || `q_${idx + 1}_${crypto.randomBytes(2).toString('hex')}`,
+      q_type: q.q_type,
+      prompt_ar: q.prompt_ar,
+      prompt_en: q.prompt_en || q.prompt_ar,
+      options_ar: safeOptions,
+      options_en: safeOptionsEn,
+      correct_index: q.correct_index,
+      points: Number(q.points || 1),
+    };
+  });
+}
+
+app.post('/api/exams', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+  const parsed = examCreateOrUpdateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid exam payload', details: parsed.error.flatten().fieldErrors });
+    return;
+  }
+
+  const sb = requireSupabaseAdmin();
+  if (req.user!.role === 'teacher') {
+    const teacher = await getTeacherByProfile(req.user!.id);
+    if (!teacher || !(await assertTeacherOwnsCourse(teacher.id, parsed.data.course_id))) {
+      res.status(403).json({ error: 'Forbidden: you can only create exams for your assigned courses' });
+      return;
+    }
+  }
+
+  if ((parsed.data.exam_mode === 'quiz' || parsed.data.exam_mode === 'hybrid') && parsed.data.questions.length === 0) {
+    res.status(400).json({ error: 'Online quiz and hybrid exams require at least one question.' });
+    return;
+  }
+
+  const questions = normalizeQuestions(parsed.data.questions);
+  const inserted = await insertRowSafe<{ id: number }>('exams', {
+    course_id: parsed.data.course_id,
+    title_ar: parsed.data.title_ar,
+    title_en: parsed.data.title_en?.trim() || parsed.data.title_ar,
+    exam_date: parsed.data.exam_date,
+    max_score: parsed.data.max_score,
+  });
+
+  await saveExamVaultConfig(sb, {
+    exam_id: inserted.id,
+    exam_mode: parsed.data.exam_mode,
+    instructions_ar: parsed.data.instructions_ar || '',
+    instructions_en: parsed.data.instructions_en || parsed.data.instructions_ar || '',
+    available_from: parsed.data.available_from || null,
+    due_at: parsed.data.due_at || null,
+    allow_late_submission: parsed.data.allow_late_submission,
+    show_answers_after_submit: parsed.data.show_answers_after_submit,
+    question_file: null,
+    questions,
+    updated_at: new Date().toISOString(),
+  });
+
+  if (parsed.data.notify_students) {
+    await notifyCourseExamPublished(
+      sb,
+      parsed.data.course_id,
+      parsed.data.title_ar,
+      parsed.data.title_en?.trim() || parsed.data.title_ar
+    );
+  }
+
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_EXAM', 'exam', inserted.id, {
+    course_id: parsed.data.course_id,
+    exam_mode: parsed.data.exam_mode,
+    question_count: questions.length,
+  });
+  void broadcastRealtimeEvent('academic:updated', { kind: 'exam' });
+
+  res.status(201).json({ id: inserted.id });
+}));
+
+app.patch('/api/exams/:examId', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+  const examId = Number(req.params.examId);
+  const { sb, exam } = await assertCanManageExam(req.user!, examId);
+
+  const partialSchema = examCreateOrUpdateSchema.partial().omit({ course_id: true, notify_students: true });
+  const parsed = partialSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid exam update payload', details: parsed.error.flatten().fieldErrors });
+    return;
+  }
+
+  const dbUpdate: Record<string, unknown> = {};
+  if (parsed.data.title_ar !== undefined) dbUpdate.title_ar = parsed.data.title_ar;
+  if (parsed.data.title_en !== undefined) dbUpdate.title_en = parsed.data.title_en;
+  if (parsed.data.exam_date !== undefined) dbUpdate.exam_date = parsed.data.exam_date;
+  if (parsed.data.max_score !== undefined) dbUpdate.max_score = parsed.data.max_score;
+  if (Object.keys(dbUpdate).length) {
+    await sb.from('exams').update(dbUpdate).eq('id', examId);
+  }
+
+  const existingCfg = await getExamVaultConfig(sb, examId);
+  const nextMode = parsed.data.exam_mode ?? existingCfg.exam_mode;
+  const nextQuestions = parsed.data.questions !== undefined ? normalizeQuestions(parsed.data.questions) : existingCfg.questions;
+  if ((nextMode === 'quiz' || nextMode === 'hybrid') && nextQuestions.length === 0) {
+    res.status(400).json({ error: 'Online quiz and hybrid exams require at least one question.' });
+    return;
+  }
+
+  await saveExamVaultConfig(sb, {
+    ...existingCfg,
+    exam_mode: nextMode,
+    instructions_ar: parsed.data.instructions_ar ?? existingCfg.instructions_ar,
+    instructions_en: parsed.data.instructions_en ?? existingCfg.instructions_en,
+    available_from: parsed.data.available_from !== undefined ? parsed.data.available_from : existingCfg.available_from,
+    due_at: parsed.data.due_at !== undefined ? parsed.data.due_at : existingCfg.due_at,
+    allow_late_submission: parsed.data.allow_late_submission ?? existingCfg.allow_late_submission,
+    show_answers_after_submit: parsed.data.show_answers_after_submit ?? existingCfg.show_answers_after_submit,
+    questions: nextQuestions,
+  });
+
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_EXAM', 'exam', examId, {
+    course_id: exam.course_id,
+    exam_mode: nextMode,
+  });
+  void broadcastRealtimeEvent('academic:updated', { kind: 'exam' });
+  res.json({ ok: true });
+}));
+
+app.delete('/api/exams/:examId', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+  const examId = Number(req.params.examId);
+  const { sb } = await assertCanManageExam(req.user!, examId);
+  await sb.from('exams').update({ deleted_at: new Date().toISOString() }).eq('id', examId);
+  invalidateExamCache(examId);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'DELETE_EXAM', 'exam', examId, {});
+  void broadcastRealtimeEvent('academic:updated', { kind: 'exam' });
+  res.json({ ok: true });
+}));
+
+app.post(
+  '/api/exams/:examId/question-file',
+  express.json({ limit: '14mb' }),
+  authenticate,
+  requireRole('admin', 'teacher'),
+  examUploadLimiter,
+  asyncHandler<AuthRequest>(async (req, res) => {
+    const examId = Number(req.params.examId);
+    const { sb } = await assertCanManageExam(req.user!, examId);
+
+    const schema = z.object({
+      fileName: z.string().trim().min(1).max(180),
+      mimeType: z.string().trim().min(1).max(120),
+      base64Data: z.string().min(1),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid question file upload payload.' });
+      return;
+    }
+
+    const uploadedMeta = await uploadExamBinaryFile({
+      sb,
+      folder: `questions/${examId}`,
+      fileName: parsed.data.fileName,
+      mimeType: parsed.data.mimeType,
+      base64Data: parsed.data.base64Data,
+    });
+
+    const cfg = await getExamVaultConfig(sb, examId);
+    if (cfg.question_file?.path) {
+      await removeExamBinaryFile(sb, cfg.question_file.path);
+    }
+
+    await saveExamVaultConfig(sb, {
+      ...cfg,
+      question_file: uploadedMeta,
+    });
+
+    await writeAuditLog(req.user!.id, req.user!.full_name, 'UPLOAD_EXAM_QUESTION_FILE', 'exam', examId, {
+      fileName: uploadedMeta.name,
+      bytes: uploadedMeta.size_bytes,
+    });
+    res.status(201).json({ fileName: uploadedMeta.name, mime: uploadedMeta.mime });
+  })
+);
+
+app.delete('/api/exams/:examId/question-file', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+  const examId = Number(req.params.examId);
+  const { sb } = await assertCanManageExam(req.user!, examId);
+  const cfg = await getExamVaultConfig(sb, examId);
+  if (cfg.question_file?.path) {
+    await removeExamBinaryFile(sb, cfg.question_file.path);
+  }
+  await saveExamVaultConfig(sb, { ...cfg, question_file: null });
+  res.json({ ok: true });
+}));
+
+app.get('/api/exams/:examId/question-file', authenticate, asyncHandler<AuthRequest>(async (req, res) => {
+  const examId = Number(req.params.examId);
+  const { sb } = await assertCanAccessExam(req.user!, examId);
+  const cfg = await getExamVaultConfig(sb, examId);
+
+  const isPrivileged = req.user!.role === 'admin' || req.user!.role === 'teacher';
+  if (!isPrivileged && !isExamAvailableYet(cfg)) {
+    res.status(403).json({ error: 'Exam question paper is not open yet.' });
+    return;
+  }
+  if (!cfg.question_file?.path) {
+    res.status(404).json({ error: 'No question PDF/file attached to this exam.' });
+    return;
+  }
+
+  const signedUrl = await createExamSignedUrl(sb, cfg.question_file.path, 180);
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ url: signedUrl, fileName: cfg.question_file.name, mime: cfg.question_file.mime });
+}));
+
+app.get('/api/exams/:examId/submissions', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+  const examId = Number(req.params.examId);
+  const { sb, exam } = await assertCanManageExam(req.user!, examId);
+
+  const [enrollRes, resultsRes, subs] = await Promise.all([
+    sb
+      .from('enrollments')
+      .select('student_id, students!inner(id, student_code, full_name_ar, full_name_en, deleted_at)')
+      .eq('course_id', exam.course_id)
+      .eq('status', 'active')
+      .is('deleted_at', null)
+      .is('students.deleted_at', null),
+    sb.from('exam_results').select('*').eq('exam_id', examId),
+    listExamSubmissionsForExam(sb, examId),
+  ]);
+
+  const subMap = new Map<number, ExamSubmissionRecord>();
+  for (const s of subs) subMap.set(s.student_id, s);
+
+  const resMap = new Map<number, Record<string, unknown>>();
+  for (const r of resultsRes.data || []) {
+    resMap.set(Number((r as { student_id: number }).student_id), r as Record<string, unknown>);
+  }
+
+  const rows = (enrollRes.data || []).map((row: Record<string, unknown>) => {
+    const rawS = Array.isArray(row.students) ? row.students[0] : row.students;
+    const stu = rawS as { id: number; student_code: string; full_name_ar: string; full_name_en: string };
+    const sub = subMap.get(stu.id) || null;
+    const result = resMap.get(stu.id) || null;
+    return {
+      student_id: stu.id,
+      student_code: stu.student_code,
+      full_name_ar: stu.full_name_ar,
+      full_name_en: stu.full_name_en,
+      submission: sanitizeSubmissionForViewer(sub),
+      result: result
+        ? {
+            score: result.score,
+            feedback_ar: result.feedback_ar,
+            feedback_en: result.feedback_en,
+            graded_at: result.graded_at,
+          }
+        : null,
+      overall_status: result ? 'graded' : sub ? 'submitted_pending' : 'not_submitted',
+    };
+  });
+
+  res.json({ exam_id: examId, max_score: exam.max_score, submissions: rows });
+}));
+
+app.post(
+  '/api/exams/:examId/submit-file',
+  express.json({ limit: '14mb' }),
+  authenticate,
+  requireRole('student'),
+  examUploadLimiter,
+  asyncHandler<AuthRequest>(async (req, res) => {
+    const examId = Number(req.params.examId);
+    const { sb, exam, studentId } = await assertCanAccessExam(req.user!, examId);
+    if (!studentId) {
+      res.status(403).json({ error: 'Student profile is not linked.' });
+      return;
+    }
+
+    const schema = z.object({
+      fileName: z.string().trim().min(1).max(180),
+      mimeType: z.string().trim().min(1).max(120),
+      base64Data: z.string().min(1),
+      student_notes: z.string().trim().max(1000).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid solution file upload payload.' });
+      return;
+    }
+
+    const cfg = await getExamVaultConfig(sb, examId);
+    if (!isExamAvailableYet(cfg)) {
+      res.status(403).json({ error: 'Exam is not open for submissions yet.' });
+      return;
+    }
+    const pastDeadline = isExamPastDeadline(cfg);
+    if (pastDeadline && !cfg.allow_late_submission) {
+      res.status(403).json({ error: 'Submission deadline has passed for this exam.' });
+      return;
+    }
+
+    const [{ data: existingResult }, existingSub] = await Promise.all([
+      sb.from('exam_results').select('id').eq('exam_id', examId).eq('student_id', studentId).maybeSingle(),
+      getExamSubmission(sb, examId, studentId),
+    ]);
+    if (existingResult || existingSub?.status === 'graded') {
+      res.status(409).json({ error: 'This exam has already been graded. Ask your teacher if a re-submission is needed.' });
+      return;
+    }
+
+    const uploadedMeta = await uploadExamBinaryFile({
+      sb,
+      folder: `submissions/${examId}/${studentId}`,
+      fileName: parsed.data.fileName,
+      mimeType: parsed.data.mimeType,
+      base64Data: parsed.data.base64Data,
+    });
+
+    if (existingSub?.solution_file?.path) {
+      await removeExamBinaryFile(sb, existingSub.solution_file.path);
+    }
+
+    const nowIso = new Date().toISOString();
+    await saveExamSubmission(sb, {
+      exam_id: examId,
+      student_id: studentId,
+      status: 'submitted_pending',
+      submitted_at: nowIso,
+      is_late: pastDeadline,
+      solution_file: uploadedMeta,
+      student_notes: parsed.data.student_notes || existingSub?.student_notes || '',
+      quiz_answers: existingSub?.quiz_answers || [],
+      auto_score: existingSub?.auto_score ?? null,
+      graded_file: existingSub?.graded_file || null,
+      graded_at: null,
+    });
+
+    // Notify course teacher
+    const rawCourse = Array.isArray(exam.courses) ? exam.courses[0] : exam.courses;
+    const teacherId = (rawCourse as { teacher_id?: number | null } | null)?.teacher_id;
+    if (teacherId) {
+      const { data: teacherRow } = await sb.from('teachers').select('profile_id').eq('id', teacherId).maybeSingle();
+      if (teacherRow?.profile_id) {
+        await insertRowSafe('notifications', {
+          profile_id: teacherRow.profile_id,
+          title_ar: `تسليم حل امتحان: ${exam.title_ar}`,
+          title_en: `Exam Solution Submitted: ${exam.title_en}`,
+          body_ar: `قام الطالب ${req.user!.full_name} برفع ملف الحل وهو بانتظار التصحيح ورصد الدرجة.`,
+          body_en: `${req.user!.full_name} uploaded an exam solution awaiting grading.`,
+        }).catch(() => {});
+      }
+    }
+
+    await writeAuditLog(req.user!.id, req.user!.full_name, 'SUBMIT_EXAM_FILE', 'exam', examId, {
+      student_id: studentId,
+      fileName: uploadedMeta.name,
+      is_late: pastDeadline,
+    });
+    void broadcastRealtimeEvent('academic:updated', { kind: 'exam_submission' });
+
+    res.status(201).json({ ok: true, fileName: uploadedMeta.name, is_late: pastDeadline });
+  })
+);
+
+app.post(
+  '/api/exams/:examId/submit-quiz',
+  authenticate,
+  requireRole('student'),
+  examUploadLimiter,
+  asyncHandler<AuthRequest>(async (req, res) => {
+    const examId = Number(req.params.examId);
+    const { sb, exam, studentId } = await assertCanAccessExam(req.user!, examId);
+    if (!studentId) {
+      res.status(403).json({ error: 'Student profile is not linked.' });
+      return;
+    }
+
+    const schema = z.object({
+      answers: z.array(
+        z.object({
+          question_id: z.string().trim().min(1).max(64),
+          selected_index: z.coerce.number().int().min(0).max(5),
+        })
+      ).min(1).max(60),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid quiz answers payload.' });
+      return;
+    }
+
+    const cfg = await getExamVaultConfig(sb, examId);
+    if (cfg.exam_mode !== 'quiz' && cfg.exam_mode !== 'hybrid') {
+      res.status(400).json({ error: 'This exam does not contain interactive online questions.' });
+      return;
+    }
+    if (!isExamAvailableYet(cfg)) {
+      res.status(403).json({ error: 'Exam is not open yet.' });
+      return;
+    }
+    const pastDeadline = isExamPastDeadline(cfg);
+    if (pastDeadline && !cfg.allow_late_submission) {
+      res.status(403).json({ error: 'Submission deadline has passed for this exam.' });
+      return;
+    }
+
+    const existingSub = await getExamSubmission(sb, examId, studentId);
+    if (existingSub && existingSub.quiz_answers.length > 0) {
+      res.status(409).json({ error: 'Quiz answers have already been submitted for this exam.' });
+      return;
+    }
+
+    // 100% Server-side authoritative grading
+    const answerById = new Map<string, number>();
+    for (const a of parsed.data.answers) {
+      answerById.set(a.question_id, a.selected_index);
+    }
+
+    let totalPoints = 0;
+    let earnedPoints = 0;
+    for (const q of cfg.questions) {
+      const pts = Number(q.points || 1);
+      totalPoints += pts;
+      if (answerById.get(q.id) === q.correct_index) {
+        earnedPoints += pts;
+      }
+    }
+
+    const maxScore = Number(exam.max_score || 100);
+    const computedScore =
+      totalPoints > 0
+        ? Math.round((earnedPoints / totalPoints) * maxScore * 100) / 100
+        : 0;
+
+    const nowIso = new Date().toISOString();
+    const isPureQuiz = cfg.exam_mode === 'quiz';
+
+    await saveExamSubmission(sb, {
+      exam_id: examId,
+      student_id: studentId,
+      status: isPureQuiz ? 'graded' : 'submitted_pending',
+      submitted_at: existingSub?.submitted_at || nowIso,
+      is_late: pastDeadline,
+      solution_file: existingSub?.solution_file || null,
+      student_notes: existingSub?.student_notes || '',
+      quiz_answers: parsed.data.answers,
+      auto_score: computedScore,
+      graded_file: existingSub?.graded_file || null,
+      graded_at: isPureQuiz ? nowIso : null,
+    });
+
+    if (isPureQuiz) {
+      const feedbackAr = `تم التصحيح التلقائي (${earnedPoints} من ${totalPoints} نقطة).`;
+      const feedbackEn = `Auto-graded (${earnedPoints} / ${totalPoints} pts).`;
+      const { data: existingResult } = await sb
+        .from('exam_results')
+        .select('id')
+        .eq('exam_id', examId)
+        .eq('student_id', studentId)
+        .maybeSingle();
+
+      if (existingResult) {
+        await sb
+          .from('exam_results')
+          .update({
+            score: computedScore,
+            feedback_ar: feedbackAr,
+            feedback_en: feedbackEn,
+            graded_at: nowIso,
+          })
+          .eq('id', existingResult.id);
+      } else {
+        await insertRowSafe('exam_results', {
+          exam_id: examId,
+          student_id: studentId,
+          score: computedScore,
+          feedback_ar: feedbackAr,
+          feedback_en: feedbackEn,
+          graded_at: nowIso,
+        });
+      }
+
+      await notifyStudentAndGuardian(
+        sb,
+        studentId,
+        `نتيجة الاختبار: ${exam.title_ar}`,
+        `Quiz Result: ${exam.title_en}`,
+        `درجتك التلقائية: ${computedScore} / ${maxScore}`,
+        `Auto-graded score: ${computedScore} / ${maxScore}`
+      );
+    }
+
+    await writeAuditLog(req.user!.id, req.user!.full_name, 'SUBMIT_EXAM_QUIZ', 'exam', examId, {
+      student_id: studentId,
+      auto_score: computedScore,
+      pure_quiz: isPureQuiz,
+    });
+    void broadcastRealtimeEvent('academic:updated', { kind: 'exam_result' });
+
+    res.status(201).json({
+      ok: true,
+      auto_score: computedScore,
+      max_score: maxScore,
+      finalized: isPureQuiz,
+    });
+  })
+);
+
+app.post(
+  '/api/exams/:examId/grade',
+  express.json({ limit: '14mb' }),
+  authenticate,
+  requireRole('admin', 'teacher'),
+  examUploadLimiter,
+  asyncHandler<AuthRequest>(async (req, res) => {
+    const examId = Number(req.params.examId);
+    const { sb, exam } = await assertCanManageExam(req.user!, examId);
+
+    const schema = z.object({
+      student_id: z.coerce.number().int().positive(),
+      score: z.coerce.number().min(0),
+      feedback_ar: z.string().trim().max(1500).optional(),
+      feedback_en: z.string().trim().max(1500).optional(),
+      gradedFile: z
+        .object({
+          fileName: z.string().trim().min(1).max(180),
+          mimeType: z.string().trim().min(1).max(120),
+          base64Data: z.string().min(1),
+        })
+        .optional(),
+    });
+
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid grading payload.' });
+      return;
+    }
+
+    const maxScore = Number(exam.max_score || 100);
+    if (parsed.data.score > maxScore) {
+      res.status(400).json({ error: `Score cannot exceed maximum score (${maxScore}).` });
+      return;
+    }
+
+    const targetStudentId = parsed.data.student_id;
+    const { data: enrollment } = await sb
+      .from('enrollments')
+      .select('id')
+      .eq('course_id', exam.course_id)
+      .eq('student_id', targetStudentId)
+      .is('deleted_at', null)
+      .maybeSingle();
+
+    if (!enrollment) {
+      res.status(403).json({ error: 'Student is not enrolled in this exam course.' });
+      return;
+    }
+
+    const existingSub = await getExamSubmission(sb, examId, targetStudentId);
+    let gradedFileMeta = existingSub?.graded_file || null;
+    if (parsed.data.gradedFile) {
+      const uploadedGraded = await uploadExamBinaryFile({
+        sb,
+        folder: `graded/${examId}/${targetStudentId}`,
+        fileName: parsed.data.gradedFile.fileName,
+        mimeType: parsed.data.gradedFile.mimeType,
+        base64Data: parsed.data.gradedFile.base64Data,
+      });
+      if (existingSub?.graded_file?.path) {
+        await removeExamBinaryFile(sb, existingSub.graded_file.path);
+      }
+      gradedFileMeta = uploadedGraded;
+    }
+
+    const gradedAt = new Date().toISOString();
+    const { data: existingResult } = await sb
+      .from('exam_results')
+      .select('id')
+      .eq('exam_id', examId)
+      .eq('student_id', targetStudentId)
+      .maybeSingle();
+
+    if (existingResult) {
+      await sb
+        .from('exam_results')
+        .update({
+          score: parsed.data.score,
+          feedback_ar: parsed.data.feedback_ar || '',
+          feedback_en: parsed.data.feedback_en || parsed.data.feedback_ar || '',
+          graded_by: req.user!.id,
+          graded_at: gradedAt,
+        })
+        .eq('id', existingResult.id);
+    } else {
+      await insertRowSafe('exam_results', {
+        exam_id: examId,
+        student_id: targetStudentId,
+        score: parsed.data.score,
+        feedback_ar: parsed.data.feedback_ar || '',
+        feedback_en: parsed.data.feedback_en || parsed.data.feedback_ar || '',
+        graded_by: req.user!.id,
+        graded_at: gradedAt,
+      });
+    }
+
+    await saveExamSubmission(sb, {
+      exam_id: examId,
+      student_id: targetStudentId,
+      status: 'graded',
+      submitted_at: existingSub?.submitted_at || gradedAt,
+      is_late: existingSub?.is_late || false,
+      solution_file: existingSub?.solution_file || null,
+      student_notes: existingSub?.student_notes || '',
+      quiz_answers: existingSub?.quiz_answers || [],
+      auto_score: existingSub?.auto_score ?? null,
+      graded_file: gradedFileMeta,
+      graded_at: gradedAt,
+    });
+
+    await notifyStudentAndGuardian(
+      sb,
+      targetStudentId,
+      `تم تصحيح ورصد درجة: ${exam.title_ar}`,
+      `Exam Graded: ${exam.title_en}`,
+      `الدرجة المرصودة: ${parsed.data.score} / ${maxScore}`,
+      `Score recorded: ${parsed.data.score} / ${maxScore}`
+    );
+
+    await writeAuditLog(req.user!.id, req.user!.full_name, 'GRADE_EXAM', 'exam', examId, {
+      student_id: targetStudentId,
+      score: parsed.data.score,
+      has_graded_file: Boolean(gradedFileMeta),
+    });
+    void broadcastRealtimeEvent('academic:updated', { kind: 'exam_result' });
+
+    res.json({ ok: true });
+  })
+);
+
+app.get('/api/exams/:examId/submissions/:studentId/file', authenticate, asyncHandler<AuthRequest>(async (req, res) => {
+  const examId = Number(req.params.examId);
+  const targetStudentId = Number(req.params.studentId);
+  const kind = req.query.kind === 'graded' ? 'graded' : 'solution';
+
+  const sb = requireSupabaseAdmin();
+  const { data: exam } = await sb
+    .from('exams')
+    .select('id, course_id, courses!inner(teacher_id)')
+    .eq('id', examId)
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (!exam) {
+    res.status(404).json({ error: 'Exam not found' });
+    return;
+  }
+
+  let authorized = false;
+  if (req.user!.role === 'admin') {
+    authorized = true;
+  } else if (req.user!.role === 'teacher') {
+    const teacher = await getTeacherByProfile(req.user!.id);
+    const rawC = Array.isArray(exam.courses) ? exam.courses[0] : exam.courses;
+    const course = rawC as { teacher_id?: number | null } | null;
+    if (teacher && course?.teacher_id === teacher.id) authorized = true;
+  } else if (req.user!.role === 'student') {
+    const { data: stu } = await sb.from('students').select('id').eq('profile_id', req.user!.id).is('deleted_at', null).maybeSingle();
+    if (stu && Number(stu.id) === targetStudentId) authorized = true;
+  } else if (req.user!.role === 'guardian') {
+    const { data: guard } = await sb.from('guardians').select('id').eq('profile_id', req.user!.id).is('deleted_at', null).maybeSingle();
+    if (guard) {
+      const { data: stu } = await sb
+        .from('students')
+        .select('id')
+        .eq('id', targetStudentId)
+        .eq('guardian_id', guard.id)
+        .is('deleted_at', null)
+        .maybeSingle();
+      if (stu) authorized = true;
+    }
+  }
+
+  if (!authorized) {
+    res.status(403).json({ error: 'Forbidden: you are not authorized to access this exam file.' });
+    return;
+  }
+
+  const sub = await getExamSubmission(sb, examId, targetStudentId);
+  const fileMeta = kind === 'graded' ? sub?.graded_file : sub?.solution_file;
+  if (!fileMeta?.path) {
+    res.status(404).json({ error: 'Requested exam file was not found.' });
+    return;
+  }
+
+  const signedUrl = await createExamSignedUrl(sb, fileMeta.path, 180);
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ url: signedUrl, fileName: fileMeta.name, mime: fileMeta.mime });
+}));
+
+app.post('/api/exams/:examId/submissions/:studentId/reset', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+  const examId = Number(req.params.examId);
+  const targetStudentId = Number(req.params.studentId);
+  const { sb } = await assertCanManageExam(req.user!, examId);
+
+  await sb.from('exam_results').delete().eq('exam_id', examId).eq('student_id', targetStudentId);
+  await deleteExamSubmissionRecord(sb, examId, targetStudentId);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'RESET_EXAM_SUBMISSION', 'exam', examId, {
+    student_id: targetStudentId,
+  });
+  void broadcastRealtimeEvent('academic:updated', { kind: 'exam_submission' });
+  res.json({ ok: true });
+}));
+
+// ============================================================================
 // ADMIN ROUTES (Strictly role === 'admin')
 // ============================================================================
 app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler(async (_req, res) => {
@@ -1654,7 +3380,7 @@ app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler
     sb.from('teachers').select('*').is('deleted_at', null).order('id', { ascending: true }),
     sb
       .from('students')
-      .select('*, levels(name_ar, name_en), guardians(full_name, phone, email), profiles(email)')
+      .select('*, levels(name_ar, name_en), guardians(full_name, phone, email, profile_id), profiles(email)')
       .is('deleted_at', null)
       .order('id', { ascending: false }),
     sb
@@ -1703,7 +3429,7 @@ app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler
 
   const students = (studentsRes.data || []).map((s: Record<string, unknown>) => {
     const l = s.levels as { name_ar?: string; name_en?: string } | null;
-    const g = s.guardians as { full_name?: string; phone?: string; email?: string } | null;
+    const g = s.guardians as { full_name?: string; phone?: string; email?: string; profile_id?: string | null } | null;
     const p = s.profiles as { email?: string } | null;
     const { levels: _l, guardians: _g, profiles: _p, ...rest } = s;
     return {
@@ -1713,6 +3439,7 @@ app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler
       guardian_name: g?.full_name ?? null,
       guardian_phone: g?.phone ?? null,
       guardian_email: g?.email ?? null,
+      guardian_linked: Boolean(g?.profile_id),
       student_email: p?.email ?? null,
     };
   });
@@ -1750,11 +3477,32 @@ app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler
     return { ...rest, course_title_ar: c?.title_ar ?? null };
   });
 
-  const exams = (examsRes.data || []).map((ex: Record<string, unknown>) => {
-    const c = ex.courses as { title_ar?: string } | null;
-    const { courses: _c, ...rest } = ex;
-    return { ...rest, course_title_ar: c?.title_ar ?? null };
-  });
+  const examsRaw = examsRes.data || [];
+  const allExamResultsRows = examsRaw.length
+    ? (await sb.from('exam_results').select('exam_id, student_id')).data || []
+    : [];
+
+  const exams = await Promise.all(
+    examsRaw.map(async (ex: Record<string, unknown>) => {
+      const c = ex.courses as { title_ar?: string } | null;
+      const { courses: _c, ...rest } = ex;
+      const eid = Number(rest.id);
+      const [cfg, subs] = await Promise.all([
+        getExamVaultConfig(sb, eid),
+        listExamSubmissionsForExam(sb, eid),
+      ]);
+      const gradedCount = allExamResultsRows.filter((er: Record<string, unknown>) => Number(er.exam_id) === eid).length;
+      return {
+        ...rest,
+        id: eid,
+        course_title_ar: c?.title_ar ?? null,
+        ...sanitizeExamConfigForViewer(cfg, { isPrivileged: true }),
+        submission_count: subs.length,
+        pending_grading_count: subs.filter((s) => s.status === 'submitted_pending').length,
+        graded_count: gradedCount,
+      };
+    })
+  );
 
   const certificates = (certificatesRes.data || []).map((cert: Record<string, unknown>) => {
     const s = cert.students as { full_name_ar?: string } | null;
@@ -1821,6 +3569,36 @@ app.post('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler<
   res.status(201).json({ id: inserted.id });
 }));
 
+app.patch('/api/admin/courses/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const id = Number(req.params.id);
+  const schema = z.object({
+    title_ar: z.string().trim().min(1).max(180).optional(),
+    title_en: z.string().trim().min(1).max(180).optional(),
+    description_ar: z.string().trim().max(2000).optional(),
+    description_en: z.string().trim().max(2000).optional(),
+    level_id: z.coerce.number().int().positive().optional(),
+    teacher_id: z.coerce.number().int().positive().optional(),
+    schedule_ar: z.string().trim().min(1).max(180).optional(),
+    schedule_en: z.string().trim().min(1).max(180).optional(),
+    price_monthly: z.coerce.number().min(0).max(100000).optional(),
+    capacity: z.coerce.number().int().min(1).max(200).optional(),
+    is_featured: z.boolean().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid course update payload' });
+    return;
+  }
+  const sb = requireSupabaseAdmin();
+  const { error } = await sb.from('courses').update(parsed.data).eq('id', id).is('deleted_at', null);
+  if (error) {
+    res.status(500).json({ error: error.message });
+    return;
+  }
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_COURSE', 'course', id, parsed.data);
+  res.json({ ok: true });
+}));
+
 app.delete('/api/admin/courses/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = Number(req.params.id);
   const sb = requireSupabaseAdmin();
@@ -1852,6 +3630,33 @@ app.post('/api/admin/lessons', authenticate, requireRole('admin'), asyncHandler<
     });
   }
   res.status(201).json({ id: lesson.id });
+}));
+
+app.patch('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const id = Number(req.params.id);
+  const schema = z.object({
+    course_id: z.coerce.number().int().positive().optional(),
+    title_ar: z.string().trim().min(1).max(180).optional(),
+    title_en: z.string().trim().min(1).max(180).optional(),
+    lesson_date: z.string().trim().min(4).max(30).optional(),
+    start_time: z.string().trim().min(2).max(20).optional(),
+    duration_min: z.coerce.number().int().min(10).max(360).optional(),
+    objectives_ar: z.string().trim().max(1000).optional(),
+    objectives_en: z.string().trim().max(1000).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid lesson update payload' });
+    return;
+  }
+  const sb = requireSupabaseAdmin();
+  const { error } = await sb.from('lessons').update(parsed.data).eq('id', id).is('deleted_at', null);
+  if (error) {
+    res.status(500).json({ error: error.message });
+    return;
+  }
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_LESSON', 'lesson', id, parsed.data);
+  res.json({ ok: true });
 }));
 
 app.delete('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
@@ -1909,6 +3714,35 @@ app.post('/api/admin/teachers', authenticate, requireRole('admin'), asyncHandler
   res.status(201).json({ id: teacher.id, temporary_password: tempPassword });
 }));
 
+app.patch('/api/admin/teachers/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const id = Number(req.params.id);
+  const schema = z.object({
+    name_ar: z.string().trim().min(1).max(160).optional(),
+    name_en: z.string().trim().min(1).max(160).optional(),
+    specialty_ar: z.string().trim().max(200).optional(),
+    specialty_en: z.string().trim().max(200).optional(),
+    qualifications_ar: z.string().trim().max(500).optional(),
+    qualifications_en: z.string().trim().max(500).optional(),
+    bio_ar: z.string().trim().max(2000).optional(),
+    bio_en: z.string().trim().max(2000).optional(),
+    hourly_rate: z.coerce.number().min(0).max(50000).optional(),
+    is_public: z.boolean().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid teacher update payload' });
+    return;
+  }
+  const sb = requireSupabaseAdmin();
+  const { error } = await sb.from('teachers').update(parsed.data).eq('id', id).is('deleted_at', null);
+  if (error) {
+    res.status(500).json({ error: error.message });
+    return;
+  }
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_TEACHER', 'teacher', id, parsed.data);
+  res.json({ ok: true });
+}));
+
 app.delete('/api/admin/teachers/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = Number(req.params.id);
   const sb = requireSupabaseAdmin();
@@ -1949,7 +3783,7 @@ app.post('/api/admin/students', authenticate, requireRole('admin'), asyncHandler
   const guardian = await insertRowSafe<{ id: number }>('guardians', {
     full_name: guardian_name || 'ولي أمر',
     phone: guardian_phone || '',
-    email: guardian_email || cleanEmail,
+    email: (guardian_email || cleanEmail).trim().toLowerCase(),
     relation: 'ولي أمر',
   });
 
@@ -1975,6 +3809,77 @@ app.post('/api/admin/students', authenticate, requireRole('admin'), asyncHandler
 
   await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_STUDENT', 'student', student.id, { email: cleanEmail, full_name_ar: cleanName });
   res.status(201).json({ id: student.id, student_code: code, temporary_password: tempPassword });
+}));
+
+app.patch('/api/admin/students/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const id = Number(req.params.id);
+  const schema = z.object({
+    full_name_ar: z.string().trim().min(1).max(160).optional(),
+    full_name_en: z.string().trim().min(1).max(160).optional(),
+    age: z.coerce.number().int().min(3).max(25).optional(),
+    level_id: z.coerce.number().int().positive().optional(),
+    status: z.enum(['active', 'paused', 'graduated']).optional(),
+    guardian_name: z.string().trim().max(140).optional(),
+    guardian_phone: z.string().trim().max(32).optional(),
+    guardian_email: z.string().trim().email().max(160).optional().or(z.literal('')),
+    unlink_guardian_account: z.boolean().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid student update payload' });
+    return;
+  }
+
+  const sb = requireSupabaseAdmin();
+  const { data: studentRow } = await sb
+    .from('students')
+    .select('id, guardian_id')
+    .eq('id', id)
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (!studentRow) {
+    res.status(404).json({ error: 'Student not found' });
+    return;
+  }
+
+  const studentUpdates: Record<string, unknown> = {};
+  if (parsed.data.full_name_ar !== undefined) studentUpdates.full_name_ar = parsed.data.full_name_ar;
+  if (parsed.data.full_name_en !== undefined) studentUpdates.full_name_en = parsed.data.full_name_en;
+  if (parsed.data.age !== undefined) studentUpdates.age = parsed.data.age;
+  if (parsed.data.level_id !== undefined) studentUpdates.level_id = parsed.data.level_id;
+  if (parsed.data.status !== undefined) studentUpdates.status = parsed.data.status;
+
+  if (Object.keys(studentUpdates).length) {
+    await sb.from('students').update(studentUpdates).eq('id', id);
+  }
+
+  const guardianUpdates: Record<string, unknown> = {};
+  if (parsed.data.guardian_name !== undefined) guardianUpdates.full_name = parsed.data.guardian_name;
+  if (parsed.data.guardian_phone !== undefined) guardianUpdates.phone = parsed.data.guardian_phone;
+  if (parsed.data.guardian_email !== undefined && parsed.data.guardian_email !== '') {
+    guardianUpdates.email = parsed.data.guardian_email.trim().toLowerCase();
+  }
+  if (parsed.data.unlink_guardian_account) {
+    guardianUpdates.profile_id = null;
+  }
+
+  if (Object.keys(guardianUpdates).length) {
+    if (studentRow.guardian_id) {
+      await sb.from('guardians').update(guardianUpdates).eq('id', studentRow.guardian_id);
+    } else if (guardianUpdates.email || guardianUpdates.full_name) {
+      const createdGuardian = await insertRowSafe<{ id: number }>('guardians', {
+        full_name: String(guardianUpdates.full_name || 'ولي أمر'),
+        phone: String(guardianUpdates.phone || ''),
+        email: String(guardianUpdates.email || ''),
+        relation: 'ولي أمر',
+      });
+      await sb.from('students').update({ guardian_id: createdGuardian.id }).eq('id', id);
+    }
+  }
+
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_STUDENT', 'student', id, parsed.data);
+  res.json({ ok: true });
 }));
 
 app.patch('/api/admin/students/:id/level', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
@@ -2017,6 +3922,14 @@ app.post('/api/admin/enrollments', authenticate, requireRole('admin'), asyncHand
     course_id: courseId,
   });
   res.status(201).json({ ok: true });
+}));
+
+app.delete('/api/admin/enrollments/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const id = Number(req.params.id);
+  const sb = requireSupabaseAdmin();
+  await sb.from('enrollments').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'REMOVE_ENROLLMENT', 'enrollment', id, {});
+  res.json({ ok: true });
 }));
 
 app.post('/api/admin/admissions/:id/decision', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
@@ -2171,24 +4084,50 @@ app.post('/api/admin/announcements', authenticate, requireRole('admin'), asyncHa
     });
   }
 
-  void broadcastRealtimeEvent('notification:created', {
-    announcementId: ann.id,
-    targetProfileIds,
-    title_ar,
-    title_en: title_en || title_ar,
-  });
+  void broadcastRealtimeEvent('notification:created', { kind: 'notification' });
 
   res.status(201).json({ id: ann.id });
 }));
 
 app.post('/api/admin/exams', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const { course_id, title_ar, title_en, exam_date, max_score } = req.body;
+  const parsed = examCreateOrUpdateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid exam payload', details: parsed.error.flatten().fieldErrors });
+    return;
+  }
+  const sb = requireSupabaseAdmin();
+  const questions = normalizeQuestions(parsed.data.questions);
   const inserted = await insertRowSafe<{ id: number }>('exams', {
-    course_id: Number(course_id),
-    title_ar,
-    title_en: title_en || title_ar,
-    exam_date,
-    max_score: Number(max_score || 100),
+    course_id: parsed.data.course_id,
+    title_ar: parsed.data.title_ar,
+    title_en: parsed.data.title_en?.trim() || parsed.data.title_ar,
+    exam_date: parsed.data.exam_date,
+    max_score: parsed.data.max_score,
+  });
+  await saveExamVaultConfig(sb, {
+    exam_id: inserted.id,
+    exam_mode: parsed.data.exam_mode,
+    instructions_ar: parsed.data.instructions_ar || '',
+    instructions_en: parsed.data.instructions_en || parsed.data.instructions_ar || '',
+    available_from: parsed.data.available_from || null,
+    due_at: parsed.data.due_at || null,
+    allow_late_submission: parsed.data.allow_late_submission,
+    show_answers_after_submit: parsed.data.show_answers_after_submit,
+    question_file: null,
+    questions,
+    updated_at: new Date().toISOString(),
+  });
+  if (parsed.data.notify_students) {
+    await notifyCourseExamPublished(
+      sb,
+      parsed.data.course_id,
+      parsed.data.title_ar,
+      parsed.data.title_en?.trim() || parsed.data.title_ar
+    );
+  }
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_EXAM', 'exam', inserted.id, {
+    course_id: parsed.data.course_id,
+    exam_mode: parsed.data.exam_mode,
   });
   res.status(201).json({ id: inserted.id });
 }));
@@ -2211,11 +4150,7 @@ app.post('/api/admin/certificates', authenticate, requireRole('admin'), asyncHan
     student_id,
     course_id,
   });
-  void broadcastRealtimeEvent('academic:updated', {
-    kind: 'certificate',
-    student_id: Number(student_id),
-    verification_code: code,
-  });
+  void broadcastRealtimeEvent('academic:updated', { kind: 'certificate' });
   res.status(201).json({ id: inserted.id, verification_code: code });
 }));
 
@@ -2325,6 +4260,82 @@ app.post('/api/admin/supabase/sync-users', authenticate, requireRole('admin'), a
   );
   await writeAuditLog(req.user!.id, req.user!.full_name, 'SYNC_SUPABASE_AUTH', 'supabase', 'auth', result);
   res.json(result);
+}));
+
+function resolvePublicBaseUrl(req: Request): string {
+  const configured = process.env.APP_URL?.trim();
+  if (configured && configured !== 'MY_APP_URL' && /^https?:\/\//i.test(configured)) {
+    try {
+      return new URL(configured).origin;
+    } catch {
+      // fall back to request host
+    }
+  }
+  const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+  const host = String(req.headers['x-forwarded-host'] || req.get('host') || 'localhost:3000').split(',')[0].trim();
+  return `${proto}://${host}`;
+}
+
+app.get('/robots.txt', (req, res) => {
+  const baseUrl = resolvePublicBaseUrl(req);
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.send(
+    `User-agent: *\nAllow: /\nDisallow: /dashboard\nDisallow: /login\nDisallow: /api/\n\nSitemap: ${baseUrl}/sitemap.xml\n`
+  );
+});
+
+app.get('/sitemap.xml', asyncHandler(async (req, res) => {
+  const baseUrl = resolvePublicBaseUrl(req);
+  const staticPaths: Array<{ path: string; priority: string }> = [
+    { path: '/', priority: '1.0' },
+    { path: '/courses', priority: '0.9' },
+    { path: '/teachers', priority: '0.8' },
+    { path: '/levels', priority: '0.8' },
+    { path: '/placement', priority: '0.9' },
+    { path: '/apply', priority: '0.9' },
+    { path: '/parents', priority: '0.8' },
+    { path: '/games', priority: '0.8' },
+    { path: '/verify', priority: '0.7' },
+    { path: '/how-it-works', priority: '0.7' },
+    { path: '/faq', priority: '0.6' },
+    { path: '/contact', priority: '0.7' },
+    { path: '/legal/terms', priority: '0.4' },
+    { path: '/legal/privacy', priority: '0.4' },
+    { path: '/legal/refund', priority: '0.4' },
+  ];
+
+  const dynamicUrls: Array<{ path: string; priority: string }> = [];
+  try {
+    const sb = requireSupabaseAdmin();
+    const [{ data: courses }, { data: teachers }, { data: games }] = await Promise.all([
+      sb.from('courses').select('id').is('deleted_at', null),
+      sb.from('teachers').select('id').is('deleted_at', null).eq('is_public', true),
+      sb.from('games').select('slug').eq('is_active', true),
+    ]);
+    for (const c of courses || []) {
+      dynamicUrls.push({ path: `/courses/${c.id}`, priority: '0.8' });
+    }
+    for (const t of teachers || []) {
+      dynamicUrls.push({ path: `/teachers/${t.id}`, priority: '0.7' });
+    }
+    for (const g of games || []) {
+      dynamicUrls.push({ path: `/games/${g.slug}`, priority: '0.7' });
+    }
+  } catch {
+    // Serve static URLs if DB query fails
+  }
+
+  const urls = [...staticPaths, ...dynamicUrls]
+    .map(
+      (u) =>
+        `  <url><loc>${baseUrl}${u.path}</loc><priority>${u.priority}</priority></url>`
+    )
+    .join('\n');
+
+  res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls}\n</urlset>\n`);
 }));
 
 // Unmatched API endpoints return structured JSON 404 instead of SPA HTML

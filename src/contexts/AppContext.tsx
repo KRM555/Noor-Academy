@@ -21,6 +21,7 @@ interface AppContextValue {
   authLoading: boolean;
   loginWithCredentials: (email: string, password: string) => Promise<AuthUser>;
   loginDemoRole: (demoRole: 'admin' | 'teacher1' | 'teacher2' | 'student' | 'guardian') => Promise<AuthUser>;
+  setAuthSession: (token: string, user: AuthUser) => void;
   logout: () => void;
   notifications: NotificationItem[];
   refreshNotifications: () => Promise<void>;
@@ -107,14 +108,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     async function initAuth() {
-      const token = getStoredToken();
-      if (!token) {
-        setAuthLoading(false);
-        return;
-      }
       try {
-        const res = await apiFetch<{ user: AuthUser }>('/api/auth/me');
-        setUser(res.user);
+        const res = await apiFetch<{ user: AuthUser | null }>('/api/auth/session');
+        if (res.user) {
+          setUser(res.user);
+        } else {
+          setStoredToken(null);
+          setUser(null);
+        }
       } catch {
         setStoredToken(null);
         setUser(null);
@@ -147,7 +148,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return res.user;
   };
 
+  const setAuthSession = useCallback(
+    (token: string, nextUser: AuthUser) => {
+      setStoredToken(token);
+      setUser(nextUser);
+      void qc.invalidateQueries({ queryKey: queryKeys.notifications(nextUser.id) });
+    },
+    [qc]
+  );
+
   const logout = () => {
+    void apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
     setStoredToken(null);
     setUser(null);
     qc.removeQueries({ queryKey: ['dashboard'] });
@@ -168,6 +179,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         authLoading,
         loginWithCredentials,
         loginDemoRole,
+        setAuthSession,
         logout,
         notifications,
         refreshNotifications,

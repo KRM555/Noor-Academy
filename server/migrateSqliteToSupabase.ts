@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -59,14 +60,16 @@ async function main() {
 
   const profileIdMap = new Map<number, string>();
   const profileRows: Array<Record<string, unknown>> = [];
+  let createdAuthUsers = 0;
 
   for (const p of sqliteProfiles) {
     const email = p.email.trim().toLowerCase();
     let uuid = authByEmail.get(email);
     if (!uuid) {
+      const randomPassword = `NB-${crypto.randomBytes(16).toString('base64url')}`;
       const { data: created, error: createErr } = await sb.auth.admin.createUser({
         email,
-        password: 'Noor2026!',
+        password: randomPassword,
         email_confirm: true,
         user_metadata: { full_name: p.full_name, role: p.role },
       });
@@ -75,6 +78,7 @@ async function main() {
       }
       uuid = created.user.id;
       authByEmail.set(email, uuid);
+      createdAuthUsers++;
     }
     profileIdMap.set(p.id, uuid);
     profileRows.push({
@@ -92,7 +96,10 @@ async function main() {
     const { error } = await sb.from('profiles').upsert(profileRows, { onConflict: 'id' });
     if (error) throw new Error('profiles upsert failed: ' + error.message);
   }
-  console.log(`Migrated profiles: ${profileRows.length}`);
+  console.log(`Migrated profiles: ${profileRows.length} (newly provisioned Auth accounts with random passwords: ${createdAuthUsers})`);
+  if (createdAuthUsers > 0) {
+    console.log('Notice: Newly created Auth users were assigned unique random passwords. Trigger password reset emails before user sign-in.');
+  }
 
   const mapPid = (oldId: unknown): string | null => {
     if (oldId === null || oldId === undefined) return null;

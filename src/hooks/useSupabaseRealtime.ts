@@ -3,6 +3,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useApp } from '../contexts/AppContext';
 import { getBrowserSupabase } from '../lib/supabase';
 import { queryKeys } from '../lib/queryClient';
+import type { NotificationItem } from '../types';
 
 export function useSupabaseRealtime() {
   const { user, lang, toast } = useApp();
@@ -15,17 +16,15 @@ export function useSupabaseRealtime() {
 
     const channel = sb
       .channel('noor-bayan-live')
-      .on('broadcast', { event: 'notification:created' }, (msg) => {
-        const payload = (msg.payload || {}) as {
-          targetProfileIds?: string[];
-          title_ar?: string;
-          title_en?: string;
-        };
-        const targets = Array.isArray(payload.targetProfileIds) ? payload.targetProfileIds : [];
-        if (targets.length === 0 || targets.includes(String(user.id))) {
-          void qc.invalidateQueries({ queryKey: queryKeys.notifications(user.id) });
-          void qc.invalidateQueries({ queryKey: ['dashboard'] });
-          const title = lang === 'ar' ? payload.title_ar : payload.title_en || payload.title_ar;
+      .on('broadcast', { event: 'notification:created' }, async () => {
+        const prev = qc.getQueryData<NotificationItem[]>(queryKeys.notifications(user.id)) || [];
+        const prevMaxId = prev.reduce((max, n) => Math.max(max, Number(n.id) || 0), 0);
+        await qc.invalidateQueries({ queryKey: queryKeys.notifications(user.id) });
+        void qc.invalidateQueries({ queryKey: ['dashboard'] });
+        const next = qc.getQueryData<NotificationItem[]>(queryKeys.notifications(user.id)) || [];
+        const newest = next.find((n) => Number(n.id) > prevMaxId && !n.is_read);
+        if (newest) {
+          const title = lang === 'ar' ? newest.title_ar : newest.title_en || newest.title_ar;
           toast(
             title
               ? `${lang === 'ar' ? 'إشعار جديد:' : 'New notification:'} ${title}`

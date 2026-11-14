@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Award, Search, CheckCircle2, XCircle, Gamepad2, PhoneCall, Mail, BookOpen } from 'lucide-react';
+import { Award, Search, CheckCircle2, XCircle, Gamepad2, PhoneCall, Mail, BookOpen, Clock, ExternalLink } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { apiFetch } from '../../lib/api';
 import { queryKeys } from '../../lib/queryClient';
@@ -28,11 +28,11 @@ export function CoursesPage({
           <h1 className="text-3xl font-extrabold">{t.coursesTitle}</h1>
           <p className="text-slate-600 dark:text-slate-300">{t.coursesSubtitle}</p>
         </div>
-        <div className="lg:col-span-5 rounded-2xl overflow-hidden border border-[#E5DEC9] dark:border-[#233C63]">
+        <div className="lg:col-span-5 rounded-2xl overflow-hidden border border-[#E5DEC9] dark:border-[#233C63] bg-[#FAF8F3] dark:bg-[#091529] shadow-sm">
           <ResilientImage
-            src="/assets/images/academy_banner.webp"
-            alt={t.brandFull}
-            className="w-full h-44 object-cover"
+            src="/assets/images/virtual_classroom.webp"
+            alt={lang === 'ar' ? 'حلقات التعلم التفاعلية في أكاديمية نور وبيان' : 'Interactive virtual learning classroom at Noor & Bayan Academy'}
+            className="w-full h-auto block"
           />
         </div>
       </div>
@@ -336,7 +336,10 @@ export function LevelsPage({ overview, onNavigate }: { overview: PublicOverview 
 
 export function VerifyCertificatePage() {
   const { lang } = useApp();
-  const [code, setCode] = useState('NB-CERT-2026-8841');
+  const [code, setCode] = useState(() => {
+    const fromQuery = new URLSearchParams(window.location.search).get('code');
+    return fromQuery?.trim() || 'NB-CERT-2026-8841';
+  });
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<{
     valid: boolean;
@@ -354,17 +357,29 @@ export function VerifyCertificatePage() {
     };
   } | null>(null);
 
-  const handleVerify = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!code.trim()) return;
+  const verifyCode = useCallback(async (targetCode: string) => {
+    const trimmed = targetCode.trim();
+    if (!trimmed) return;
     setLoading(true);
     try {
-      const res = await fetch(`/api/public/certificates/verify/${encodeURIComponent(code.trim())}`);
+      const res = await fetch(`/api/public/certificates/verify/${encodeURIComponent(trimmed)}`);
       const data = await res.json();
       setResult(data);
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  useEffect(() => {
+    const fromQuery = new URLSearchParams(window.location.search).get('code');
+    if (fromQuery?.trim()) {
+      void verifyCode(fromQuery.trim());
+    }
+  }, [verifyCode]);
+
+  const handleVerify = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await verifyCode(code);
   };
 
   return (
@@ -496,7 +511,7 @@ export function InfoStaticPage({
   legalDocs,
   onNavigate,
 }: {
-  mode: 'how-it-works' | 'parents' | 'faq' | 'terms' | 'privacy' | 'refund';
+  mode: 'how-it-works' | 'parents' | 'faq' | 'contact' | 'terms' | 'privacy' | 'refund';
   legalDocs: LegalDocument[];
   onNavigate: (p: string) => void;
 }) {
@@ -602,18 +617,152 @@ export function InfoStaticPage({
     );
   }
 
+  if (mode === 'contact') {
+    return (
+      <div className="max-w-4xl mx-auto px-4 sm:px-6 py-12 space-y-8">
+        <div className="space-y-2">
+          <h1 className="text-3xl font-extrabold">{dict[lang].contactUs}</h1>
+          <p className="text-slate-600 dark:text-slate-300">
+            {lang === 'ar'
+              ? 'فريق الإشراف الأكاديمي وخدمة أولياء الأمور جاهز للرد على استفساراتكم ومساعدتكم في اختيار الحلقة الأنسب.'
+              : 'Our academic care team is ready to answer your questions and help choose the right circle for your child.'}
+          </p>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <Card className="p-6 space-y-4">
+            <div className="flex items-center gap-3 text-[#0F766E] dark:text-[#2DD4BF]">
+              <PhoneCall className="w-6 h-6" />
+              <h2 className="text-lg font-bold">{lang === 'ar' ? 'التواصل السريع عبر واتساب' : 'Direct WhatsApp Support'}</h2>
+            </div>
+            <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+              {lang === 'ar'
+                ? 'استفسر مباشرة عن المواعيد المتاحة، خطط الرسوم، وتحديد المستوى للأطفال.'
+                : 'Ask directly about available schedules, tuition plans, and child placement.'}
+            </p>
+            <div className="font-mono-tabular text-sm font-bold">+20 100 555 0199</div>
+            <a
+              href="https://wa.me/201005550199"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-bold bg-[#0F766E] hover:bg-[#0D625B] text-white transition-colors"
+            >
+              <span>{lang === 'ar' ? 'راسلنا على واتساب' : 'Chat on WhatsApp'}</span>
+              <ExternalLink className="w-4 h-4" />
+            </a>
+          </Card>
+
+          <Card className="p-6 space-y-4">
+            <div className="flex items-center gap-3 text-[#C98A1E]">
+              <Mail className="w-6 h-6" />
+              <h2 className="text-lg font-bold">{lang === 'ar' ? 'البريد الإلكتروني الرسمي' : 'Official Email'}</h2>
+            </div>
+            <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+              {lang === 'ar'
+                ? 'للمراسلات الإدارية، متابعة الشهادات المعتمدة، أو استفسارات المعلمين.'
+                : 'For administrative inquiries, certificate support, or teaching applications.'}
+            </p>
+            <div className="font-mono-tabular text-sm font-bold">care@noorbayan.academy</div>
+            <a
+              href="mailto:care@noorbayan.academy"
+              className="inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-bold bg-[#EFEAD8] hover:bg-[#E5DEC9] dark:bg-[#162C4E] dark:hover:bg-[#1F3A66] text-[#0F213E] dark:text-white transition-colors"
+            >
+              <span>{lang === 'ar' ? 'إرسال رسالة بريدية' : 'Send Email'}</span>
+              <Mail className="w-4 h-4" />
+            </a>
+          </Card>
+        </div>
+
+        <Card className="p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-[#F2EFE6] dark:bg-[#13284A]">
+          <div className="flex items-start gap-3">
+            <Clock className="w-5 h-5 text-[#C98A1E] shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <div className="font-bold text-sm">
+                {lang === 'ar' ? 'ساعات عمل الإشراف والدعم' : 'Support Hours'}
+              </div>
+              <div className="text-xs text-slate-600 dark:text-slate-300">
+                {lang === 'ar'
+                  ? 'السبت إلى الخميس — من الساعة ٩ صباحاً حتى ٩ مساءً بتوقيت القاهرة'
+                  : 'Saturday – Thursday, 9:00 AM – 9:00 PM (Cairo Time)'}
+              </div>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <SecondaryButton onClick={() => onNavigate('/placement')}>
+              {dict[lang].ctaPlacement}
+            </SecondaryButton>
+            <PrimaryButton onClick={() => onNavigate('/apply')}>
+              {dict[lang].ctaApply}
+            </PrimaryButton>
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
+  const faqItems = [
+    {
+      qAr: 'ما الفئات العمرية المناسبة للالتحاق بأكاديمية نور وبيان؟',
+      aAr: 'تستقبل الأكاديمية الأطفال والناشئة من عمر ٤ سنوات وحتى ١٨ عاماً عبر مسارات متدرجة تبدأ بتأسيس نور البيان وصولاً إلى حفظ القرآن الكريم والتجويد والمناهج الدولية.',
+      qEn: 'Which age groups can enroll at Noor & Bayan Academy?',
+      aEn: 'We welcome learners from ages 4 to 18 across structured tracks from Noor Al-Bayan reading foundations to Quran memorization, Tajweed, and school support.',
+    },
+    {
+      qAr: 'كيف يتم تحديد المستوى المناسب لطفلي قبل بدء الحصص؟',
+      aAr: 'يمكنك إجراء اختبار تحديد المستوى المجاني عبر المنصة خلال دقائق، ثم يراجع المشرف التربوي النتيجة ويوجه الطالب للحلقة الأنسب له.',
+      qEn: 'How is my child placed into the right learning level?',
+      aEn: 'Complete the free placement assessment online in minutes, and our academic supervisor assigns your child to the matching circle.',
+    },
+    {
+      qAr: 'كيف يتابع ولي الأمر حضور الطفل ومستواه في التسميع؟',
+      aAr: 'يتوفر لولي الأمر حساب خاص يتيح متابعة سجل الحضور لكل حصة، درجات التسميع والتجويد، نتائج الاختبارات، وتقارير السلوك والمشاركة لحظياً.',
+      qEn: 'How can parents monitor attendance and recitation progress?',
+      aEn: 'Each guardian receives a dedicated dashboard showing live session attendance, Tajweed & memorization scores, exam grades, and teacher evaluations.',
+    },
+    {
+      qAr: 'هل الشهادات الصادرة عن الأكاديمية موثقة؟',
+      aAr: 'نعم، تحمل كل شهادة رمز تحقق فريد ورمز استجابة سريعة (QR) يتيح التحقق الفوري من صحتها عبر صفحة التحقق الرسمية في الموقع.',
+      qEn: 'Are academy certificates officially verifiable?',
+      aEn: 'Yes. Every certificate includes a unique verification code and QR code for instant authenticity verification on our website.',
+    },
+  ];
+
   return (
     <div className="max-w-3xl mx-auto px-4 sm:px-6 py-12 space-y-6">
-      <h1 className="text-3xl font-extrabold">{dict[lang].faqTitle} &amp; {dict[lang].contactUs}</h1>
-      <Card className="p-6 space-y-4">
-        <div className="flex items-center gap-3">
-          <PhoneCall className="w-5 h-5 text-[#0F766E] dark:text-[#2DD4BF]" />
-          <span className="font-mono-tabular text-sm">WhatsApp: +20 100 555 0199</span>
+      <div className="space-y-2">
+        <h1 className="text-3xl font-extrabold">{dict[lang].faqTitle}</h1>
+        <p className="text-sm text-slate-600 dark:text-slate-300">
+          {lang === 'ar'
+            ? 'إجابات سريعة على أكثر أسئلة أولياء الأمور شيوعاً.'
+            : 'Quick answers to the most common parent and student questions.'}
+        </p>
+      </div>
+
+      <div className="space-y-4">
+        {faqItems.map((item, idx) => (
+          <Card key={idx} className="p-5 sm:p-6 space-y-2">
+            <h2 className="font-bold text-base text-[#0F213E] dark:text-white">
+              {lang === 'ar' ? item.qAr : item.qEn}
+            </h2>
+            <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+              {lang === 'ar' ? item.aAr : item.aEn}
+            </p>
+          </Card>
+        ))}
+      </div>
+
+      <Card className="p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div className="space-y-1">
+          <div className="font-bold text-sm">
+            {lang === 'ar' ? 'لديك استفسار آخر؟' : 'Have another question?'}
+          </div>
+          <div className="text-xs text-slate-500">
+            care@noorbayan.academy · +20 100 555 0199
+          </div>
         </div>
-        <div className="flex items-center gap-3">
-          <Mail className="w-5 h-5 text-[#C98A1E]" />
-          <span className="font-mono-tabular text-sm">care@noorbayan.academy</span>
-        </div>
+        <PrimaryButton onClick={() => onNavigate('/contact')}>
+          {dict[lang].contactUs}
+        </PrimaryButton>
       </Card>
     </div>
   );

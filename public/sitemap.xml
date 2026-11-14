@@ -11,6 +11,7 @@
   <url><loc>/verify</loc><priority>0.7</priority></url>
   <url><loc>/how-it-works</loc><priority>0.7</priority></url>
   <url><loc>/faq</loc><priority>0.6</priority></url>
+  <url><loc>/contact</loc><priority>0.7</priority></url>
   <url><loc>/legal/terms</loc><priority>0.4</priority></url>
   <url><loc>/legal/privacy</loc><priority>0.4</priority></url>
   <url><loc>/legal/refund</loc><priority>0.4</priority></url>

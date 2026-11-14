@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { Suspense, lazy, useEffect, useState, useCallback, useRef } from 'react';
 import {
   Home,
   BookOpen,
@@ -42,14 +42,29 @@ import {
 } from './pages/public/PublicSubpages';
 import { LoginPage } from './pages/auth/LoginPage';
 import { DashboardShell, type NavTab } from './components/dashboard/DashboardShell';
-import { StudentDashboard } from './pages/dashboard/StudentDashboard';
-import { TeacherDashboard } from './pages/dashboard/TeacherDashboard';
-import { GuardianDashboard } from './pages/dashboard/GuardianDashboard';
-import { AdminDashboard } from './pages/dashboard/AdminDashboard';
-import { NoorLettersGame } from './components/games/NoorLettersGame';
-import { QuranMemoryGame } from './components/games/QuranMemoryGame';
-import { Noor3DExplorer } from './components/games/Noor3DExplorer';
 import { LoadingState } from './components/ui/CommonUI';
+
+const StudentDashboard = lazy(() =>
+  import('./pages/dashboard/StudentDashboard').then((m) => ({ default: m.StudentDashboard }))
+);
+const TeacherDashboard = lazy(() =>
+  import('./pages/dashboard/TeacherDashboard').then((m) => ({ default: m.TeacherDashboard }))
+);
+const GuardianDashboard = lazy(() =>
+  import('./pages/dashboard/GuardianDashboard').then((m) => ({ default: m.GuardianDashboard }))
+);
+const AdminDashboard = lazy(() =>
+  import('./pages/dashboard/AdminDashboard').then((m) => ({ default: m.AdminDashboard }))
+);
+const NoorLettersGame = lazy(() =>
+  import('./components/games/NoorLettersGame').then((m) => ({ default: m.NoorLettersGame }))
+);
+const QuranMemoryGame = lazy(() =>
+  import('./components/games/QuranMemoryGame').then((m) => ({ default: m.QuranMemoryGame }))
+);
+const Noor3DExplorer = lazy(() =>
+  import('./components/games/Noor3DExplorer').then((m) => ({ default: m.Noor3DExplorer }))
+);
 import { OfflineIndicator } from './components/ui/PWAComponents';
 import { useSupabaseRealtime } from './hooks/useSupabaseRealtime';
 
@@ -93,9 +108,9 @@ function RouterContent() {
   const { user, authLoading, lang } = useApp();
   useSupabaseRealtime();
   const [path, setPath] = useState<string>(() => window.location.pathname || '/');
-  const [activeGameSlug, setActiveGameSlug] = useState<string | null>(null);
   const [preCourseId, setPreCourseId] = useState<number | null>(null);
   const [preLevelId, setPreLevelId] = useState<number | null>(null);
+  const lastPathBeforeGameRef = useRef<string>('/games');
 
   const { data: overview = null } = useQuery({
     queryKey: queryKeys.publicOverview,
@@ -107,6 +122,16 @@ function RouterContent() {
     window.history.pushState({}, '', nextPath);
     setPath(nextPath);
   }, []);
+
+  const launchGame = useCallback(
+    (slug: string) => {
+      if (!path.startsWith('/games/')) {
+        lastPathBeforeGameRef.current = path || '/games';
+      }
+      navigate(`/games/${slug}`);
+    },
+    [path, navigate]
+  );
 
   useEffect(() => {
     const onPop = () => setPath(window.location.pathname || '/');
@@ -182,6 +207,12 @@ function RouterContent() {
         descAr: 'إجابات شاملة حول مواعيد الحصص، المناهج، الرسوم، ونظام المتابعة في أكاديمية نور وبيان.',
         descEn: 'Answers to common questions about schedules, curricula, tuition, and parent reporting.',
       },
+      '/contact': {
+        titleAr: 'تواصل معنا | أكاديمية نور وبيان',
+        titleEn: 'Contact Us | Noor & Bayan Academy',
+        descAr: 'تواصل مع فريق أكاديمية نور وبيان عبر واتساب أو البريد الإلكتروني للاستفسار عن الحلقات وتحديد المستوى.',
+        descEn: 'Contact Noor & Bayan Academy via WhatsApp or email for course schedules and placement support.',
+      },
       '/login': {
         titleAr: 'تسجيل الدخول الموحد | أكاديمية نور وبيان',
         titleEn: 'Unified Sign In | Noor & Bayan Academy',
@@ -201,6 +232,8 @@ function RouterContent() {
       ? seoMap['/courses']
       : path.startsWith('/teachers/')
       ? seoMap['/teachers']
+      : path.startsWith('/games/')
+      ? seoMap['/games']
       : seoMap[path] || seoMap['/'];
 
     const nextTitle = lang === 'ar' ? meta.titleAr : meta.titleEn;
@@ -212,18 +245,42 @@ function RouterContent() {
   }, [path, lang]);
 
   const exitGame = useCallback(() => {
-    setActiveGameSlug(null);
     void queryClient.invalidateQueries({ queryKey: ['dashboard', 'student'] });
-  }, []);
+    const target = lastPathBeforeGameRef.current || '/games';
+    navigate(target.startsWith('/games/') ? '/games' : target);
+  }, [navigate]);
+
+  const gameFallback = (
+    <div className="min-h-screen flex items-center justify-center bg-[#FAF8F3] dark:bg-[#091529] p-8">
+      <div className="w-full max-w-md">
+        <LoadingState />
+      </div>
+    </div>
+  );
+
+  const gameMatch = path.match(/^\/games\/([a-z0-9-]+)$/);
+  const activeGameSlug = gameMatch ? gameMatch[1] : null;
 
   if (activeGameSlug === 'noor-letters') {
-    return <NoorLettersGame onExit={exitGame} />;
+    return (
+      <Suspense fallback={gameFallback}>
+        <NoorLettersGame onExit={exitGame} />
+      </Suspense>
+    );
   }
   if (activeGameSlug === 'quran-memory') {
-    return <QuranMemoryGame onExit={exitGame} />;
+    return (
+      <Suspense fallback={gameFallback}>
+        <QuranMemoryGame onExit={exitGame} />
+      </Suspense>
+    );
   }
   if (activeGameSlug === 'noor-3d-lantern') {
-    return <Noor3DExplorer onExit={exitGame} />;
+    return (
+      <Suspense fallback={gameFallback}>
+        <Noor3DExplorer onExit={exitGame} />
+      </Suspense>
+    );
   }
 
   // Dashboard Route Guard
@@ -253,14 +310,16 @@ function RouterContent() {
         onSelectTab={(tabId) => navigate(`/dashboard/${tabId}`)}
         onNavigatePublic={navigate}
       >
-        {user.role === 'student' && (
-          <StudentDashboard activeTab={requestedTab} onLaunchGame={setActiveGameSlug} />
-        )}
-        {user.role === 'teacher' && <TeacherDashboard activeTab={requestedTab} />}
-        {user.role === 'guardian' && <GuardianDashboard activeTab={requestedTab} />}
-        {user.role === 'admin' && (
-          <AdminDashboard activeTab={requestedTab} onLaunchGame={setActiveGameSlug} />
-        )}
+        <Suspense fallback={<LoadingState />}>
+          {user.role === 'student' && (
+            <StudentDashboard activeTab={requestedTab} onLaunchGame={launchGame} />
+          )}
+          {user.role === 'teacher' && <TeacherDashboard activeTab={requestedTab} />}
+          {user.role === 'guardian' && <GuardianDashboard activeTab={requestedTab} />}
+          {user.role === 'admin' && (
+            <AdminDashboard activeTab={requestedTab} onLaunchGame={launchGame} />
+          )}
+        </Suspense>
       </DashboardShell>
     );
   }
@@ -275,7 +334,7 @@ function RouterContent() {
         <HomePage
           overview={overview}
           onNavigate={navigate}
-          onLaunchGame={setActiveGameSlug}
+          onLaunchGame={launchGame}
         />
       )}
 
@@ -317,7 +376,7 @@ function RouterContent() {
       )}
 
       {path === '/games' && (
-        <GamesHubPage overview={overview} onLaunchGame={setActiveGameSlug} />
+        <GamesHubPage overview={overview} onLaunchGame={launchGame} />
       )}
 
       {path === '/levels' && <LevelsPage overview={overview} onNavigate={navigate} />}
@@ -351,6 +410,9 @@ function RouterContent() {
       )}
       {path === '/faq' && (
         <InfoStaticPage mode="faq" legalDocs={overview?.legal || []} onNavigate={navigate} />
+      )}
+      {path === '/contact' && (
+        <InfoStaticPage mode="contact" legalDocs={overview?.legal || []} onNavigate={navigate} />
       )}
       {path === '/legal/terms' && (
         <InfoStaticPage mode="terms" legalDocs={overview?.legal || []} onNavigate={navigate} />

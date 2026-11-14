@@ -1,11 +1,19 @@
 import React, { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
-import { Users, BookOpen, CheckCircle2, Award, Download, Heart } from 'lucide-react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+} from 'recharts';
+import { Users, BookOpen, CheckCircle2, Award, Download, Heart, Link2 } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { apiFetch } from '../../lib/api';
 import { queryKeys } from '../../lib/queryClient';
 import { tField } from '../../i18n/translations';
-import { generateCertificatePDF } from '../../lib/pdfCertificate';
 import { Card, LoadingState, EmptyState, ResponsiveTable, PrimaryButton } from '../../components/ui/CommonUI';
 import { ChangePasswordCard } from '../../components/dashboard/ChangePasswordCard';
 
@@ -26,18 +34,69 @@ interface GuardianPayload {
   enrollments: Array<{ id: number; student_id: number; title_ar: string; title_en: string; schedule_ar: string; schedule_en: string; teacher_name_ar: string; teacher_name_en: string }>;
   attendance: Array<{ id: number; student_id: number; lesson_title_ar: string; lesson_title_en: string; lesson_date: string; status: string; notes: string }>;
   recitations: Array<{ id: number; student_id: number; surah_name: string; ayah_from: number; ayah_to: number; tajweed_score: number; memorization_score: number; notes_ar: string; course_title_ar: string }>;
+  exams?: Array<{
+    id: number;
+    student_id: number;
+    course_id: number;
+    title_ar: string;
+    title_en: string;
+    exam_date: string;
+    max_score: number;
+    course_title_ar: string;
+    course_title_en: string;
+    due_at: string | null;
+    has_question_file: boolean;
+    submission: {
+      status: 'submitted_pending' | 'graded';
+      submitted_at: string;
+      is_late: boolean;
+      has_solution_file: boolean;
+      has_graded_file: boolean;
+    } | null;
+    result: {
+      score: number;
+      feedback_ar: string;
+      feedback_en: string;
+    } | null;
+  }>;
   examResults: Array<{ id: number; student_id: number; exam_title_ar: string; exam_title_en: string; exam_date: string; score: number; max_score: number; feedback_ar: string; course_title_ar: string }>;
   evaluations: Array<{ id: number; student_id: number; period: string; behavior_score: number; participation_score: number; summary_ar: string; summary_en: string }>;
   certificates: Array<{ id: number; student_id: number; verification_code: string; title_ar: string; title_en: string; course_title_ar: string; course_title_en: string; grade_label: string; issued_at: string }>;
 }
 
 export function GuardianDashboard({ activeTab }: { activeTab: string }) {
-  const { lang, user } = useApp();
+  const { lang, user, toast } = useApp();
+  const qc = useQueryClient();
   const [selectedChildId, setSelectedChildId] = useState<number | null>(null);
+  const [linkCode, setLinkCode] = useState('');
+  const [linking, setLinking] = useState(false);
+
   const { data, isLoading } = useQuery({
     queryKey: queryKeys.guardianDashboard(user?.id),
     queryFn: () => apiFetch<GuardianPayload>('/api/guardian/dashboard'),
   });
+
+  const handleLinkChild = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!linkCode.trim()) return;
+    setLinking(true);
+    try {
+      const res = await apiFetch<{ ok: boolean; student_code: string; full_name_ar: string }>('/api/guardian/link-child', {
+        method: 'POST',
+        body: JSON.stringify({ student_code: linkCode.trim().toUpperCase() }),
+      });
+      toast(
+        lang === 'ar' ? `تم ربط الطالب ${res.full_name_ar} (${res.student_code}) بنجاح` : `Linked ${res.full_name_ar} (${res.student_code})`,
+        'success'
+      );
+      setLinkCode('');
+      void qc.invalidateQueries({ queryKey: queryKeys.guardianDashboard(user?.id) });
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Unable to link child', 'error');
+    } finally {
+      setLinking(false);
+    }
+  };
 
   if (isLoading) return <LoadingState label={lang === 'ar' ? 'جاري تحميل متابعة الأبناء...' : 'Loading family progress...'} />;
   if (!data) return <EmptyState title={lang === 'ar' ? 'لا توجد بيانات لولي الأمر بعد' : 'Guardian data unavailable'} />;
@@ -49,8 +108,29 @@ export function GuardianDashboard({ activeTab }: { activeTab: string }) {
   const childAttendance = data.attendance.filter((a) => a.student_id === childId);
   const childRecitations = data.recitations.filter((r) => r.student_id === childId);
   const childExams = data.examResults.filter((ex) => ex.student_id === childId);
+  const childAssignedExams = (data.exams || []).filter((ex) => ex.student_id === childId);
   const childEvaluations = data.evaluations.filter((ev) => ev.student_id === childId);
   const childCertificates = data.certificates.filter((c) => c.student_id === childId);
+
+  const openGuardianExamFile = async (examId: number, kind: 'question' | 'solution' | 'graded') => {
+    if (!childId) return;
+    try {
+      const endpoint =
+        kind === 'question'
+          ? `/api/exams/${examId}/question-file`
+          : `/api/exams/${examId}/submissions/${childId}/file?kind=${kind}`;
+      const res = await apiFetch<{ url: string }>(endpoint);
+      const a = document.createElement('a');
+      a.href = res.url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'File unavailable', 'error');
+    }
+  };
 
   const attendanceRate = childAttendance.length
     ? Math.round((childAttendance.filter((a) => a.status === 'present').length / childAttendance.length) * 100)
@@ -77,6 +157,30 @@ export function GuardianDashboard({ activeTab }: { activeTab: string }) {
             <div className="text-xs text-slate-500">{lang === 'ar' ? 'البريد الإلكتروني' : 'Email'}</div>
             <div className="font-mono-tabular font-bold">{data.guardian.email}</div>
           </div>
+        </Card>
+        <Card className="p-6 space-y-3">
+          <div className="flex items-center gap-2 text-sm font-bold">
+            <Link2 className="w-4 h-4 text-[#0F766E] dark:text-[#2DD4BF]" />
+            <span>{lang === 'ar' ? 'ربط طالب آخر بحسابي (بكود الطالب)' : 'Link Another Child via Student Code'}</span>
+          </div>
+          <p className="text-xs text-slate-500">
+            {lang === 'ar'
+              ? 'يُشترط أن يتطابق البريد الإلكتروني لحسابك مع البريد المسجل لولي الأمر في ملف الطالب.'
+              : 'Your guardian email must match the email registered on the student record.'}
+          </p>
+          <form onSubmit={handleLinkChild} className="flex flex-wrap gap-2">
+            <input
+              dir="ltr"
+              required
+              value={linkCode}
+              onChange={(e) => setLinkCode(e.target.value.toUpperCase())}
+              placeholder="NB-2026-XXXXXX"
+              className="flex-1 min-w-[180px] rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm font-mono-tabular uppercase"
+            />
+            <PrimaryButton type="submit" disabled={linking} className="text-xs">
+              {linking ? (lang === 'ar' ? 'جاري الربط...' : 'Linking...') : lang === 'ar' ? 'ربط الطالب' : 'Link Child'}
+            </PrimaryButton>
+          </form>
         </Card>
         <ChangePasswordCard />
       </div>
@@ -108,17 +212,20 @@ export function GuardianDashboard({ activeTab }: { activeTab: string }) {
                   </div>
                   {child && (
                     <PrimaryButton
-                      onClick={() =>
-                        generateCertificatePDF({
+                      onClick={async () => {
+                        const { generateCertificatePDF } = await import('../../lib/pdfCertificate');
+                        await generateCertificatePDF({
                           verification_code: cert.verification_code,
                           student_name_ar: child.full_name_ar,
                           student_name_en: child.full_name_en,
+                          course_title_ar: cert.course_title_ar,
                           course_title_en: cert.course_title_en,
+                          title_ar: cert.title_ar,
                           title_en: cert.title_en,
                           grade_label: cert.grade_label,
                           issued_at: cert.issued_at,
-                        })
-                      }
+                        });
+                      }}
                       className="text-xs"
                     >
                       <Download className="w-4 h-4" />
@@ -160,7 +267,8 @@ export function GuardianDashboard({ activeTab }: { activeTab: string }) {
                     : 'bg-white dark:bg-[#0F213E] border-[#E5DEC9] dark:border-[#233C63] hover:border-[#C98A1E]'
                 }`}
               >
-                {lang === 'ar' ? c.full_name_ar : c.full_name_en} ({tField(c as unknown as Record<string, unknown>, 'level_name', lang)})
+                {lang === 'ar' ? c.full_name_ar : c.full_name_en} ({tField(c as unknown as Record<string, unknown>, 'level_name', lang)}) ·{' '}
+                <span className="font-mono-tabular opacity-80">{c.student_code}</span>
               </button>
             ))}
           </div>
@@ -168,7 +276,22 @@ export function GuardianDashboard({ activeTab }: { activeTab: string }) {
       </div>
 
       {!selectedChild ? (
-        <EmptyState title={lang === 'ar' ? 'لم يتم ربط أبناء بهذا الحساب بعد' : 'No children linked to this account yet'} />
+        <Card className="p-6 space-y-4">
+          <EmptyState title={lang === 'ar' ? 'لم يتم ربط أبناء بهذا الحساب بعد' : 'No children linked to this account yet'} />
+          <form onSubmit={handleLinkChild} className="flex flex-wrap gap-2 max-w-md mx-auto">
+            <input
+              dir="ltr"
+              required
+              value={linkCode}
+              onChange={(e) => setLinkCode(e.target.value.toUpperCase())}
+              placeholder="NB-2026-XXXXXX"
+              className="flex-1 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm font-mono-tabular uppercase"
+            />
+            <PrimaryButton type="submit" disabled={linking} className="text-xs">
+              {linking ? (lang === 'ar' ? 'جاري الربط...' : 'Linking...') : lang === 'ar' ? 'ربط بكود الطالب' : 'Link Child'}
+            </PrimaryButton>
+          </form>
+        </Card>
       ) : (
         <>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -201,6 +324,41 @@ export function GuardianDashboard({ activeTab }: { activeTab: string }) {
               <div className="text-2xl font-extrabold tabular-nums">{childCertificates.length}</div>
             </Card>
           </div>
+
+          <Card className="p-6 space-y-4">
+            <h3 className="text-lg font-bold">
+              {lang === 'ar' ? 'منحنى تطور الحفظ والتجويد' : 'Memorization & Tajweed Progress'}
+            </h3>
+            {childRecitations.length > 0 ? (
+              <div className="h-64 w-full" dir="ltr">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart
+                    data={childRecitations
+                      .slice(0, 8)
+                      .reverse()
+                      .map((r) => ({
+                        name: r.surah_name,
+                        memorization: r.memorization_score,
+                        tajweed: r.tajweed_score,
+                      }))}
+                  >
+                    <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
+                    <XAxis dataKey="name" tick={{ fontSize: 12 }} />
+                    <YAxis domain={[0, 100]} tick={{ fontSize: 12 }} />
+                    <Tooltip />
+                    <Bar dataKey="memorization" name={lang === 'ar' ? 'الحفظ' : 'Memorization'} fill="#0F766E" radius={[6, 6, 0, 0]} />
+                    <Bar dataKey="tajweed" name={lang === 'ar' ? 'التجويد' : 'Tajweed'} fill="#C98A1E" radius={[6, 6, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            ) : (
+              <p className="text-sm text-slate-500">
+                {lang === 'ar'
+                  ? 'ستظهر الرسوم البيانية بمجرد تسجيل أول تسميع للطالب.'
+                  : 'Charts will appear once the first recitation is recorded.'}
+              </p>
+            )}
+          </Card>
 
           <div className="space-y-3">
             <h3 className="text-lg font-bold">{lang === 'ar' ? 'الحلقات المسجّل بها الطفل' : 'Enrolled Circles'}</h3>
@@ -247,6 +405,51 @@ export function GuardianDashboard({ activeTab }: { activeTab: string }) {
                 { key: 'notes', header: lang === 'ar' ? 'ملاحظات المعلم' : 'Notes', render: (r) => r.notes_ar || '—' },
               ]}
             />
+            {childAssignedExams.length > 0 && (
+              <div className="space-y-2 pt-2">
+                <h4 className="text-sm font-extrabold text-slate-700 dark:text-slate-200">
+                  {lang === 'ar' ? 'حالة الامتحانات والتسليمات الجارية' : 'Active Exams & Submission Status'}
+                </h4>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {childAssignedExams.map((ex) => (
+                    <Card key={`${ex.id}-${ex.student_id}`} className="p-4 space-y-2">
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <div className="text-xs text-slate-500">{ex.course_title_ar} · <span className="font-mono-tabular">{ex.exam_date}</span></div>
+                          <div className="font-bold text-sm">{tField(ex as unknown as Record<string, unknown>, 'title', lang)}</div>
+                        </div>
+                        <div className="text-xs font-extrabold tabular-nums">
+                          {ex.result ? (
+                            <span className="text-[#0F766E] dark:text-[#2DD4BF]">{ex.result.score} / {ex.max_score}</span>
+                          ) : ex.submission ? (
+                            <span className="text-[#C98A1E]">{lang === 'ar' ? 'تم التسليم — بانتظار التصحيح' : 'Submitted'}</span>
+                          ) : (
+                            <span className="text-slate-500">{lang === 'ar' ? 'لم يُسلّم بعد' : 'Pending'}</span>
+                          )}
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-3 text-xs font-bold">
+                        {ex.has_question_file && (
+                          <button type="button" onClick={() => openGuardianExamFile(ex.id, 'question')} className="text-[#0F766E] dark:text-[#2DD4BF] hover:underline cursor-pointer">
+                            {lang === 'ar' ? 'ورقة الأسئلة' : 'Question PDF'}
+                          </button>
+                        )}
+                        {ex.submission?.has_solution_file && (
+                          <button type="button" onClick={() => openGuardianExamFile(ex.id, 'solution')} className="text-slate-600 dark:text-slate-300 hover:underline cursor-pointer">
+                            {lang === 'ar' ? 'حل الطالب' : 'Student Solution'}
+                          </button>
+                        )}
+                        {ex.submission?.has_graded_file && (
+                          <button type="button" onClick={() => openGuardianExamFile(ex.id, 'graded')} className="text-[#C98A1E] hover:underline cursor-pointer">
+                            {lang === 'ar' ? 'ملف التصحيح' : 'Graded Copy'}
+                          </button>
+                        )}
+                      </div>
+                    </Card>
+                  ))}
+                </div>
+              </div>
+            )}
             {childExams.length > 0 && (
               <ResponsiveTable
                 data={childExams}

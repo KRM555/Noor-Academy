@@ -9,13 +9,32 @@ import {
   Tooltip,
   CartesianGrid,
 } from 'recharts';
-import { Trash2, CheckCircle2, XCircle, Download, ShieldAlert, Rocket, RefreshCw } from 'lucide-react';
+import {
+  Trash2,
+  CheckCircle2,
+  XCircle,
+  Download,
+  ShieldAlert,
+  Rocket,
+  RefreshCw,
+  Pencil,
+  FolderOpen,
+  ArrowRight,
+  Search,
+  Copy,
+  Upload,
+  Video,
+  PlayCircle,
+  FileText,
+  ExternalLink,
+  Plus,
+  FileSpreadsheet,
+} from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { apiFetch } from '../../lib/api';
 import { queryKeys } from '../../lib/queryClient';
 import { isBrowserSupabaseConfigured } from '../../lib/supabase';
 import { tField } from '../../i18n/translations';
-import { generateCertificatePDF } from '../../lib/pdfCertificate';
 import {
   Card,
   LoadingState,
@@ -25,18 +44,97 @@ import {
   ConfirmDeleteModal,
 } from '../../components/ui/CommonUI';
 import { ChangePasswordCard } from '../../components/dashboard/ChangePasswordCard';
+import { ExamCenter, type ManagedExamItem } from '../../components/dashboard/ExamCenter';
+
+function exportCsv(filename: string, headers: string[], rows: Array<Array<string | number | boolean | null | undefined>>) {
+  const escape = (val: string | number | boolean | null | undefined) => {
+    const str = String(val ?? '');
+    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  };
+  const csv = [headers.map(escape).join(','), ...rows.map((r) => r.map(escape).join(','))].join('\n');
+  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
 
 interface AdminData {
   profiles: Array<{ id: string | number; email: string; full_name: string; role: 'student' | 'teacher' | 'admin' | 'guardian'; is_active: number | boolean }>;
   levels: Array<{ id: number; code: string; name_ar: string; name_en: string; age_range: string }>;
-  teachers: Array<{ id: number; name_ar: string; name_en: string; specialty_ar: string; hourly_rate: number }>;
-  students: Array<{ id: number; student_code: string; full_name_ar: string; full_name_en: string; age: number; level_id: number; level_name_ar: string; guardian_name: string; student_email?: string }>;
-  courses: Array<{ id: number; title_ar: string; title_en: string; level_name_ar: string; teacher_name_ar: string; schedule_ar: string; price_monthly: number; capacity: number }>;
-  lessons: Array<{ id: number; course_id: number; title_ar: string; course_title_ar: string; lesson_date: string; start_time: string; duration_min: number }>;
+  teachers: Array<{
+    id: number;
+    name_ar: string;
+    name_en: string;
+    specialty_ar: string;
+    specialty_en?: string;
+    qualifications_ar?: string;
+    bio_ar?: string;
+    hourly_rate: number;
+    is_public?: boolean;
+  }>;
+  students: Array<{
+    id: number;
+    student_code: string;
+    full_name_ar: string;
+    full_name_en: string;
+    age: number;
+    level_id: number;
+    status: 'active' | 'paused' | 'graduated';
+    level_name_ar: string;
+    guardian_name: string;
+    guardian_phone?: string;
+    guardian_email?: string;
+    guardian_linked?: boolean;
+    student_email?: string;
+  }>;
+  courses: Array<{
+    id: number;
+    title_ar: string;
+    title_en: string;
+    description_ar?: string;
+    description_en?: string;
+    level_id: number;
+    teacher_id: number;
+    level_name_ar: string;
+    teacher_name_ar: string;
+    schedule_ar: string;
+    schedule_en?: string;
+    price_monthly: number;
+    capacity: number;
+    is_featured?: boolean;
+  }>;
+  lessons: Array<{
+    id: number;
+    course_id: number;
+    title_ar: string;
+    title_en?: string;
+    course_title_ar: string;
+    lesson_date: string;
+    start_time: string;
+    duration_min: number;
+    objectives_ar?: string;
+    objectives_en?: string;
+  }>;
+  lessonLinks: Array<{
+    id: number;
+    lesson_id: number;
+    title_ar: string;
+    title_en: string;
+    url: string;
+    link_type: 'zoom' | 'meet' | 'material' | 'recording';
+  }>;
   enrollments: Array<{ id: number; student_id: number; course_id: number; student_name_ar: string; course_title_ar: string; status: string }>;
   admissionRequests: Array<{ id: number; student_name: string; student_age: number; guardian_name: string; guardian_email: string; guardian_phone: string; course_title_ar: string; level_name_ar: string; status: string }>;
   announcements: Array<{ id: number; title_ar: string; body_ar: string; target_scope: string; course_title_ar: string | null; created_at: string }>;
-  exams: Array<{ id: number; course_id: number; title_ar: string; course_title_ar: string; exam_date: string; max_score: number }>;
+  exams: ManagedExamItem[];
   certificates: Array<{ id: number; verification_code: string; student_id: number; student_name_ar: string; course_title_ar: string; title_ar: string; title_en: string; grade_label: string; issued_at: string; revoked_at: string | null }>;
   payroll: Array<{ id: number; teacher_id: number; teacher_name_ar: string; month_year: string; base_amount: number; bonus_amount: number; deduction_amount: number; net_amount: number; status: string; bank_name: string | null; masked_iban: string | null }>;
   games: Array<{ id: number; slug: string; title_ar: string; title_en: string; category: string; is_active: number | boolean }>;
@@ -56,10 +154,81 @@ export function AdminDashboard({
   const [deleteTarget, setDeleteTarget] = useState<{ type: 'courses' | 'lessons' | 'teachers' | 'students'; id: number } | null>(null);
   const [syncingSupabase, setSyncingSupabase] = useState(false);
 
-  // Form states
-  const [newCourse, setNewCourse] = useState({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '1', schedule_ar: 'الإثنين · 5:00 م', price_monthly: '350' });
+  // Search & Filter states
+  const [studentSearch, setStudentSearch] = useState('');
+  const [courseSearch, setCourseSearch] = useState('');
+  const [admissionSearch, setAdmissionSearch] = useState('');
+  const [admissionFilter, setAdmissionFilter] = useState<'all' | 'pending' | 'approved' | 'rejected'>('all');
+
+  // Workspace & Edit states
+  const [selectedCourseId, setSelectedCourseId] = useState<number | null>(null);
+  const [courseEdit, setCourseEdit] = useState<{
+    title_ar: string;
+    title_en: string;
+    description_ar: string;
+    level_id: string;
+    teacher_id: string;
+    schedule_ar: string;
+    price_monthly: string;
+    capacity: string;
+    is_featured: boolean;
+  } | null>(null);
+  const [courseLessonForm, setCourseLessonForm] = useState({
+    title_ar: '',
+    lesson_date: '2026-11-22',
+    start_time: '17:00',
+    duration_min: '45',
+    objectives_ar: '',
+    live_url: '',
+  });
+  const [courseEnrollStudentId, setCourseEnrollStudentId] = useState('');
+
+  // Lesson edit & attachment states
+  const [editingLessonId, setEditingLessonId] = useState<number | null>(null);
+  const [lessonEdit, setLessonEdit] = useState({
+    title_ar: '',
+    lesson_date: '',
+    start_time: '',
+    duration_min: '45',
+    objectives_ar: '',
+  });
+  const [attachLessonId, setAttachLessonId] = useState<number | null>(null);
+  const [attachForm, setAttachForm] = useState<{
+    link_type: 'recording' | 'zoom' | 'meet' | 'material';
+    title_ar: string;
+    url: string;
+  }>({ link_type: 'recording', title_ar: '', url: '' });
+  const [uploadingMaterial, setUploadingMaterial] = useState(false);
+
+  // Student & Teacher edit states
+  const [editingStudentId, setEditingStudentId] = useState<number | null>(null);
+  const [studentEdit, setStudentEdit] = useState({
+    full_name_ar: '',
+    full_name_en: '',
+    age: '8',
+    level_id: '1',
+    status: 'active' as 'active' | 'paused' | 'graduated',
+    guardian_name: '',
+    guardian_phone: '',
+    guardian_email: '',
+    unlink_guardian_account: false,
+  });
+
+  const [editingTeacherId, setEditingTeacherId] = useState<number | null>(null);
+  const [teacherEdit, setTeacherEdit] = useState({
+    name_ar: '',
+    name_en: '',
+    specialty_ar: '',
+    qualifications_ar: '',
+    hourly_rate: '180',
+    bio_ar: '',
+    is_public: true,
+  });
+
+  // Create Form states
+  const [newCourse, setNewCourse] = useState({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '1', schedule_ar: 'الإثنين · 5:00 م', price_monthly: '350', capacity: '12' });
   const [newLesson, setNewLesson] = useState({ course_id: '1', title_ar: '', lesson_date: '2026-11-20', start_time: '17:00', live_url: 'https://zoom.us/j/900112233' });
-  const [newStudent, setNewStudent] = useState({ email: '', full_name_ar: '', age: '8', level_id: '1', guardian_name: '', guardian_phone: '', course_id: '1' });
+  const [newStudent, setNewStudent] = useState({ email: '', full_name_ar: '', age: '8', level_id: '1', guardian_name: '', guardian_phone: '', guardian_email: '', course_id: '1' });
   const [newTeacher, setNewTeacher] = useState({ email: '', name_ar: '', specialty_ar: 'نور البيان والقرآن', qualifications_ar: 'إجازة حفص', hourly_rate: '180' });
   const [enrollPair, setEnrollPair] = useState({ student_id: '1', course_id: '1' });
   const [newAnn, setNewAnn] = useState<{ title_ar: string; body_ar: string; target_scope: 'all_students' | 'course' | 'specific_students'; target_course_id: string; student_ids: number[] }>({
@@ -69,7 +238,6 @@ export function AdminDashboard({
     target_course_id: '1',
     student_ids: [],
   });
-  const [newExam, setNewExam] = useState({ course_id: '1', title_ar: '', exam_date: '2026-11-25', max_score: '100' });
   const [newCert, setNewCert] = useState({ student_id: '1', course_id: '1', title_ar: 'شهادة إتمام المستوى', title_en: 'Level Completion Certificate', grade_label: 'امتياز · 98%' });
   const [newPay, setNewPay] = useState({ teacher_id: '1', month_year: '2026-11', base_amount: '5400', bonus_amount: '250', deduction_amount: '0' });
 
@@ -171,6 +339,25 @@ export function AdminDashboard({
     );
   }
 
+  const openLinkAttachment = async (lk: { id: number; url: string }) => {
+    try {
+      let targetUrl = lk.url;
+      if (lk.url.startsWith('storage://')) {
+        const res = await apiFetch<{ url: string }>(`/api/lesson-links/${lk.id}/access`);
+        targetUrl = res.url;
+      }
+      const a = document.createElement('a');
+      a.href = targetUrl;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Unable to open attachment', 'error');
+    }
+  };
+
   if (activeTab === 'students') {
     const createStudent = async (e: React.FormEvent) => {
       e.preventDefault();
@@ -182,9 +369,44 @@ export function AdminDashboard({
             : `Student created (${res.student_code}) — Temp password: ${res.temporary_password}`,
           'success'
         );
-        setNewStudent({ email: '', full_name_ar: '', age: '8', level_id: '1', guardian_name: '', guardian_phone: '', course_id: '1' });
+        setNewStudent({ email: '', full_name_ar: '', age: '8', level_id: '1', guardian_name: '', guardian_phone: '', guardian_email: '', course_id: '1' });
         loadData();
       } catch (err: unknown) {
+        toast(err instanceof Error ? err.message : 'Error', 'error');
+      }
+    };
+
+    const startEditStudent = (s: AdminData['students'][number]) => {
+      setEditingStudentId(s.id);
+      setStudentEdit({
+        full_name_ar: s.full_name_ar || '',
+        full_name_en: s.full_name_en || '',
+        age: String(s.age || 8),
+        level_id: String(s.level_id || 1),
+        status: s.status || 'active',
+        guardian_name: s.guardian_name || '',
+        guardian_phone: s.guardian_phone || '',
+        guardian_email: s.guardian_email || '',
+        unlink_guardian_account: false,
+      });
+    };
+
+    const saveStudentEdit = async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!editingStudentId) return;
+      try {
+        await apiFetch(`/api/admin/students/${editingStudentId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            ...studentEdit,
+            age: Number(studentEdit.age),
+            level_id: Number(studentEdit.level_id),
+          }),
+        });
+        toast(lang === 'ar' ? 'تم تحديث بيانات الطالب وولي الأمر' : 'Student & guardian updated', 'success');
+        setEditingStudentId(null);
+        loadData();
+      } catch (err) {
         toast(err instanceof Error ? err.message : 'Error', 'error');
       }
     };
@@ -195,6 +417,33 @@ export function AdminDashboard({
       loadData();
     };
 
+    const updateStatus = async (studentId: number, status: 'active' | 'paused' | 'graduated') => {
+      await apiFetch(`/api/admin/students/${studentId}`, { method: 'PATCH', body: JSON.stringify({ status }) });
+      toast(lang === 'ar' ? 'تم تحديث حالة الطالب' : 'Student status updated', 'success');
+      loadData();
+    };
+
+    const copyCode = async (code: string) => {
+      try {
+        await navigator.clipboard.writeText(code);
+        toast(lang === 'ar' ? `تم نسخ الكود: ${code}` : `Copied: ${code}`, 'success');
+      } catch {
+        toast(code, 'info');
+      }
+    };
+
+    const filteredStudents = data.students.filter((s) => {
+      const q = studentSearch.trim().toLowerCase();
+      if (!q) return true;
+      return (
+        s.full_name_ar.toLowerCase().includes(q) ||
+        s.full_name_en.toLowerCase().includes(q) ||
+        s.student_code.toLowerCase().includes(q) ||
+        (s.guardian_name || '').toLowerCase().includes(q) ||
+        (s.guardian_email || '').toLowerCase().includes(q)
+      );
+    });
+
     return (
       <div className="space-y-6">
         <Card className="p-6 space-y-4">
@@ -204,26 +453,117 @@ export function AdminDashboard({
             <input type="email" placeholder={lang === 'ar' ? 'البريد الإلكتروني للطالب' : 'Student Email'} value={newStudent.email} onChange={(e) => setNewStudent({ ...newStudent, email: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
             <input type="number" placeholder={lang === 'ar' ? 'العمر' : 'Age'} value={newStudent.age} onChange={(e) => setNewStudent({ ...newStudent, age: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
             <input placeholder={lang === 'ar' ? 'اسم ولي الأمر' : 'Guardian Name'} value={newStudent.guardian_name} onChange={(e) => setNewStudent({ ...newStudent, guardian_name: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+            <input type="email" placeholder={lang === 'ar' ? 'بريد ولي الأمر (للربط بكود الطالب)' : 'Guardian Email (for parent signup)'} value={newStudent.guardian_email} onChange={(e) => setNewStudent({ ...newStudent, guardian_email: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+            <input placeholder={lang === 'ar' ? 'هاتف ولي الأمر' : 'Guardian Phone'} value={newStudent.guardian_phone} onChange={(e) => setNewStudent({ ...newStudent, guardian_phone: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
             <select value={newStudent.level_id} onChange={(e) => setNewStudent({ ...newStudent, level_id: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
               {data.levels.map((l) => <option key={l.id} value={l.id}>{l.name_ar}</option>)}
             </select>
-            <select value={newStudent.course_id} onChange={(e) => setNewStudent({ ...newStudent, course_id: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+            <select value={newStudent.course_id} onChange={(e) => setNewStudent({ ...newStudent, course_id: e.target.value })} className="sm:col-span-2 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
               {data.courses.map((c) => <option key={c.id} value={c.id}>{c.title_ar}</option>)}
             </select>
             <div className="sm:col-span-3"><PrimaryButton type="submit">{lang === 'ar' ? 'إضافة الطالب' : 'Create Student'}</PrimaryButton></div>
           </form>
         </Card>
 
+        {editingStudentId !== null && (
+          <Card className="p-6 space-y-4 border-2 border-[#C98A1E]">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-extrabold">{lang === 'ar' ? 'تعديل بيانات الطالب وربط ولي الأمر' : 'Edit Student & Guardian Link'}</h3>
+              <button type="button" onClick={() => setEditingStudentId(null)} className="text-xs text-slate-500 hover:underline cursor-pointer">
+                {lang === 'ar' ? 'إغلاق' : 'Close'}
+              </button>
+            </div>
+            <form onSubmit={saveStudentEdit} className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <input placeholder={lang === 'ar' ? 'الاسم بالعربية' : 'Arabic Name'} value={studentEdit.full_name_ar} onChange={(e) => setStudentEdit({ ...studentEdit, full_name_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <input placeholder={lang === 'ar' ? 'الاسم بالإنجليزية' : 'English Name'} value={studentEdit.full_name_en} onChange={(e) => setStudentEdit({ ...studentEdit, full_name_en: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <input type="number" placeholder={lang === 'ar' ? 'العمر' : 'Age'} value={studentEdit.age} onChange={(e) => setStudentEdit({ ...studentEdit, age: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
+              <select value={studentEdit.level_id} onChange={(e) => setStudentEdit({ ...studentEdit, level_id: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+                {data.levels.map((l) => <option key={l.id} value={l.id}>{l.name_ar}</option>)}
+              </select>
+              <select value={studentEdit.status} onChange={(e) => setStudentEdit({ ...studentEdit, status: e.target.value as 'active' | 'paused' | 'graduated' })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+                <option value="active">{lang === 'ar' ? 'نشط (active)' : 'Active'}</option>
+                <option value="paused">{lang === 'ar' ? 'متوقف مؤقتاً (paused)' : 'Paused'}</option>
+                <option value="graduated">{lang === 'ar' ? 'متخرج (graduated)' : 'Graduated'}</option>
+              </select>
+              <input placeholder={lang === 'ar' ? 'اسم ولي الأمر' : 'Guardian Name'} value={studentEdit.guardian_name} onChange={(e) => setStudentEdit({ ...studentEdit, guardian_name: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <input type="email" placeholder={lang === 'ar' ? 'بريد ولي الأمر' : 'Guardian Email'} value={studentEdit.guardian_email} onChange={(e) => setStudentEdit({ ...studentEdit, guardian_email: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <input placeholder={lang === 'ar' ? 'هاتف ولي الأمر' : 'Guardian Phone'} value={studentEdit.guardian_phone} onChange={(e) => setStudentEdit({ ...studentEdit, guardian_phone: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <label className="inline-flex items-center gap-2 text-xs font-semibold cursor-pointer px-2">
+                <input type="checkbox" checked={studentEdit.unlink_guardian_account} onChange={(e) => setStudentEdit({ ...studentEdit, unlink_guardian_account: e.target.checked })} />
+                <span>{lang === 'ar' ? 'إعادة ضبط ربط حساب ولي الأمر' : 'Reset guardian link'}</span>
+              </label>
+              <div className="sm:col-span-3 flex gap-2">
+                <PrimaryButton type="submit">{lang === 'ar' ? 'حفظ التعديلات' : 'Save Changes'}</PrimaryButton>
+                <SecondaryButton type="button" onClick={() => setEditingStudentId(null)}>{lang === 'ar' ? 'إلغاء' : 'Cancel'}</SecondaryButton>
+              </div>
+            </form>
+          </Card>
+        )}
+
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="relative flex-1 min-w-[220px] max-w-md">
+            <Search className="w-4 h-4 text-slate-400 absolute top-1/2 -translate-y-1/2 start-3" />
+            <input
+              value={studentSearch}
+              onChange={(e) => setStudentSearch(e.target.value)}
+              placeholder={lang === 'ar' ? 'ابحث باسم الطالب أو الكود أو بريد ولي الأمر...' : 'Search by name, code, or guardian email...'}
+              className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#0F213E] ps-9 pe-3 py-2 text-sm"
+            />
+          </div>
+          <SecondaryButton
+            type="button"
+            className="text-xs"
+            onClick={() =>
+              exportCsv(
+                'students.csv',
+                ['Student Code', 'Arabic Name', 'English Name', 'Age', 'Level', 'Status', 'Guardian', 'Guardian Email', 'Guardian Linked'],
+                filteredStudents.map((s) => [s.student_code, s.full_name_ar, s.full_name_en, s.age, s.level_name_ar, s.status, s.guardian_name, s.guardian_email, s.guardian_linked ? 'Yes' : 'No'])
+              )
+            }
+          >
+            <FileSpreadsheet className="w-4 h-4" />
+            <span>{lang === 'ar' ? 'تصدير CSV' : 'Export CSV'}</span>
+          </SecondaryButton>
+        </div>
+
         <ResponsiveTable
-          data={data.students}
-          emptyTitle={lang === 'ar' ? 'لا يوجد طلاب' : 'No students'}
+          data={filteredStudents}
+          emptyTitle={lang === 'ar' ? 'لا يوجد طلاب مطابقون' : 'No students found'}
           columns={[
-            { key: 'code', header: lang === 'ar' ? 'الكود' : 'Code', render: (r) => <span className="font-mono-tabular">{r.student_code}</span> },
-            { key: 'name', header: lang === 'ar' ? 'الاسم' : 'Name', render: (r) => r.full_name_ar },
-            { key: 'age', header: lang === 'ar' ? 'العمر' : 'Age', align: 'end', render: (r) => r.age },
+            {
+              key: 'code',
+              header: lang === 'ar' ? 'الكود' : 'Code',
+              render: (r) => (
+                <button
+                  type="button"
+                  onClick={() => void copyCode(r.student_code)}
+                  className="inline-flex items-center gap-1 font-mono-tabular text-xs font-bold text-[#0F766E] dark:text-[#2DD4BF] hover:underline cursor-pointer"
+                  title={lang === 'ar' ? 'نسخ الكود' : 'Copy Code'}
+                >
+                  <span>{r.student_code}</span>
+                  <Copy className="w-3 h-3" />
+                </button>
+              ),
+            },
+            { key: 'name', header: lang === 'ar' ? 'الطالب' : 'Student', render: (r) => r.full_name_ar },
+            {
+              key: 'guardian',
+              header: lang === 'ar' ? 'ولي الأمر' : 'Guardian',
+              render: (r) => (
+                <div className="text-xs space-y-0.5">
+                  <div className="font-semibold">{r.guardian_name || '—'}</div>
+                  <div className="text-slate-500 font-mono-tabular">
+                    {r.guardian_email || '—'}{' '}
+                    <span className={r.guardian_linked ? 'text-[#0F766E] dark:text-[#2DD4BF] font-bold' : 'text-[#C98A1E]'}>
+                      ({r.guardian_linked ? (lang === 'ar' ? 'حساب مفعّل' : 'Linked') : lang === 'ar' ? 'بانتظار التسجيل' : 'Unlinked'})
+                    </span>
+                  </div>
+                </div>
+              ),
+            },
             {
               key: 'level',
-              header: lang === 'ar' ? 'المستوى (تصنيف)' : 'Level',
+              header: lang === 'ar' ? 'المستوى' : 'Level',
               render: (r) => (
                 <select
                   value={r.level_id}
@@ -235,13 +575,33 @@ export function AdminDashboard({
               ),
             },
             {
+              key: 'status',
+              header: lang === 'ar' ? 'الحالة' : 'Status',
+              render: (r) => (
+                <select
+                  value={r.status || 'active'}
+                  onChange={(e) => updateStatus(r.id, e.target.value as 'active' | 'paused' | 'graduated')}
+                  className="rounded-lg border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#13284A] px-2 py-1 text-xs"
+                >
+                  <option value="active">{lang === 'ar' ? 'نشط' : 'Active'}</option>
+                  <option value="paused">{lang === 'ar' ? 'متوقف' : 'Paused'}</option>
+                  <option value="graduated">{lang === 'ar' ? 'متخرج' : 'Graduated'}</option>
+                </select>
+              ),
+            },
+            {
               key: 'actions',
               header: '',
               align: 'end',
               render: (r) => (
-                <button onClick={() => setDeleteTarget({ type: 'students', id: r.id })} className="p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 rounded-lg cursor-pointer" title="Soft Delete">
-                  <Trash2 className="w-4 h-4" />
-                </button>
+                <div className="inline-flex items-center gap-1">
+                  <button onClick={() => startEditStudent(r)} className="p-1.5 text-[#0F766E] dark:text-[#2DD4BF] hover:bg-[#0F766E]/10 rounded-lg cursor-pointer" title={lang === 'ar' ? 'تعديل' : 'Edit'}>
+                    <Pencil className="w-4 h-4" />
+                  </button>
+                  <button onClick={() => setDeleteTarget({ type: 'students', id: r.id })} className="p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 rounded-lg cursor-pointer" title="Soft Delete">
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
               ),
             },
           ]}
@@ -269,17 +629,77 @@ export function AdminDashboard({
       }
     };
 
+    const startEditTeacher = (t: AdminData['teachers'][number]) => {
+      setEditingTeacherId(t.id);
+      setTeacherEdit({
+        name_ar: t.name_ar || '',
+        name_en: t.name_en || '',
+        specialty_ar: t.specialty_ar || '',
+        qualifications_ar: t.qualifications_ar || '',
+        hourly_rate: String(t.hourly_rate || 180),
+        bio_ar: t.bio_ar || '',
+        is_public: t.is_public !== false,
+      });
+    };
+
+    const saveTeacherEdit = async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!editingTeacherId) return;
+      try {
+        await apiFetch(`/api/admin/teachers/${editingTeacherId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            ...teacherEdit,
+            hourly_rate: Number(teacherEdit.hourly_rate),
+          }),
+        });
+        toast(lang === 'ar' ? 'تم تحديث بيانات المعلم' : 'Teacher updated', 'success');
+        setEditingTeacherId(null);
+        loadData();
+      } catch (err) {
+        toast(err instanceof Error ? err.message : 'Error', 'error');
+      }
+    };
+
     return (
       <div className="space-y-6">
         <Card className="p-6 space-y-4">
           <h2 className="text-lg font-extrabold">{lang === 'ar' ? 'إضافة معلم جديد (المدير فقط)' : 'Add Teacher (Admin Only)'}</h2>
-          <form onSubmit={createTeacher} className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <form onSubmit={createTeacher} className="grid grid-cols-1 sm:grid-cols-4 gap-3">
             <input placeholder={lang === 'ar' ? 'اسم المعلم' : 'Teacher Name'} value={newTeacher.name_ar} onChange={(e) => setNewTeacher({ ...newTeacher, name_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
             <input type="email" placeholder={lang === 'ar' ? 'البريد الإلكتروني' : 'Email'} value={newTeacher.email} onChange={(e) => setNewTeacher({ ...newTeacher, email: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
             <input placeholder={lang === 'ar' ? 'التخصص' : 'Specialty'} value={newTeacher.specialty_ar} onChange={(e) => setNewTeacher({ ...newTeacher, specialty_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
-            <div className="sm:col-span-3"><PrimaryButton type="submit">{lang === 'ar' ? 'إنشاء معلم' : 'Create Teacher'}</PrimaryButton></div>
+            <input type="number" placeholder={lang === 'ar' ? 'الأجر/ساعة' : 'Rate/hr'} value={newTeacher.hourly_rate} onChange={(e) => setNewTeacher({ ...newTeacher, hourly_rate: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
+            <div className="sm:col-span-4"><PrimaryButton type="submit">{lang === 'ar' ? 'إنشاء معلم' : 'Create Teacher'}</PrimaryButton></div>
           </form>
         </Card>
+
+        {editingTeacherId !== null && (
+          <Card className="p-6 space-y-4 border-2 border-[#C98A1E]">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-extrabold">{lang === 'ar' ? 'تعديل بيانات المعلم' : 'Edit Teacher'}</h3>
+              <button type="button" onClick={() => setEditingTeacherId(null)} className="text-xs text-slate-500 hover:underline cursor-pointer">
+                {lang === 'ar' ? 'إغلاق' : 'Close'}
+              </button>
+            </div>
+            <form onSubmit={saveTeacherEdit} className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <input placeholder={lang === 'ar' ? 'الاسم بالعربية' : 'Arabic Name'} value={teacherEdit.name_ar} onChange={(e) => setTeacherEdit({ ...teacherEdit, name_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <input placeholder={lang === 'ar' ? 'الاسم بالإنجليزية' : 'English Name'} value={teacherEdit.name_en} onChange={(e) => setTeacherEdit({ ...teacherEdit, name_en: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <input type="number" placeholder={lang === 'ar' ? 'الأجر/ساعة' : 'Hourly Rate'} value={teacherEdit.hourly_rate} onChange={(e) => setTeacherEdit({ ...teacherEdit, hourly_rate: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
+              <input placeholder={lang === 'ar' ? 'التخصص' : 'Specialty'} value={teacherEdit.specialty_ar} onChange={(e) => setTeacherEdit({ ...teacherEdit, specialty_ar: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <input placeholder={lang === 'ar' ? 'المؤهلات والإجازات' : 'Qualifications'} value={teacherEdit.qualifications_ar} onChange={(e) => setTeacherEdit({ ...teacherEdit, qualifications_ar: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <label className="inline-flex items-center gap-2 text-xs font-semibold cursor-pointer px-2">
+                <input type="checkbox" checked={teacherEdit.is_public} onChange={(e) => setTeacherEdit({ ...teacherEdit, is_public: e.target.checked })} />
+                <span>{lang === 'ar' ? 'ظاهر في صفحة المعلمين العامة' : 'Visible publicly'}</span>
+              </label>
+              <textarea rows={2} placeholder={lang === 'ar' ? 'نبذة عن المعلم' : 'Bio'} value={teacherEdit.bio_ar} onChange={(e) => setTeacherEdit({ ...teacherEdit, bio_ar: e.target.value })} className="sm:col-span-3 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <div className="sm:col-span-3 flex gap-2">
+                <PrimaryButton type="submit">{lang === 'ar' ? 'حفظ التعديلات' : 'Save Teacher'}</PrimaryButton>
+                <SecondaryButton type="button" onClick={() => setEditingTeacherId(null)}>{lang === 'ar' ? 'إلغاء' : 'Cancel'}</SecondaryButton>
+              </div>
+            </form>
+          </Card>
+        )}
 
         <ResponsiveTable
           data={data.teachers}
@@ -293,9 +713,14 @@ export function AdminDashboard({
               header: '',
               align: 'end',
               render: (r) => (
-                <button onClick={() => setDeleteTarget({ type: 'teachers', id: r.id })} className="p-1.5 text-red-600 rounded-lg cursor-pointer">
-                  <Trash2 className="w-4 h-4" />
-                </button>
+                <div className="inline-flex items-center gap-1">
+                  <button onClick={() => startEditTeacher(r)} className="p-1.5 text-[#0F766E] dark:text-[#2DD4BF] rounded-lg cursor-pointer" title={lang === 'ar' ? 'تعديل' : 'Edit'}>
+                    <Pencil className="w-4 h-4" />
+                  </button>
+                  <button onClick={() => setDeleteTarget({ type: 'teachers', id: r.id })} className="p-1.5 text-red-600 rounded-lg cursor-pointer">
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
               ),
             },
           ]}
@@ -306,17 +731,531 @@ export function AdminDashboard({
   }
 
   if (activeTab === 'courses') {
+    const openCourseWorkspace = (c: AdminData['courses'][number]) => {
+      setSelectedCourseId(c.id);
+      setCourseEdit({
+        title_ar: c.title_ar || '',
+        title_en: c.title_en || c.title_ar || '',
+        description_ar: c.description_ar || '',
+        level_id: String(c.level_id || 1),
+        teacher_id: String(c.teacher_id || 1),
+        schedule_ar: c.schedule_ar || '',
+        price_monthly: String(c.price_monthly ?? 0),
+        capacity: String(c.capacity ?? 12),
+        is_featured: Boolean(c.is_featured),
+      });
+      setCourseEnrollStudentId(String(data.students[0]?.id || ''));
+      setAttachLessonId(null);
+      setEditingLessonId(null);
+    };
+
+    const selectedCourse = selectedCourseId ? data.courses.find((c) => c.id === selectedCourseId) : null;
+
+    if (selectedCourse && courseEdit) {
+      const courseLessons = data.lessons.filter((l) => l.course_id === selectedCourse.id);
+      const courseEnrollments = data.enrollments.filter((e) => e.course_id === selectedCourse.id);
+      const enrolledStudentIds = new Set(courseEnrollments.map((e) => e.student_id));
+      const unenrolledStudents = data.students.filter((s) => !enrolledStudentIds.has(s.id));
+
+      const saveCourseDetails = async (e: React.FormEvent) => {
+        e.preventDefault();
+        try {
+          await apiFetch(`/api/admin/courses/${selectedCourse.id}`, {
+            method: 'PATCH',
+            body: JSON.stringify({
+              ...courseEdit,
+              level_id: Number(courseEdit.level_id),
+              teacher_id: Number(courseEdit.teacher_id),
+              price_monthly: Number(courseEdit.price_monthly),
+              capacity: Number(courseEdit.capacity),
+            }),
+          });
+          toast(lang === 'ar' ? 'تم حفظ تعديلات الدورة بنجاح' : 'Course details updated', 'success');
+          loadData();
+        } catch (err) {
+          toast(err instanceof Error ? err.message : 'Error', 'error');
+        }
+      };
+
+      const addCourseLesson = async (e: React.FormEvent) => {
+        e.preventDefault();
+        try {
+          await apiFetch('/api/admin/lessons', {
+            method: 'POST',
+            body: JSON.stringify({
+              ...courseLessonForm,
+              course_id: selectedCourse.id,
+              duration_min: Number(courseLessonForm.duration_min || 45),
+            }),
+          });
+          toast(lang === 'ar' ? 'تمت إضافة الدرس للدورة' : 'Lesson added to course', 'success');
+          setCourseLessonForm({ ...courseLessonForm, title_ar: '', objectives_ar: '', live_url: '' });
+          loadData();
+        } catch (err) {
+          toast(err instanceof Error ? err.message : 'Error', 'error');
+        }
+      };
+
+      const saveLessonEdit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!editingLessonId) return;
+        try {
+          await apiFetch(`/api/admin/lessons/${editingLessonId}`, {
+            method: 'PATCH',
+            body: JSON.stringify({
+              ...lessonEdit,
+              duration_min: Number(lessonEdit.duration_min || 45),
+            }),
+          });
+          toast(lang === 'ar' ? 'تم تحديث بيانات الدرس' : 'Lesson updated', 'success');
+          setEditingLessonId(null);
+          loadData();
+        } catch (err) {
+          toast(err instanceof Error ? err.message : 'Error', 'error');
+        }
+      };
+
+      const addLessonAttachmentLink = async (e: React.FormEvent, lessonId: number) => {
+        e.preventDefault();
+        try {
+          await apiFetch(`/api/lessons/${lessonId}/links`, {
+            method: 'POST',
+            body: JSON.stringify({
+              link_type: attachForm.link_type,
+              title_ar:
+                attachForm.title_ar.trim() ||
+                (attachForm.link_type === 'recording'
+                  ? 'تسجيل المحاضرة'
+                  : attachForm.link_type === 'material'
+                  ? 'ملف الدرس'
+                  : 'رابط الحصة المباشرة'),
+              url: attachForm.url.trim(),
+            }),
+          });
+          toast(lang === 'ar' ? 'تمت إضافة الرابط للدرس' : 'Link attached to lesson', 'success');
+          setAttachForm({ link_type: 'recording', title_ar: '', url: '' });
+          setAttachLessonId(null);
+          loadData();
+        } catch (err) {
+          toast(err instanceof Error ? err.message : 'Error', 'error');
+        }
+      };
+
+      const uploadMaterialFile = async (lessonId: number, file: File) => {
+        if (file.size > 8 * 1024 * 1024) {
+          toast(
+            lang === 'ar'
+              ? 'حجم الملف يتجاوز 8 ميجابايت. ارفع الفيديوهات على Google Drive / YouTube وأضف الرابط بدلاً من رفعه هنا.'
+              : 'Max file size is 8 MB. Host videos on Google Drive / YouTube and paste the link.',
+            'error'
+          );
+          return;
+        }
+        setUploadingMaterial(true);
+        try {
+          const base64Data = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result || ''));
+            reader.onerror = () => reject(new Error('File read failed'));
+            reader.readAsDataURL(file);
+          });
+          await apiFetch(`/api/lessons/${lessonId}/upload-material`, {
+            method: 'POST',
+            body: JSON.stringify({
+              fileName: file.name,
+              mimeType: file.type || 'application/octet-stream',
+              base64Data,
+              title_ar: attachForm.title_ar.trim() || file.name,
+            }),
+          });
+          toast(lang === 'ar' ? 'تم رفع ملف الدرس وحفظه بأمان' : 'Lesson material uploaded', 'success');
+          setAttachForm({ ...attachForm, title_ar: '' });
+          loadData();
+        } catch (err) {
+          toast(err instanceof Error ? err.message : 'Upload failed', 'error');
+        } finally {
+          setUploadingMaterial(false);
+        }
+      };
+
+      const deleteLink = async (linkId: number) => {
+        try {
+          await apiFetch(`/api/lesson-links/${linkId}`, { method: 'DELETE' });
+          toast(lang === 'ar' ? 'تم حذف المرفق' : 'Attachment deleted', 'info');
+          loadData();
+        } catch (err) {
+          toast(err instanceof Error ? err.message : 'Error', 'error');
+        }
+      };
+
+      const quickEnroll = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!courseEnrollStudentId) return;
+        try {
+          await apiFetch('/api/admin/enrollments', {
+            method: 'POST',
+            body: JSON.stringify({ student_id: Number(courseEnrollStudentId), course_id: selectedCourse.id }),
+          });
+          toast(lang === 'ar' ? 'تم إلحاق الطالب بالدورة' : 'Student enrolled', 'success');
+          loadData();
+        } catch (err) {
+          toast(err instanceof Error ? err.message : 'Error', 'error');
+        }
+      };
+
+      const removeEnrollment = async (enrollmentId: number) => {
+        try {
+          await apiFetch(`/api/admin/enrollments/${enrollmentId}`, { method: 'DELETE' });
+          toast(lang === 'ar' ? 'تمت إزالة الطالب من الدورة' : 'Enrollment removed', 'info');
+          loadData();
+        } catch (err) {
+          toast(err instanceof Error ? err.message : 'Error', 'error');
+        }
+      };
+
+      return (
+        <div className="space-y-6">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="space-y-1">
+              <button
+                type="button"
+                onClick={() => setSelectedCourseId(null)}
+                className="inline-flex items-center gap-1.5 text-xs font-bold text-[#0F766E] dark:text-[#2DD4BF] hover:underline cursor-pointer"
+              >
+                <ArrowRight className="w-3.5 h-3.5" />
+                <span>{lang === 'ar' ? 'العودة إلى قائمة الدورات' : 'Back to all courses'}</span>
+              </button>
+              <h2 className="text-2xl font-extrabold">{selectedCourse.title_ar}</h2>
+              <div className="text-xs text-slate-500">
+                {selectedCourse.teacher_name_ar} · {selectedCourse.level_name_ar} ·{' '}
+                <span className="font-mono-tabular font-bold text-[#C98A1E]">
+                  {courseEnrollments.length}/{selectedCourse.capacity} {lang === 'ar' ? 'طالب' : 'enrolled'}
+                </span>
+              </div>
+            </div>
+            <div className="text-sm font-extrabold px-4 py-2 rounded-xl bg-[#F2EFE6] dark:bg-[#13284A] border border-[#E5DEC9] dark:border-[#233C63]">
+              {selectedCourse.price_monthly} EGP / {lang === 'ar' ? 'شهرياً' : 'mo'}
+            </div>
+          </div>
+
+          {/* 1. Course Metadata & Pricing Editor */}
+          <Card className="p-6 space-y-4">
+            <h3 className="text-base font-extrabold">{lang === 'ar' ? 'تعديل إعدادات الدورة والأسعار والمواعيد' : 'Edit Course Settings, Price & Schedule'}</h3>
+            <form onSubmit={saveCourseDetails} className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="space-y-1">
+                <label className="text-xs font-bold">{lang === 'ar' ? 'عنوان الدورة (عربي)' : 'Title (AR)'}</label>
+                <input value={courseEdit.title_ar} onChange={(e) => setCourseEdit({ ...courseEdit, title_ar: e.target.value })} required className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-bold">{lang === 'ar' ? 'عنوان الدورة (إنجليزي)' : 'Title (EN)'}</label>
+                <input value={courseEdit.title_en} onChange={(e) => setCourseEdit({ ...courseEdit, title_en: e.target.value })} required className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-bold">{lang === 'ar' ? 'المعلم المسؤول' : 'Teacher'}</label>
+                <select value={courseEdit.teacher_id} onChange={(e) => setCourseEdit({ ...courseEdit, teacher_id: e.target.value })} className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+                  {data.teachers.map((t) => <option key={t.id} value={t.id}>{t.name_ar}</option>)}
+                </select>
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-bold">{lang === 'ar' ? 'المستوى' : 'Level'}</label>
+                <select value={courseEdit.level_id} onChange={(e) => setCourseEdit({ ...courseEdit, level_id: e.target.value })} className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+                  {data.levels.map((l) => <option key={l.id} value={l.id}>{l.name_ar}</option>)}
+                </select>
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-bold">{lang === 'ar' ? 'المواعيد' : 'Schedule'}</label>
+                <input value={courseEdit.schedule_ar} onChange={(e) => setCourseEdit({ ...courseEdit, schedule_ar: e.target.value })} required className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1">
+                  <label className="text-xs font-bold">{lang === 'ar' ? 'السعر الشهري' : 'Price'}</label>
+                  <input type="number" min={0} value={courseEdit.price_monthly} onChange={(e) => setCourseEdit({ ...courseEdit, price_monthly: e.target.value })} required className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-xs font-bold">{lang === 'ar' ? 'السعة' : 'Capacity'}</label>
+                  <input type="number" min={1} value={courseEdit.capacity} onChange={(e) => setCourseEdit({ ...courseEdit, capacity: e.target.value })} required className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
+                </div>
+              </div>
+              <div className="sm:col-span-2 space-y-1">
+                <label className="text-xs font-bold">{lang === 'ar' ? 'الوصف' : 'Description'}</label>
+                <input value={courseEdit.description_ar} onChange={(e) => setCourseEdit({ ...courseEdit, description_ar: e.target.value })} className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              </div>
+              <label className="inline-flex items-center gap-2 text-xs font-bold cursor-pointer self-end pb-2">
+                <input type="checkbox" checked={courseEdit.is_featured} onChange={(e) => setCourseEdit({ ...courseEdit, is_featured: e.target.checked })} />
+                <span>{lang === 'ar' ? 'دورة مميزة في الرئيسية' : 'Featured on Home'}</span>
+              </label>
+              <div className="sm:col-span-3">
+                <PrimaryButton type="submit">{lang === 'ar' ? 'حفظ تعديلات الدورة' : 'Save Course Changes'}</PrimaryButton>
+              </div>
+            </form>
+          </Card>
+
+          {/* 2. Course Lessons, Recordings & Files */}
+          <Card className="p-6 space-y-5">
+            <div className="space-y-1">
+              <h3 className="text-base font-extrabold">{lang === 'ar' ? 'الدروس والمحاضرات المسجلة والمرفقات' : 'Course Lessons, Recordings & Materials'}</h3>
+              <p className="text-xs text-slate-500">
+                {lang === 'ar'
+                  ? 'أضف الدروس وارفع ملفات PDF / أوراق العمل (حتى 8 ميجا)، أما تسجيلات الفيديو فأضف رابط Google Drive أو YouTube Unlisted للحفاظ على سرعة ومجانية الاستضافة.'
+                  : 'Attach live URLs, external Google Drive/YouTube recording links, or upload PDF worksheets (max 8 MB).'}
+              </p>
+            </div>
+
+            <form onSubmit={addCourseLesson} className="grid grid-cols-1 sm:grid-cols-6 gap-2.5 p-4 rounded-xl bg-[#FAF8F3] dark:bg-[#13284A] border border-[#E5DEC9] dark:border-[#233C63]">
+              <input
+                placeholder={lang === 'ar' ? 'عنوان الدرس الجديد *' : 'New Lesson Title *'}
+                value={courseLessonForm.title_ar}
+                onChange={(e) => setCourseLessonForm({ ...courseLessonForm, title_ar: e.target.value })}
+                required
+                className="sm:col-span-2 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#091529] px-3 py-2 text-xs"
+              />
+              <input type="date" value={courseLessonForm.lesson_date} onChange={(e) => setCourseLessonForm({ ...courseLessonForm, lesson_date: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#091529] px-3 py-2 text-xs font-mono-tabular" />
+              <input type="time" value={courseLessonForm.start_time} onChange={(e) => setCourseLessonForm({ ...courseLessonForm, start_time: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#091529] px-3 py-2 text-xs font-mono-tabular" />
+              <input placeholder={lang === 'ar' ? 'رابط البث المباشر (اختياري)' : 'Live URL (optional)'} value={courseLessonForm.live_url} onChange={(e) => setCourseLessonForm({ ...courseLessonForm, live_url: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#091529] px-3 py-2 text-xs" />
+              <PrimaryButton type="submit" className="text-xs">
+                <Plus className="w-3.5 h-3.5" />
+                <span>{lang === 'ar' ? 'إضافة درس' : 'Add Lesson'}</span>
+              </PrimaryButton>
+            </form>
+
+            {courseLessons.length === 0 ? (
+              <p className="text-sm text-slate-500">{lang === 'ar' ? 'لا توجد دروس في هذه الدورة بعد.' : 'No lessons in this course yet.'}</p>
+            ) : (
+              <div className="space-y-3">
+                {courseLessons.map((ls) => {
+                  const links = (data.lessonLinks || []).filter((lk) => lk.lesson_id === ls.id);
+                  const isEditingThis = editingLessonId === ls.id;
+                  const isAttachingThis = attachLessonId === ls.id;
+
+                  return (
+                    <div key={ls.id} className="rounded-xl border border-[#E5DEC9] dark:border-[#233C63] p-4 space-y-3 bg-white dark:bg-[#0F213E]">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div className="space-y-1">
+                          <div className="font-bold text-sm">{ls.title_ar}</div>
+                          <div className="text-xs font-mono-tabular text-[#0F766E] dark:text-[#2DD4BF]">
+                            {ls.lesson_date} · {ls.start_time} ({ls.duration_min} {lang === 'ar' ? 'د' : 'm'})
+                          </div>
+                          {ls.objectives_ar && <p className="text-xs text-slate-500">{ls.objectives_ar}</p>}
+                        </div>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setAttachLessonId(isAttachingThis ? null : ls.id);
+                              setAttachForm({ link_type: 'recording', title_ar: '', url: '' });
+                            }}
+                            className="rounded-lg px-2.5 py-1.5 text-xs font-bold bg-[#0F766E] text-white hover:bg-[#0D625B] cursor-pointer"
+                          >
+                            {isAttachingThis ? (lang === 'ar' ? 'إغلاق المرفقات' : 'Close') : lang === 'ar' ? '+ تسجيل / ملف / رابط' : '+ Recording / File'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (isEditingThis) {
+                                setEditingLessonId(null);
+                              } else {
+                                setEditingLessonId(ls.id);
+                                setLessonEdit({
+                                  title_ar: ls.title_ar || '',
+                                  lesson_date: ls.lesson_date || '',
+                                  start_time: ls.start_time || '',
+                                  duration_min: String(ls.duration_min || 45),
+                                  objectives_ar: ls.objectives_ar || '',
+                                });
+                              }
+                            }}
+                            className="p-1.5 rounded-lg text-[#0F766E] dark:text-[#2DD4BF] hover:bg-[#0F766E]/10 cursor-pointer"
+                            title={lang === 'ar' ? 'تعديل الدرس' : 'Edit Lesson'}
+                          >
+                            <Pencil className="w-4 h-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setDeleteTarget({ type: 'lessons', id: ls.id })}
+                            className="p-1.5 rounded-lg text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 cursor-pointer"
+                            title={lang === 'ar' ? 'حذف الدرس' : 'Delete Lesson'}
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+
+                      {links.length > 0 && (
+                        <div className="flex flex-wrap gap-2">
+                          {links.map((lk) => {
+                            const Icon = lk.link_type === 'recording' ? PlayCircle : lk.link_type === 'material' ? FileText : Video;
+                            const badgeLabel =
+                              lk.link_type === 'recording'
+                                ? lang === 'ar' ? 'تسجيل' : 'Rec'
+                                : lk.link_type === 'material'
+                                ? lang === 'ar' ? 'ملف' : 'File'
+                                : lang === 'ar' ? 'بث' : 'Live';
+                            return (
+                              <div key={lk.id} className="inline-flex items-center gap-1.5 rounded-lg border border-[#E5DEC9] dark:border-[#233C63] bg-[#FAF8F3] dark:bg-[#13284A] px-2.5 py-1 text-xs">
+                                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-[#C98A1E]/20 text-[#C98A1E]">{badgeLabel}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => void openLinkAttachment(lk)}
+                                  className="inline-flex items-center gap-1 font-semibold hover:text-[#0F766E] cursor-pointer"
+                                >
+                                  <Icon className="w-3.5 h-3.5" />
+                                  <span>{lk.title_ar}</span>
+                                  <ExternalLink className="w-3 h-3 opacity-60" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void deleteLink(lk.id)}
+                                  className="text-red-600 p-0.5 rounded hover:bg-red-100 dark:hover:bg-red-950/40 cursor-pointer"
+                                  title={lang === 'ar' ? 'حذف المرفق' : 'Remove'}
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {isEditingThis && (
+                        <form onSubmit={saveLessonEdit} className="grid grid-cols-1 sm:grid-cols-4 gap-2.5 p-3 rounded-xl bg-[#FAF8F3] dark:bg-[#13284A] border border-[#E5DEC9] dark:border-[#233C63]">
+                          <input value={lessonEdit.title_ar} onChange={(e) => setLessonEdit({ ...lessonEdit, title_ar: e.target.value })} required className="sm:col-span-2 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#091529] px-3 py-1.5 text-xs" />
+                          <input type="date" value={lessonEdit.lesson_date} onChange={(e) => setLessonEdit({ ...lessonEdit, lesson_date: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#091529] px-3 py-1.5 text-xs font-mono-tabular" />
+                          <input type="time" value={lessonEdit.start_time} onChange={(e) => setLessonEdit({ ...lessonEdit, start_time: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#091529] px-3 py-1.5 text-xs font-mono-tabular" />
+                          <input placeholder={lang === 'ar' ? 'أهداف الدرس' : 'Objectives'} value={lessonEdit.objectives_ar} onChange={(e) => setLessonEdit({ ...lessonEdit, objectives_ar: e.target.value })} className="sm:col-span-3 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#091529] px-3 py-1.5 text-xs" />
+                          <PrimaryButton type="submit" className="text-xs">{lang === 'ar' ? 'حفظ الدرس' : 'Save'}</PrimaryButton>
+                        </form>
+                      )}
+
+                      {isAttachingThis && (
+                        <div className="p-4 rounded-xl bg-[#FAF8F3] dark:bg-[#13284A] border border-[#C98A1E]/40 space-y-3">
+                          <form onSubmit={(e) => addLessonAttachmentLink(e, ls.id)} className="grid grid-cols-1 sm:grid-cols-4 gap-2.5">
+                            <select
+                              value={attachForm.link_type}
+                              onChange={(e) => setAttachForm({ ...attachForm, link_type: e.target.value as 'recording' | 'zoom' | 'meet' | 'material' })}
+                              className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#091529] px-3 py-2 text-xs font-bold"
+                            >
+                              <option value="recording">{lang === 'ar' ? 'تسجيل المحاضرة (Google Drive / YouTube)' : 'Recording URL'}</option>
+                              <option value="zoom">{lang === 'ar' ? 'رابط Zoom مباشر' : 'Live Zoom URL'}</option>
+                              <option value="meet">{lang === 'ar' ? 'رابط Google Meet' : 'Live Meet URL'}</option>
+                              <option value="material">{lang === 'ar' ? 'رابط ملف خارجي' : 'External Material URL'}</option>
+                            </select>
+                            <input
+                              placeholder={lang === 'ar' ? 'العنوان (مثال: تسجيل الحصة الرابعة)' : 'Label'}
+                              value={attachForm.title_ar}
+                              onChange={(e) => setAttachForm({ ...attachForm, title_ar: e.target.value })}
+                              className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#091529] px-3 py-2 text-xs"
+                            />
+                            <input
+                              type="url"
+                              required
+                              dir="ltr"
+                              placeholder="https://drive.google.com/file/..."
+                              value={attachForm.url}
+                              onChange={(e) => setAttachForm({ ...attachForm, url: e.target.value })}
+                              className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#091529] px-3 py-2 text-xs"
+                            />
+                            <PrimaryButton type="submit" className="text-xs">{lang === 'ar' ? 'إضافة الرابط' : 'Add Link'}</PrimaryButton>
+                          </form>
+                          <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-[#E5DEC9] dark:border-[#233C63] text-xs">
+                            <span className="text-slate-500">
+                              {lang === 'ar'
+                                ? 'أو رفع ملف (PDF / مستند / صورة / صوت — حد أقصى 8 ميجا):'
+                                : 'Or upload document/PDF directly to private Storage (max 8 MB):'}
+                            </span>
+                            <label className="inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 bg-[#0F213E] text-white font-bold cursor-pointer hover:bg-[#19335E]">
+                              <Upload className="w-3.5 h-3.5" />
+                              <span>{uploadingMaterial ? (lang === 'ar' ? 'جاري الرفع...' : 'Uploading...') : lang === 'ar' ? 'رفع ملف للدرس' : 'Upload File'}</span>
+                              <input
+                                type="file"
+                                className="hidden"
+                                accept=".pdf,.png,.jpg,.jpeg,.webp,.doc,.docx,.ppt,.pptx,.mp3,.m4a"
+                                disabled={uploadingMaterial}
+                                onChange={(e) => {
+                                  const f = e.target.files?.[0];
+                                  if (f) void uploadMaterialFile(ls.id, f);
+                                  e.target.value = '';
+                                }}
+                              />
+                            </label>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </Card>
+
+          {/* 3. Course Enrollments */}
+          <Card className="p-6 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <h3 className="text-base font-extrabold">{lang === 'ar' ? 'الطلاب المسجلون بهذه الدورة' : 'Enrolled Students in Course'}</h3>
+              {unenrolledStudents.length > 0 && (
+                <form onSubmit={quickEnroll} className="flex flex-wrap items-center gap-2">
+                  <select
+                    value={courseEnrollStudentId}
+                    onChange={(e) => setCourseEnrollStudentId(e.target.value)}
+                    className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-1.5 text-xs"
+                  >
+                    {unenrolledStudents.map((s) => (
+                      <option key={s.id} value={s.id}>{s.full_name_ar} ({s.student_code})</option>
+                    ))}
+                  </select>
+                  <PrimaryButton type="submit" className="text-xs py-1.5">{lang === 'ar' ? '+ إلحاق طالب' : '+ Enroll'}</PrimaryButton>
+                </form>
+              )}
+            </div>
+            <ResponsiveTable
+              data={courseEnrollments}
+              emptyTitle={lang === 'ar' ? 'لا يوجد طلاب ملتحقون بهذه الدورة بعد' : 'No students enrolled yet'}
+              columns={[
+                { key: 'student', header: lang === 'ar' ? 'الطالب' : 'Student', render: (r) => r.student_name_ar },
+                { key: 'status', header: lang === 'ar' ? 'الحالة' : 'Status', render: (r) => r.status },
+                {
+                  key: 'act',
+                  header: '',
+                  align: 'end',
+                  render: (r) => (
+                    <button
+                      type="button"
+                      onClick={() => void removeEnrollment(r.id)}
+                      className="text-xs font-bold text-red-600 hover:underline cursor-pointer"
+                    >
+                      {lang === 'ar' ? 'إزالة من الدورة' : 'Remove'}
+                    </button>
+                  ),
+                },
+              ]}
+            />
+          </Card>
+
+          <ConfirmDeleteModal open={Boolean(deleteTarget)} onConfirm={confirmSoftDelete} onClose={() => setDeleteTarget(null)} />
+        </div>
+      );
+    }
+
     const createCourse = async (e: React.FormEvent) => {
       e.preventDefault();
       try {
         await apiFetch('/api/admin/courses', { method: 'POST', body: JSON.stringify(newCourse) });
         toast(lang === 'ar' ? 'تم إنشاء الكورس بنجاح' : 'Course created', 'success');
-        setNewCourse({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '1', schedule_ar: 'الإثنين · 5:00 م', price_monthly: '350' });
+        setNewCourse({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '1', schedule_ar: 'الإثنين · 5:00 م', price_monthly: '350', capacity: '12' });
         loadData();
       } catch (err: unknown) {
         toast(err instanceof Error ? err.message : 'Error', 'error');
       }
     };
+
+    const filteredCourses = data.courses.filter((c) => {
+      const q = courseSearch.trim().toLowerCase();
+      if (!q) return true;
+      return (
+        c.title_ar.toLowerCase().includes(q) ||
+        (c.title_en || '').toLowerCase().includes(q) ||
+        (c.teacher_name_ar || '').toLowerCase().includes(q)
+      );
+    });
 
     return (
       <div className="space-y-6">
@@ -332,27 +1271,64 @@ export function AdminDashboard({
             </select>
             <input placeholder={lang === 'ar' ? 'الجدول' : 'Schedule'} value={newCourse.schedule_ar} onChange={(e) => setNewCourse({ ...newCourse, schedule_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
             <input type="number" placeholder={lang === 'ar' ? 'السعر الشهري' : 'Price'} value={newCourse.price_monthly} onChange={(e) => setNewCourse({ ...newCourse, price_monthly: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
-            <input placeholder={lang === 'ar' ? 'وصف مختصر' : 'Description'} value={newCourse.description_ar} onChange={(e) => setNewCourse({ ...newCourse, description_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+            <input type="number" placeholder={lang === 'ar' ? 'السعة' : 'Capacity'} value={newCourse.capacity} onChange={(e) => setNewCourse({ ...newCourse, capacity: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
+            <input placeholder={lang === 'ar' ? 'وصف مختصر' : 'Description'} value={newCourse.description_ar} onChange={(e) => setNewCourse({ ...newCourse, description_ar: e.target.value })} required className="sm:col-span-3 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
             <div className="sm:col-span-3"><PrimaryButton type="submit">{lang === 'ar' ? 'إنشاء الحلقة' : 'Create Course'}</PrimaryButton></div>
           </form>
         </Card>
 
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="relative flex-1 min-w-[220px] max-w-md">
+            <Search className="w-4 h-4 text-slate-400 absolute top-1/2 -translate-y-1/2 start-3" />
+            <input
+              value={courseSearch}
+              onChange={(e) => setCourseSearch(e.target.value)}
+              placeholder={lang === 'ar' ? 'ابحث باسم الدورة أو المعلم...' : 'Search by course or teacher...'}
+              className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#0F213E] ps-9 pe-3 py-2 text-sm"
+            />
+          </div>
+          <SecondaryButton
+            type="button"
+            className="text-xs"
+            onClick={() =>
+              exportCsv(
+                'courses.csv',
+                ['Title', 'Level', 'Teacher', 'Schedule', 'Monthly Price', 'Capacity'],
+                filteredCourses.map((c) => [c.title_ar, c.level_name_ar, c.teacher_name_ar, c.schedule_ar, c.price_monthly, c.capacity])
+              )
+            }
+          >
+            <FileSpreadsheet className="w-4 h-4" />
+            <span>{lang === 'ar' ? 'تصدير CSV' : 'Export CSV'}</span>
+          </SecondaryButton>
+        </div>
+
         <ResponsiveTable
-          data={data.courses}
+          data={filteredCourses}
           emptyTitle={lang === 'ar' ? 'لا توجد كورسات' : 'No courses'}
           columns={[
-            { key: 'title', header: lang === 'ar' ? 'الحلقة' : 'Title', render: (r) => r.title_ar },
+            { key: 'title', header: lang === 'ar' ? 'الحلقة' : 'Title', render: (r) => <span className="font-bold">{r.title_ar}</span> },
             { key: 'teacher', header: lang === 'ar' ? 'المعلم' : 'Teacher', render: (r) => r.teacher_name_ar },
             { key: 'schedule', header: lang === 'ar' ? 'الموعد' : 'Schedule', render: (r) => r.schedule_ar },
-            { key: 'price', header: lang === 'ar' ? 'السعر' : 'Price', align: 'end', render: (r) => r.price_monthly },
+            { key: 'price', header: lang === 'ar' ? 'السعر' : 'Price', align: 'end', render: (r) => <span className="font-mono-tabular font-bold">{r.price_monthly}</span> },
             {
               key: 'act',
-              header: '',
+              header: lang === 'ar' ? 'التحكم' : 'Manage',
               align: 'end',
               render: (r) => (
-                <button onClick={() => setDeleteTarget({ type: 'courses', id: r.id })} className="p-1.5 text-red-600 rounded-lg cursor-pointer">
-                  <Trash2 className="w-4 h-4" />
-                </button>
+                <div className="inline-flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => openCourseWorkspace(r)}
+                    className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-bold bg-[#0F766E] text-white hover:bg-[#0D625B] cursor-pointer"
+                  >
+                    <FolderOpen className="w-3.5 h-3.5" />
+                    <span>{lang === 'ar' ? 'إدارة الدورة والدروس' : 'Manage'}</span>
+                  </button>
+                  <button onClick={() => setDeleteTarget({ type: 'courses', id: r.id })} className="p-1.5 text-red-600 rounded-lg cursor-pointer" title={lang === 'ar' ? 'أرشفة' : 'Archive'}>
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
               ),
             },
           ]}
@@ -371,6 +1347,25 @@ export function AdminDashboard({
       loadData();
     };
 
+    const saveInlineLessonEdit = async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!editingLessonId) return;
+      try {
+        await apiFetch(`/api/admin/lessons/${editingLessonId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            ...lessonEdit,
+            duration_min: Number(lessonEdit.duration_min || 45),
+          }),
+        });
+        toast(lang === 'ar' ? 'تم تعديل الدرس بنجاح' : 'Lesson updated', 'success');
+        setEditingLessonId(null);
+        loadData();
+      } catch (err) {
+        toast(err instanceof Error ? err.message : 'Error', 'error');
+      }
+    };
+
     return (
       <div className="space-y-6">
         <Card className="p-6 space-y-4">
@@ -387,6 +1382,24 @@ export function AdminDashboard({
           </form>
         </Card>
 
+        {editingLessonId !== null && (
+          <Card className="p-6 space-y-4 border-2 border-[#C98A1E]">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-extrabold">{lang === 'ar' ? 'تعديل بيانات الدرس' : 'Edit Lesson'}</h3>
+              <button type="button" onClick={() => setEditingLessonId(null)} className="text-xs text-slate-500 hover:underline cursor-pointer">
+                {lang === 'ar' ? 'إغلاق' : 'Close'}
+              </button>
+            </div>
+            <form onSubmit={saveInlineLessonEdit} className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+              <input value={lessonEdit.title_ar} onChange={(e) => setLessonEdit({ ...lessonEdit, title_ar: e.target.value })} required className="sm:col-span-2 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <input type="date" value={lessonEdit.lesson_date} onChange={(e) => setLessonEdit({ ...lessonEdit, lesson_date: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm font-mono-tabular" />
+              <input type="time" value={lessonEdit.start_time} onChange={(e) => setLessonEdit({ ...lessonEdit, start_time: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm font-mono-tabular" />
+              <input placeholder={lang === 'ar' ? 'الأهداف' : 'Objectives'} value={lessonEdit.objectives_ar} onChange={(e) => setLessonEdit({ ...lessonEdit, objectives_ar: e.target.value })} className="sm:col-span-3 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <PrimaryButton type="submit">{lang === 'ar' ? 'حفظ التعديلات' : 'Save Changes'}</PrimaryButton>
+            </form>
+          </Card>
+        )}
+
         <ResponsiveTable
           data={data.lessons}
           emptyTitle={lang === 'ar' ? 'لا توجد دروس' : 'No lessons'}
@@ -395,13 +1408,37 @@ export function AdminDashboard({
             { key: 'course', header: lang === 'ar' ? 'الحلقة' : 'Course', render: (r) => r.course_title_ar },
             { key: 'date', header: lang === 'ar' ? 'التاريخ' : 'Date', render: (r) => <span className="font-mono-tabular">{r.lesson_date} · {r.start_time}</span> },
             {
+              key: 'links',
+              header: lang === 'ar' ? 'المرفقات' : 'Attachments',
+              align: 'end',
+              render: (r) => <span className="font-mono-tabular font-bold">{(data.lessonLinks || []).filter((lk) => lk.lesson_id === r.id).length}</span>,
+            },
+            {
               key: 'act',
               header: '',
               align: 'end',
               render: (r) => (
-                <button onClick={() => setDeleteTarget({ type: 'lessons', id: r.id })} className="p-1.5 text-red-600 rounded-lg cursor-pointer">
-                  <Trash2 className="w-4 h-4" />
-                </button>
+                <div className="inline-flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditingLessonId(r.id);
+                      setLessonEdit({
+                        title_ar: r.title_ar || '',
+                        lesson_date: r.lesson_date || '',
+                        start_time: r.start_time || '',
+                        duration_min: String(r.duration_min || 45),
+                        objectives_ar: r.objectives_ar || '',
+                      });
+                    }}
+                    className="p-1.5 text-[#0F766E] dark:text-[#2DD4BF] rounded-lg cursor-pointer"
+                  >
+                    <Pencil className="w-4 h-4" />
+                  </button>
+                  <button onClick={() => setDeleteTarget({ type: 'lessons', id: r.id })} className="p-1.5 text-red-600 rounded-lg cursor-pointer">
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
               ),
             },
           ]}
@@ -467,15 +1504,87 @@ export function AdminDashboard({
       loadData();
     };
 
+    const filteredAdmissions = data.admissionRequests.filter((r) => {
+      if (admissionFilter !== 'all' && r.status !== admissionFilter) return false;
+      const q = admissionSearch.trim().toLowerCase();
+      if (!q) return true;
+      return (
+        r.student_name.toLowerCase().includes(q) ||
+        r.guardian_name.toLowerCase().includes(q) ||
+        r.guardian_email.toLowerCase().includes(q) ||
+        r.guardian_phone.toLowerCase().includes(q)
+      );
+    });
+
     return (
       <div className="space-y-4">
-        <h2 className="text-xl font-extrabold">{lang === 'ar' ? 'طلبات التقديم' : 'Admission Requests'}</h2>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h2 className="text-xl font-extrabold">{lang === 'ar' ? 'طلبات التقديم' : 'Admission Requests'}</h2>
+          <SecondaryButton
+            type="button"
+            className="text-xs"
+            onClick={() =>
+              exportCsv(
+                'admissions.csv',
+                ['Student', 'Age', 'Guardian', 'Guardian Email', 'Guardian Phone', 'Course', 'Status'],
+                filteredAdmissions.map((r) => [r.student_name, r.student_age, r.guardian_name, r.guardian_email, r.guardian_phone, r.course_title_ar, r.status])
+              )
+            }
+          >
+            <FileSpreadsheet className="w-4 h-4" />
+            <span>{lang === 'ar' ? 'تصدير CSV' : 'Export CSV'}</span>
+          </SecondaryButton>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap gap-1.5">
+            {(['all', 'pending', 'approved', 'rejected'] as const).map((st) => (
+              <button
+                key={st}
+                type="button"
+                onClick={() => setAdmissionFilter(st)}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold border cursor-pointer ${
+                  admissionFilter === st
+                    ? 'bg-[#0F213E] text-white border-[#0F213E] dark:bg-[#C98A1E] dark:border-[#C98A1E]'
+                    : 'bg-white dark:bg-[#0F213E] border-[#E5DEC9] dark:border-[#233C63]'
+                }`}
+              >
+                {st === 'all'
+                  ? lang === 'ar' ? 'الكل' : 'All'
+                  : st === 'pending'
+                  ? lang === 'ar' ? 'معلقة' : 'Pending'
+                  : st === 'approved'
+                  ? lang === 'ar' ? 'مقبولة' : 'Approved'
+                  : lang === 'ar' ? 'مرفوضة' : 'Rejected'}
+              </button>
+            ))}
+          </div>
+          <div className="relative flex-1 min-w-[200px] max-w-sm">
+            <Search className="w-4 h-4 text-slate-400 absolute top-1/2 -translate-y-1/2 start-3" />
+            <input
+              value={admissionSearch}
+              onChange={(e) => setAdmissionSearch(e.target.value)}
+              placeholder={lang === 'ar' ? 'بحث في الطلبات...' : 'Search admissions...'}
+              className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#0F213E] ps-9 pe-3 py-1.5 text-sm"
+            />
+          </div>
+        </div>
+
         <ResponsiveTable
-          data={data.admissionRequests}
+          data={filteredAdmissions}
           emptyTitle={lang === 'ar' ? 'لا توجد طلبات تقديم' : 'No admission requests'}
           columns={[
             { key: 'student', header: lang === 'ar' ? 'الطالب' : 'Student', render: (r) => `${r.student_name} (${r.student_age})` },
-            { key: 'guardian', header: lang === 'ar' ? 'ولي الأمر' : 'Guardian', render: (r) => `${r.guardian_name} · ${r.guardian_phone}` },
+            {
+              key: 'guardian',
+              header: lang === 'ar' ? 'ولي الأمر' : 'Guardian',
+              render: (r) => (
+                <div className="text-xs">
+                  <div className="font-semibold">{r.guardian_name}</div>
+                  <div className="text-slate-500 font-mono-tabular">{r.guardian_phone} · {r.guardian_email}</div>
+                </div>
+              ),
+            },
             { key: 'course', header: lang === 'ar' ? 'الحلقة' : 'Preferred Course', render: (r) => r.course_title_ar || '—' },
             { key: 'status', header: lang === 'ar' ? 'الحالة' : 'Status', render: (r) => r.status },
             {
@@ -581,40 +1690,7 @@ export function AdminDashboard({
   }
 
   if (activeTab === 'exams') {
-    const createExam = async (e: React.FormEvent) => {
-      e.preventDefault();
-      await apiFetch('/api/admin/exams', { method: 'POST', body: JSON.stringify(newExam) });
-      toast(lang === 'ar' ? 'تم إنشاء الامتحان' : 'Exam created', 'success');
-      setNewExam({ ...newExam, title_ar: '' });
-      loadData();
-    };
-
-    return (
-      <div className="space-y-6">
-        <Card className="p-6 space-y-4">
-          <h2 className="text-lg font-extrabold">{lang === 'ar' ? 'إنشاء امتحان جديد' : 'Create Exam'}</h2>
-          <form onSubmit={createExam} className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-            <select value={newExam.course_id} onChange={(e) => setNewExam({ ...newExam, course_id: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
-              {data.courses.map((c) => <option key={c.id} value={c.id}>{c.title_ar}</option>)}
-            </select>
-            <input placeholder={lang === 'ar' ? 'عنوان الامتحان' : 'Exam Title'} value={newExam.title_ar} onChange={(e) => setNewExam({ ...newExam, title_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
-            <input type="date" value={newExam.exam_date} onChange={(e) => setNewExam({ ...newExam, exam_date: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm font-mono-tabular" />
-            <PrimaryButton type="submit">{lang === 'ar' ? 'إضافة امتحان' : 'Add Exam'}</PrimaryButton>
-          </form>
-        </Card>
-
-        <ResponsiveTable
-          data={data.exams}
-          emptyTitle={lang === 'ar' ? 'لا توجد امتحانات' : 'No exams'}
-          columns={[
-            { key: 'title', header: lang === 'ar' ? 'الامتحان' : 'Exam', render: (r) => r.title_ar },
-            { key: 'course', header: lang === 'ar' ? 'الحلقة' : 'Course', render: (r) => r.course_title_ar },
-            { key: 'date', header: lang === 'ar' ? 'التاريخ' : 'Date', render: (r) => <span className="font-mono-tabular">{r.exam_date}</span> },
-            { key: 'max', header: lang === 'ar' ? 'العظمى' : 'Max', align: 'end', render: (r) => r.max_score },
-          ]}
-        />
-      </div>
-    );
+    return <ExamCenter courses={data.courses} exams={data.exams} onReload={loadData} />;
   }
 
   if (activeTab === 'certificates') {
@@ -663,17 +1739,20 @@ export function AdminDashboard({
               render: (r) => (
                 <div className="inline-flex gap-2">
                   <button
-                    onClick={() =>
-                      generateCertificatePDF({
+                    onClick={async () => {
+                      const { generateCertificatePDF } = await import('../../lib/pdfCertificate');
+                      await generateCertificatePDF({
                         verification_code: r.verification_code,
                         student_name_ar: r.student_name_ar,
                         student_name_en: r.student_name_ar,
+                        course_title_ar: r.course_title_ar,
                         course_title_en: r.course_title_ar,
+                        title_ar: r.title_ar,
                         title_en: r.title_en,
                         grade_label: r.grade_label,
                         issued_at: r.issued_at,
-                      })
-                    }
+                      });
+                    }}
                     className="p-1.5 text-[#0F766E] rounded-lg cursor-pointer"
                     title="Download PDF"
                   >

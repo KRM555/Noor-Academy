@@ -100,7 +100,11 @@ export default defineConfig(() => {
               },
             },
             {
-              urlPattern: /\/api\/public\/.*/i,
+              urlPattern: /\/api\/public\/certificates\/verify\/.*/i,
+              handler: 'NetworkOnly',
+            },
+            {
+              urlPattern: /\/api\/public\/(?!certificates\/verify\/).*/i,
               handler: 'NetworkFirst',
               options: {
                 cacheName: 'academy-public-api',

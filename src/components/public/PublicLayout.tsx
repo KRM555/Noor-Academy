@@ -199,7 +199,8 @@ export function PublicLayout({ currentPath, onNavigate, children }: PublicLayout
               {lang === 'ar' ? 'السياسات والتواصل' : 'Policies & Support'}
             </h4>
             <ul className="space-y-1.5">
-              <li><button onClick={() => go('/faq')} className="hover:text-[#C98A1E] cursor-pointer">{t.faqTitle} &amp; {t.contactUs}</button></li>
+              <li><button onClick={() => go('/faq')} className="hover:text-[#C98A1E] cursor-pointer">{t.faqTitle}</button></li>
+              <li><button onClick={() => go('/contact')} className="hover:text-[#C98A1E] cursor-pointer">{t.contactUs}</button></li>
               <li><button onClick={() => go('/legal/terms')} className="hover:text-[#C98A1E] cursor-pointer">{t.terms}</button></li>
               <li><button onClick={() => go('/legal/privacy')} className="hover:text-[#C98A1E] cursor-pointer">{t.privacy}</button></li>
               <li><button onClick={() => go('/legal/refund')} className="hover:text-[#C98A1E] cursor-pointer">{t.refund}</button></li>
@@ -208,13 +209,19 @@ export function PublicLayout({ currentPath, onNavigate, children }: PublicLayout
 
           <div className="space-y-2">
             <h4 className="font-bold text-xs text-slate-500 dark:text-slate-400">
-              {t.contactUs}
+              <button onClick={() => go('/contact')} className="hover:text-[#C98A1E] cursor-pointer">
+                {t.contactUs}
+              </button>
             </h4>
             <p className="text-xs text-slate-600 dark:text-slate-300 font-mono-tabular">
-              care@noorbayan.academy
+              <a href="mailto:care@noorbayan.academy" className="hover:text-[#C98A1E]">
+                care@noorbayan.academy
+              </a>
             </p>
             <p className="text-xs text-slate-600 dark:text-slate-300 font-mono-tabular">
-              WhatsApp: +20 100 555 0199
+              <a href="https://wa.me/201005550199" target="_blank" rel="noopener noreferrer" className="hover:text-[#C98A1E]">
+                WhatsApp: +20 100 555 0199
+              </a>
             </p>
             <button
               onClick={() => go('/apply')}

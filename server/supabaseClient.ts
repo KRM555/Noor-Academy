@@ -99,7 +99,7 @@ export function getSupabaseLaunchStatus() {
     supabaseHost,
     sessionSecretConfigured: Boolean(process.env.SESSION_SECRET && process.env.SESSION_SECRET.length >= 24),
     nodeEnv: process.env.NODE_ENV || 'development',
-    demoLoginEnabled: process.env.NODE_ENV !== 'production' && process.env.ALLOW_DEMO_LOGIN !== 'false',
+    demoLoginEnabled: process.env.NODE_ENV !== 'production' && process.env.ALLOW_DEMO_LOGIN === 'true',
     databaseEngine: 'supabase_postgresql' as const,
   };
 }
@@ -260,14 +260,14 @@ export async function requestSupabasePasswordReset(email: string, redirectTo?: s
 
 export async function broadcastRealtimeEvent(
   event: string,
-  payload: Record<string, unknown>
+  payload: { kind?: string } = {}
 ): Promise<void> {
   const client = getSupabaseAdmin();
   if (!client) return;
   try {
     const channel = client.channel('noor-bayan-live');
     await channel.httpSend(event, {
-      ...payload,
+      ...(payload.kind ? { kind: payload.kind } : {}),
       emittedAt: new Date().toISOString(),
     });
   } catch (err) {

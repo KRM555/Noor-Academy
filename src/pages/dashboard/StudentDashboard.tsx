@@ -1,5 +1,5 @@
-import React, { useEffect } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import React, { useEffect, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ResponsiveContainer,
   BarChart,
@@ -9,12 +9,11 @@ import {
   Tooltip,
   CartesianGrid,
 } from 'recharts';
-import { ExternalLink, Download, Gamepad2, Calendar, Award } from 'lucide-react';
+import { ExternalLink, Download, Gamepad2, Calendar, Award, Video, FileText, PlayCircle, Copy, Check, Upload, CheckCircle2, Clock, ListChecks, AlertCircle } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { apiFetch } from '../../lib/api';
 import { queryKeys } from '../../lib/queryClient';
 import { tField } from '../../i18n/translations';
-import { generateCertificatePDF } from '../../lib/pdfCertificate';
 import { Card, LoadingState, ResponsiveTable, PrimaryButton, EmptyState } from '../../components/ui/CommonUI';
 import { ChangePasswordCard } from '../../components/dashboard/ChangePasswordCard';
 
@@ -36,7 +35,56 @@ interface StudentDashboardData {
   lessons: Array<{ id: number; course_id: number; title_ar: string; title_en: string; course_title_ar: string; course_title_en: string; lesson_date: string; start_time: string; duration_min: number; objectives_ar: string; objectives_en: string }>;
   lessonLinks: Array<{ id: number; lesson_id: number; title_ar: string; title_en: string; url: string; link_type: string }>;
   attendance: Array<{ id: number; lesson_title_ar: string; lesson_title_en: string; lesson_date: string; status: string; notes: string }>;
-  examResults: Array<{ id: number; exam_title_ar: string; exam_title_en: string; course_title_ar: string; course_title_en: string; exam_date: string; score: number; max_score: number; feedback_ar: string; feedback_en: string }>;
+  exams?: Array<{
+    id: number;
+    course_id: number;
+    title_ar: string;
+    title_en: string;
+    course_title_ar: string;
+    course_title_en: string;
+    exam_date: string;
+    max_score: number;
+    exam_mode: 'file' | 'quiz' | 'hybrid';
+    instructions_ar: string;
+    instructions_en: string;
+    due_at: string | null;
+    allow_late_submission: boolean;
+    show_answers_after_submit: boolean;
+    is_open: boolean;
+    is_past_deadline: boolean;
+    has_question_file: boolean;
+    question_file_name: string | null;
+    question_count: number;
+    questions: Array<{
+      id: string;
+      q_type: 'mcq' | 'tf';
+      prompt_ar: string;
+      prompt_en: string;
+      options_ar: string[];
+      options_en: string[];
+      points: number;
+      correct_index?: number;
+    }>;
+    submission: {
+      status: 'submitted_pending' | 'graded';
+      submitted_at: string;
+      is_late: boolean;
+      has_solution_file: boolean;
+      solution_file_name: string | null;
+      student_notes: string;
+      quiz_answers: Array<{ question_id: string; selected_index: number }>;
+      auto_score: number | null;
+      has_graded_file: boolean;
+      graded_file_name: string | null;
+    } | null;
+    result: {
+      score: number;
+      feedback_ar: string;
+      feedback_en: string;
+      graded_at: string;
+    } | null;
+  }>;
+  examResults: Array<{ id: number; exam_id?: number; exam_title_ar: string; exam_title_en: string; course_title_ar: string; course_title_en: string; exam_date: string; score: number; max_score: number; feedback_ar: string; feedback_en: string }>;
   recitations: Array<{ id: number; surah_name: string; ayah_from: number; ayah_to: number; tajweed_score: number; memorization_score: number; notes_ar: string; recorded_at: string }>;
   evaluations: Array<{ id: number; period: string; behavior_score: number; participation_score: number; summary_ar: string; summary_en: string }>;
   announcements: Array<{ id: number; title_ar: string; title_en: string; body_ar: string; body_en: string; target_scope: string; created_at: string }>;
@@ -52,6 +100,14 @@ export function StudentDashboard({
   onLaunchGame: (slug: string) => void;
 }) {
   const { lang, toast, user } = useApp();
+  const qc = useQueryClient();
+  const [copiedCode, setCopiedCode] = useState(false);
+  const [uploadingExamId, setUploadingExamId] = useState<number | null>(null);
+  const [solutionNotes, setSolutionNotes] = useState<Record<number, string>>({});
+  const [activeQuizExamId, setActiveQuizExamId] = useState<number | null>(null);
+  const [quizAnswers, setQuizAnswers] = useState<Record<string, number>>({});
+  const [submittingQuiz, setSubmittingQuiz] = useState(false);
+
   const { data, isLoading, error } = useQuery({
     queryKey: queryKeys.studentDashboard(user?.id),
     queryFn: () => apiFetch<StudentDashboardData>('/api/student/dashboard'),
@@ -69,6 +125,59 @@ export function StudentDashboard({
   const nextLesson = data.lessons[0];
   const nextLinks = nextLesson ? data.lessonLinks.filter((l) => l.lesson_id === nextLesson.id) : [];
 
+  const copyStudentCode = async () => {
+    try {
+      await navigator.clipboard.writeText(data.student.student_code);
+      setCopiedCode(true);
+      toast(lang === 'ar' ? 'تم نسخ كود الطالب' : 'Student code copied', 'success');
+      setTimeout(() => setCopiedCode(false), 2000);
+    } catch {
+      toast(data.student.student_code, 'info');
+    }
+  };
+
+  const openLessonLink = async (lk: { id: number; url: string }) => {
+    try {
+      let targetUrl = lk.url;
+      if (lk.url.startsWith('storage://')) {
+        const res = await apiFetch<{ url: string }>(`/api/lesson-links/${lk.id}/access`);
+        targetUrl = res.url;
+      }
+      const a = document.createElement('a');
+      a.href = targetUrl;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Unable to open file', 'error');
+    }
+  };
+
+  const renderLessonLinkButton = (lk: { id: number; title_ar: string; title_en: string; url: string; link_type: string }) => {
+    const isRecording = lk.link_type === 'recording';
+    const isMaterial = lk.link_type === 'material';
+    const colorClass = isRecording
+      ? 'bg-[#C98A1E] text-white hover:bg-[#B47A16]'
+      : isMaterial
+      ? 'bg-[#0F213E] text-white hover:bg-[#19335E] dark:bg-[#1E3B68]'
+      : 'bg-[#0F766E] text-white hover:bg-[#0D625B]';
+    const Icon = isRecording ? PlayCircle : isMaterial ? FileText : Video;
+    return (
+      <button
+        key={lk.id}
+        type="button"
+        onClick={() => void openLessonLink(lk)}
+        className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-bold cursor-pointer transition-colors ${colorClass}`}
+      >
+        <Icon className="w-3.5 h-3.5" />
+        <span>{tField(lk as unknown as Record<string, unknown>, 'title', lang)}</span>
+        <ExternalLink className="w-3 h-3 opacity-80" />
+      </button>
+    );
+  };
+
   if (activeTab === 'home') {
     const chartData = data.recitations.map((r) => ({
       name: r.surah_name,
@@ -82,7 +191,15 @@ export function StudentDashboard({
           <Card className="p-5 space-y-1">
             <div className="text-xs text-slate-500">{lang === 'ar' ? 'المستوى الحالي' : 'Current Level'}</div>
             <div className="text-lg font-extrabold">{tField(data.student as unknown as Record<string, unknown>, 'level_name', lang)}</div>
-            <div className="text-xs font-mono-tabular text-[#0F766E] dark:text-[#2DD4BF]">{data.student.student_code}</div>
+            <button
+              type="button"
+              onClick={() => void copyStudentCode()}
+              className="inline-flex items-center gap-1.5 text-xs font-mono-tabular font-bold text-[#0F766E] dark:text-[#2DD4BF] hover:underline cursor-pointer"
+              title={lang === 'ar' ? 'نسخ كود الطالب لولي الأمر' : 'Copy student code'}
+            >
+              <span>{data.student.student_code}</span>
+              {copiedCode ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+            </button>
           </Card>
           <Card className="p-5 space-y-1">
             <div className="text-xs text-slate-500">{lang === 'ar' ? 'الحلقات المسجلة' : 'Active Circles'}</div>
@@ -112,18 +229,7 @@ export function StudentDashboard({
                 </div>
               </div>
               <div className="flex flex-wrap gap-2">
-                {nextLinks.map((lk) => (
-                  <a
-                    key={lk.id}
-                    href={lk.url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-bold bg-[#0F766E] text-white hover:bg-[#0D625B]"
-                  >
-                    <ExternalLink className="w-3.5 h-3.5" />
-                    <span>{tField(lk as unknown as Record<string, unknown>, 'title', lang)}</span>
-                  </a>
-                ))}
+                {nextLinks.map((lk) => renderLessonLinkButton(lk))}
               </div>
             </div>
           ) : (
@@ -158,36 +264,40 @@ export function StudentDashboard({
   if (activeTab === 'lessons') {
     return (
       <div className="space-y-4">
-        <h2 className="text-xl font-extrabold">{lang === 'ar' ? 'دروسي ولينكات المحاضرات' : 'My Lessons & Links'}</h2>
-        {data.lessons.map((l) => {
-          const links = data.lessonLinks.filter((lk) => lk.lesson_id === l.id);
-          return (
-            <Card key={l.id} className="p-5 flex flex-col md:flex-row md:items-center justify-between gap-4">
-              <div className="space-y-1">
-                <div className="text-xs text-slate-500">{tField(l as unknown as Record<string, unknown>, 'course_title', lang)}</div>
-                <h3 className="font-bold text-base">{tField(l as unknown as Record<string, unknown>, 'title', lang)}</h3>
-                <p className="text-xs text-slate-600 dark:text-slate-300">{tField(l as unknown as Record<string, unknown>, 'objectives', lang)}</p>
-                <div className="text-xs font-mono-tabular text-[#0F766E] dark:text-[#2DD4BF]">
-                  {l.lesson_date} · {l.start_time} ({l.duration_min} {lang === 'ar' ? 'د' : 'm'})
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-xl font-extrabold">{lang === 'ar' ? 'دروسي وتسجيلات المحاضرات والملفات' : 'My Lessons, Recordings & Materials'}</h2>
+          <div className="flex flex-wrap gap-2 text-[11px] font-bold">
+            <span className="px-2.5 py-1 rounded-lg bg-[#0F766E]/10 text-[#0F766E] dark:text-[#2DD4BF]">{lang === 'ar' ? 'بث مباشر' : 'Live'}</span>
+            <span className="px-2.5 py-1 rounded-lg bg-[#C98A1E]/15 text-[#C98A1E]">{lang === 'ar' ? 'تسجيل المحاضرة' : 'Recording'}</span>
+            <span className="px-2.5 py-1 rounded-lg bg-[#0F213E]/10 dark:bg-white/10">{lang === 'ar' ? 'ملف / واجب' : 'Material'}</span>
+          </div>
+        </div>
+        {data.lessons.length === 0 ? (
+          <EmptyState title={lang === 'ar' ? 'لا توجد دروس مجدولة في حلقاتك بعد' : 'No lessons scheduled yet'} />
+        ) : (
+          data.lessons.map((l) => {
+            const links = data.lessonLinks.filter((lk) => lk.lesson_id === l.id);
+            return (
+              <Card key={l.id} className="p-5 flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div className="space-y-1">
+                  <div className="text-xs text-slate-500">{tField(l as unknown as Record<string, unknown>, 'course_title', lang)}</div>
+                  <h3 className="font-bold text-base">{tField(l as unknown as Record<string, unknown>, 'title', lang)}</h3>
+                  <p className="text-xs text-slate-600 dark:text-slate-300">{tField(l as unknown as Record<string, unknown>, 'objectives', lang)}</p>
+                  <div className="text-xs font-mono-tabular text-[#0F766E] dark:text-[#2DD4BF]">
+                    {l.lesson_date} · {l.start_time} ({l.duration_min} {lang === 'ar' ? 'د' : 'm'})
+                  </div>
                 </div>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {links.map((lk) => (
-                  <a
-                    key={lk.id}
-                    href={lk.url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-bold bg-[#C98A1E] text-white hover:bg-[#B47A16]"
-                  >
-                    <ExternalLink className="w-3.5 h-3.5" />
-                    <span>{tField(lk as unknown as Record<string, unknown>, 'title', lang)}</span>
-                  </a>
-                ))}
-              </div>
-            </Card>
-          );
-        })}
+                <div className="flex flex-wrap gap-2">
+                  {links.length === 0 ? (
+                    <span className="text-xs text-slate-400">{lang === 'ar' ? 'لا توجد مرفقات بعد' : 'No attachments yet'}</span>
+                  ) : (
+                    links.map((lk) => renderLessonLinkButton(lk))
+                  )}
+                </div>
+              </Card>
+            );
+          })
+        )}
       </div>
     );
   }
@@ -221,22 +331,359 @@ export function StudentDashboard({
   }
 
   if (activeTab === 'exams') {
+    const examsList = data.exams || [];
+
+    const openSignedExamUrl = (url: string) => {
+      const a = document.createElement('a');
+      a.href = url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    };
+
+    const downloadQuestionPaper = async (examId: number) => {
+      try {
+        const res = await apiFetch<{ url: string }>(`/api/exams/${examId}/question-file`);
+        openSignedExamUrl(res.url);
+      } catch (err) {
+        toast(err instanceof Error ? err.message : 'Unable to download exam file', 'error');
+      }
+    };
+
+    const downloadSubmissionFile = async (examId: number, kind: 'solution' | 'graded') => {
+      try {
+        const res = await apiFetch<{ url: string }>(`/api/exams/${examId}/submissions/${data.student.id}/file?kind=${kind}`);
+        openSignedExamUrl(res.url);
+      } catch (err) {
+        toast(err instanceof Error ? err.message : 'File unavailable', 'error');
+      }
+    };
+
+    const uploadSolution = async (examId: number, file: File) => {
+      if (file.size > 8 * 1024 * 1024) {
+        toast(lang === 'ar' ? 'الحد الأقصى لحجم الحل 8 ميجابايت' : 'Max solution size is 8 MB', 'error');
+        return;
+      }
+      setUploadingExamId(examId);
+      try {
+        const base64Data = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result || ''));
+          reader.onerror = () => reject(new Error('File read failed'));
+          reader.readAsDataURL(file);
+        });
+        await apiFetch(`/api/exams/${examId}/submit-file`, {
+          method: 'POST',
+          body: JSON.stringify({
+            fileName: file.name,
+            mimeType: file.type || 'application/pdf',
+            base64Data,
+            student_notes: (solutionNotes[examId] || '').trim(),
+          }),
+        });
+        toast(lang === 'ar' ? 'تم رفع ملف الحل بأمان وإرساله للمعلم' : 'Solution uploaded securely for grading', 'success');
+        void qc.invalidateQueries({ queryKey: queryKeys.studentDashboard(user?.id) });
+      } catch (err) {
+        toast(err instanceof Error ? err.message : 'Upload failed', 'error');
+      } finally {
+        setUploadingExamId(null);
+      }
+    };
+
+    const submitOnlineQuiz = async (examItem: NonNullable<StudentDashboardData['exams']>[number]) => {
+      const answers = examItem.questions.map((q) => ({
+        question_id: q.id,
+        selected_index: quizAnswers[q.id] ?? -1,
+      }));
+      if (answers.some((a) => a.selected_index < 0)) {
+        toast(lang === 'ar' ? 'يرجى الإجابة على جميع الأسئلة قبل الإرسال' : 'Please answer all questions before submitting', 'error');
+        return;
+      }
+      setSubmittingQuiz(true);
+      try {
+        const res = await apiFetch<{ auto_score: number; max_score: number; finalized: boolean }>(
+          `/api/exams/${examItem.id}/submit-quiz`,
+          {
+            method: 'POST',
+            body: JSON.stringify({ answers }),
+          }
+        );
+        toast(
+          res.finalized
+            ? lang === 'ar'
+              ? `تم تصحيح الاختبار تلقائياً: ${res.auto_score} / ${res.max_score}`
+              : `Auto-graded score: ${res.auto_score} / ${res.max_score}`
+            : lang === 'ar'
+            ? `تم حفظ إجاباتك (${res.auto_score}) بانتظار تصحيح ملف الحل`
+            : `Quiz answers saved (${res.auto_score})`,
+          'success'
+        );
+        setActiveQuizExamId(null);
+        void qc.invalidateQueries({ queryKey: queryKeys.studentDashboard(user?.id) });
+      } catch (err) {
+        toast(err instanceof Error ? err.message : 'Submission failed', 'error');
+      } finally {
+        setSubmittingQuiz(false);
+      }
+    };
+
     return (
-      <div className="space-y-4">
-        <div className="flex items-center justify-between">
-          <h2 className="text-xl font-extrabold">{lang === 'ar' ? 'الامتحانات والنتائج' : 'Exams & Results'}</h2>
-          <span className="text-xs text-slate-500">{lang === 'ar' ? 'للقراءة فقط' : 'Read-only'}</span>
+      <div className="space-y-6">
+        <div>
+          <h2 className="text-xl font-extrabold">{lang === 'ar' ? 'الامتحانات والاختبارات الإلكترونية' : 'Exams & Assessments'}</h2>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            {lang === 'ar'
+              ? 'نزّل ورقة الامتحان أو حل الاختبار الإلكتروني، وارفع حلك بصيغة PDF أو صورة واضحة ليصحّحه المعلم ويرصد درجتك.'
+              : 'Download exam papers, take interactive quizzes, or upload your PDF/image solution for grading.'}
+          </p>
         </div>
-        <ResponsiveTable
-          data={data.examResults}
-          emptyTitle={lang === 'ar' ? 'لا توجد نتائج امتحانات بعد' : 'No exam results yet'}
-          columns={[
-            { key: 'exam', header: lang === 'ar' ? 'الامتحان' : 'Exam', render: (r) => tField(r as unknown as Record<string, unknown>, 'exam_title', lang) },
-            { key: 'course', header: lang === 'ar' ? 'الحلقة' : 'Course', render: (r) => tField(r as unknown as Record<string, unknown>, 'course_title', lang) },
-            { key: 'score', header: lang === 'ar' ? 'الدرجة' : 'Score', align: 'end', render: (r) => <span className="font-mono-tabular font-bold">{r.score} / {r.max_score}</span> },
-            { key: 'feedback', header: lang === 'ar' ? 'ملاحظة المعلم' : 'Teacher Feedback', render: (r) => tField(r as unknown as Record<string, unknown>, 'feedback', lang) || '—' },
-          ]}
-        />
+
+        {examsList.length === 0 ? (
+          <EmptyState title={lang === 'ar' ? 'لا توجد امتحانات منشورة لحلقاتك حالياً' : 'No exams published for your courses yet'} />
+        ) : (
+          <div className="space-y-4">
+            {examsList.map((ex) => {
+              const isGraded = Boolean(ex.result || ex.submission?.status === 'graded');
+              const canUploadFile =
+                (ex.exam_mode === 'file' || ex.exam_mode === 'hybrid') &&
+                ex.is_open &&
+                !isGraded &&
+                (!ex.is_past_deadline || ex.allow_late_submission);
+              const quizAlreadyDone = Boolean(ex.submission && ex.submission.quiz_answers.length > 0);
+              const canStartQuiz =
+                (ex.exam_mode === 'quiz' || ex.exam_mode === 'hybrid') &&
+                ex.is_open &&
+                ex.questions.length > 0 &&
+                !quizAlreadyDone &&
+                (!ex.is_past_deadline || ex.allow_late_submission);
+
+              return (
+                <Card key={ex.id} className="p-6 space-y-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="text-xs text-slate-500 dark:text-slate-400">
+                        {tField(ex as unknown as Record<string, unknown>, 'course_title', lang)} ·{' '}
+                        <span className="font-mono-tabular">{ex.exam_date}</span>
+                        {ex.due_at && (
+                          <>
+                            {' · '}
+                            <span>
+                              {lang === 'ar' ? 'آخر موعد:' : 'Due:'} <span className="font-mono-tabular">{String(ex.due_at).slice(0, 10)}</span>
+                            </span>
+                          </>
+                        )}
+                      </div>
+                      <h3 className="text-lg font-extrabold">{tField(ex as unknown as Record<string, unknown>, 'title', lang)}</h3>
+                    </div>
+
+                    <div className="text-sm font-extrabold tabular-nums">
+                      {ex.result ? (
+                        <span className="inline-flex items-center gap-1.5 text-[#0F766E] dark:text-[#2DD4BF]">
+                          <CheckCircle2 className="w-4 h-4" />
+                          {ex.result.score} / {ex.max_score}
+                        </span>
+                      ) : ex.submission ? (
+                        <span className="inline-flex items-center gap-1.5 text-[#C98A1E]">
+                          <Clock className="w-4 h-4" />
+                          {lang === 'ar' ? 'تم التسليم — بانتظار التصحيح' : 'Submitted — Pending Grading'}
+                        </span>
+                      ) : !ex.is_open ? (
+                        <span className="inline-flex items-center gap-1.5 text-slate-500">
+                          <Clock className="w-4 h-4" />
+                          {lang === 'ar' ? 'لم يُفتح بعد' : 'Opens soon'}
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1.5 text-[#0F213E] dark:text-[#F6F1E3]">
+                          <AlertCircle className="w-4 h-4 text-[#C98A1E]" />
+                          {lang === 'ar' ? `مطلوب الحل (${ex.max_score} درجة)` : `Action Needed (${ex.max_score} pts)`}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  {ex.instructions_ar && (
+                    <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                      {tField(ex as unknown as Record<string, unknown>, 'instructions', lang)}
+                    </p>
+                  )}
+
+                  {/* Actions Strip */}
+                  <div className="flex flex-wrap items-center gap-3 pt-1">
+                    {ex.has_question_file && (
+                      <button
+                        type="button"
+                        onClick={() => downloadQuestionPaper(ex.id)}
+                        className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-[#0F213E] text-white dark:bg-[#1E3B6E] text-xs font-bold hover:opacity-90 cursor-pointer"
+                      >
+                        <Download className="w-4 h-4" />
+                        <span>{lang === 'ar' ? `تحميل ورقة الامتحان (${ex.question_file_name || 'PDF'})` : 'Download Question Paper'}</span>
+                      </button>
+                    )}
+
+                    {canStartQuiz && (
+                      <PrimaryButton
+                        type="button"
+                        onClick={() => setActiveQuizExamId(activeQuizExamId === ex.id ? null : ex.id)}
+                      >
+                        <ListChecks className="w-4 h-4" />
+                        <span>{activeQuizExamId === ex.id ? (lang === 'ar' ? 'إخفاء الأسئلة' : 'Hide Quiz') : (lang === 'ar' ? 'بدء الاختبار الإلكتروني' : 'Start Online Quiz')}</span>
+                      </PrimaryButton>
+                    )}
+
+                    {ex.submission?.has_solution_file && (
+                      <button
+                        type="button"
+                        onClick={() => downloadSubmissionFile(ex.id, 'solution')}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] text-xs font-bold hover:bg-[#F2EFE6] dark:hover:bg-[#13284A] cursor-pointer"
+                      >
+                        <FileText className="w-4 h-4 text-[#0F766E] dark:text-[#2DD4BF]" />
+                        <span>{lang === 'ar' ? `ملف الحل المرفوع (${ex.submission.solution_file_name})` : 'My Submitted File'}</span>
+                      </button>
+                    )}
+
+                    {ex.submission?.has_graded_file && (
+                      <button
+                        type="button"
+                        onClick={() => downloadSubmissionFile(ex.id, 'graded')}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-[#0F766E]/40 text-xs font-bold text-[#0F766E] dark:text-[#2DD4BF] hover:bg-[#0F766E]/10 cursor-pointer"
+                      >
+                        <Download className="w-4 h-4" />
+                        <span>{lang === 'ar' ? 'تحميل ورقة التصحيح من المعلم' : 'Download Graded Copy'}</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {/* PDF / Image Solution Upload Box */}
+                  {canUploadFile && (
+                    <div className="p-4 rounded-xl border border-[#E5DEC9] dark:border-[#233C63] bg-[#FAF8F3] dark:bg-[#091529] space-y-3">
+                      <div className="text-xs font-bold text-slate-700 dark:text-slate-200">
+                        {ex.submission?.has_solution_file
+                          ? lang === 'ar'
+                            ? 'تحديث ملف الحل قبل التصحيح (PDF أو صورة واضحة — حد أقصى 8 MB)'
+                            : 'Replace uploaded solution (PDF/Image, max 8 MB)'
+                          : lang === 'ar'
+                          ? 'ارفع حل الامتحان (PDF أو صورة من الموبايل — حد أقصى 8 MB)'
+                          : 'Upload your solution (PDF or clear photo, max 8 MB)'}
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-center">
+                        <input
+                          value={solutionNotes[ex.id] || ''}
+                          onChange={(e) => setSolutionNotes({ ...solutionNotes, [ex.id]: e.target.value })}
+                          placeholder={lang === 'ar' ? 'ملاحظة قصيرة للمعلم (اختياري)...' : 'Optional note for teacher...'}
+                          className="sm:col-span-7 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#0F213E] px-3 py-2 text-xs"
+                        />
+                        <label className="sm:col-span-5 flex items-center justify-center gap-2 rounded-xl bg-[#C98A1E] text-white px-4 py-2 text-xs font-bold cursor-pointer hover:bg-[#B07614] transition-colors">
+                          <Upload className="w-4 h-4 shrink-0" />
+                          <span>
+                            {uploadingExamId === ex.id
+                              ? lang === 'ar' ? 'جاري الرفع والتأمين...' : 'Uploading...'
+                              : lang === 'ar' ? 'اختر ملف الحل PDF / صورة' : 'Choose Solution PDF / Photo'}
+                          </span>
+                          <input
+                            type="file"
+                            accept=".pdf,.png,.jpg,.jpeg,.webp"
+                            disabled={uploadingExamId === ex.id}
+                            className="hidden"
+                            onChange={(e) => {
+                              const f = e.target.files?.[0];
+                              if (f) void uploadSolution(ex.id, f);
+                            }}
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Interactive Online Quiz Box */}
+                  {activeQuizExamId === ex.id && canStartQuiz && (
+                    <div className="p-4 rounded-xl border border-[#0F766E]/30 bg-[#FAF8F3] dark:bg-[#091529] space-y-4">
+                      {ex.questions.map((q, qIdx) => (
+                        <div key={q.id} className="space-y-2 pb-3 border-b border-[#E5DEC9] dark:border-[#233C63] last:border-b-0">
+                          <div className="text-sm font-bold">
+                            {qIdx + 1}. {lang === 'ar' ? q.prompt_ar : q.prompt_en}
+                            <span className="text-xs font-normal text-slate-500 mx-2">({q.points} {lang === 'ar' ? 'درجات' : 'pts'})</span>
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            {q.options_ar.map((opt, oIdx) => (
+                              <label
+                                key={oIdx}
+                                className={`flex items-center gap-2 px-3 py-2 rounded-xl border text-xs font-semibold cursor-pointer transition-colors ${
+                                  quizAnswers[q.id] === oIdx
+                                    ? 'border-[#0F766E] bg-[#0F766E]/10 text-[#0F766E] dark:text-[#2DD4BF]'
+                                    : 'border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#0F213E]'
+                                }`}
+                              >
+                                <input
+                                  type="radio"
+                                  name={`quiz_${ex.id}_${q.id}`}
+                                  checked={quizAnswers[q.id] === oIdx}
+                                  onChange={() => setQuizAnswers({ ...quizAnswers, [q.id]: oIdx })}
+                                />
+                                <span>{lang === 'ar' ? opt : q.options_en[oIdx] || opt}</span>
+                              </label>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                      <PrimaryButton type="button" disabled={submittingQuiz} onClick={() => submitOnlineQuiz(ex)}>
+                        <span>{submittingQuiz ? (lang === 'ar' ? 'جاري التصحيح...' : 'Submitting...') : (lang === 'ar' ? 'إرسال الإجابات والتصحيح' : 'Submit Answers')}</span>
+                      </PrimaryButton>
+                    </div>
+                  )}
+
+                  {/* Quiz Answers Review (only if submitted & allowed by teacher) */}
+                  {quizAlreadyDone && ex.show_answers_after_submit && ex.questions.length > 0 && ex.questions[0].correct_index !== undefined && (
+                    <div className="p-4 rounded-xl border border-[#E5DEC9] dark:border-[#233C63] bg-[#FAF8F3] dark:bg-[#091529] space-y-2 text-xs">
+                      <div className="font-extrabold text-[#0F766E] dark:text-[#2DD4BF]">
+                        {lang === 'ar' ? 'مراجعة إجاباتك:' : 'Answer Review:'}
+                      </div>
+                      {ex.questions.map((q, qIdx) => {
+                        const myAns = ex.submission?.quiz_answers.find((a) => a.question_id === q.id)?.selected_index;
+                        const isRight = myAns === q.correct_index;
+                        return (
+                          <div key={q.id} className="flex flex-wrap items-center justify-between gap-2 py-1 border-b border-[#E5DEC9]/60 dark:border-[#233C63]/60 last:border-b-0">
+                            <span className="font-semibold">
+                              {qIdx + 1}. {q.prompt_ar}
+                            </span>
+                            <span className={isRight ? 'text-emerald-700 dark:text-emerald-400 font-bold' : 'text-red-600 font-bold'}>
+                              {isRight
+                                ? (lang === 'ar' ? 'إجابة صحيحة' : 'Correct')
+                                : `${lang === 'ar' ? 'الصواب:' : 'Answer:'} ${q.options_ar[q.correct_index ?? 0]}`}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Teacher Feedback Box */}
+                  {ex.result && (ex.result.feedback_ar || ex.result.feedback_en) && (
+                    <div className="text-xs text-slate-700 dark:text-slate-200 pt-2 border-t border-[#E5DEC9] dark:border-[#233C63]">
+                      <span className="font-bold">{lang === 'ar' ? 'تعليق المعلم:' : 'Teacher Feedback:'}</span>{' '}
+                      {lang === 'ar' ? ex.result.feedback_ar : ex.result.feedback_en || ex.result.feedback_ar}
+                    </div>
+                  )}
+                </Card>
+              );
+            })}
+          </div>
+        )}
+
+        <div className="pt-2 space-y-3">
+          <h3 className="text-lg font-extrabold">{lang === 'ar' ? 'ملخص الدرجات المرصودة' : 'Graded Results Summary'}</h3>
+          <ResponsiveTable
+            data={data.examResults}
+            emptyTitle={lang === 'ar' ? 'لا توجد درجات مرصودة بعد' : 'No graded results yet'}
+            columns={[
+              { key: 'exam', header: lang === 'ar' ? 'الامتحان' : 'Exam', render: (r) => tField(r as unknown as Record<string, unknown>, 'exam_title', lang) },
+              { key: 'course', header: lang === 'ar' ? 'الحلقة' : 'Course', render: (r) => tField(r as unknown as Record<string, unknown>, 'course_title', lang) },
+              { key: 'score', header: lang === 'ar' ? 'الدرجة' : 'Score', align: 'end', render: (r) => <span className="font-mono-tabular font-bold">{r.score} / {r.max_score}</span> },
+              { key: 'feedback', header: lang === 'ar' ? 'ملاحظة المعلم' : 'Teacher Feedback', render: (r) => tField(r as unknown as Record<string, unknown>, 'feedback', lang) || '—' },
+            ]}
+          />
+        </div>
       </div>
     );
   }
@@ -321,17 +768,20 @@ export function StudentDashboard({
                   {tField(cert as unknown as Record<string, unknown>, 'course_title', lang)} · {cert.grade_label}
                 </div>
                 <PrimaryButton
-                  onClick={() =>
-                    generateCertificatePDF({
+                  onClick={async () => {
+                    const { generateCertificatePDF } = await import('../../lib/pdfCertificate');
+                    await generateCertificatePDF({
                       verification_code: cert.verification_code,
                       student_name_ar: data.student.full_name_ar,
                       student_name_en: data.student.full_name_en,
+                      course_title_ar: cert.course_title_ar,
                       course_title_en: cert.course_title_en,
+                      title_ar: cert.title_ar,
                       title_en: cert.title_en,
                       grade_label: cert.grade_label,
                       issued_at: cert.issued_at,
-                    })
-                  }
+                    });
+                  }}
                   className="text-xs"
                 >
                   <Download className="w-4 h-4" />
@@ -371,6 +821,27 @@ export function StudentDashboard({
   return (
     <div className="space-y-4 max-w-2xl">
       <h2 className="text-xl font-extrabold">{lang === 'ar' ? 'ملف الطالب' : 'Student Profile'}</h2>
+      <Card className="p-5 bg-[#F2EFE6] dark:bg-[#13284A] border-[#C98A1E]/40 space-y-2">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-xs font-bold text-[#C98A1E]">
+              {lang === 'ar' ? 'كود الطالب الخاص لربط حساب ولي الأمر' : 'Unique Student Code for Guardian Linking'}
+            </div>
+            <div className="text-lg font-mono-tabular font-extrabold tracking-wider text-[#0F213E] dark:text-[#F8F5EC]">
+              {data.student.student_code}
+            </div>
+          </div>
+          <PrimaryButton type="button" onClick={() => void copyStudentCode()} className="text-xs">
+            {copiedCode ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+            <span>{copiedCode ? (lang === 'ar' ? 'تم النسخ' : 'Copied') : lang === 'ar' ? 'نسخ الكود' : 'Copy Code'}</span>
+          </PrimaryButton>
+        </div>
+        <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+          {lang === 'ar'
+            ? `يمكن لولي الأمر تفعيل حسابه من صفحة الدخول باستخدام هذا الكود مع البريد المسجّل (${data.student.guardian_email || 'لدى الإدارة'}).`
+            : `Your guardian can activate their portal account on the Sign-In page using this code plus their registered email (${data.student.guardian_email || 'on file'}).`}
+        </p>
+      </Card>
       <Card className="p-6 grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
         <div>
           <div className="text-xs text-slate-500">{lang === 'ar' ? 'الاسم' : 'Full Name'}</div>

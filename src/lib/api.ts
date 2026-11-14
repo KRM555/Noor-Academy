@@ -22,7 +22,11 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
     headers.set('Authorization', `Bearer ${token}`);
   }
 
-  const res = await fetch(url, { ...options, headers });
+  const res = await fetch(url, {
+    ...options,
+    credentials: options.credentials || 'same-origin',
+    headers,
+  });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     throw new Error((data as { error?: string }).error || `Request failed (${res.status})`);
