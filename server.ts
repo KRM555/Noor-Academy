@@ -1,6 +1,7 @@
 import express, { type Request, type Response, type NextFunction } from 'express';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import dotenv from 'dotenv';
 import { z } from 'zod';
@@ -2334,12 +2335,17 @@ app.use('/api', apiNotFoundHandler);
 // ============================================================================
 async function startServer() {
   const PORT = Number(process.env.PORT || 3000);
+  const httpServer = http.createServer(app);
   let viteServer: ViteDevServer | null = null;
 
   if (!IS_PRODUCTION) {
     const { createServer: createViteServer } = await import('vite');
     viteServer = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
+        ws: { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(viteServer.middlewares);
@@ -2380,7 +2386,7 @@ async function startServer() {
   // Global Error Handling Middleware (always registered last)
   app.use(globalErrorHandler);
 
-  const httpServer = app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(
       `Noor & Bayan Academy (Supabase PostgreSQL, ${IS_PRODUCTION ? 'production' : 'development'}) running on http://0.0.0.0:${PORT}`
     );
