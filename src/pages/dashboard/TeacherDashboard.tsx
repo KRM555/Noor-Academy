@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ResponsiveContainer,
   BarChart,
@@ -11,6 +12,7 @@ import {
 import { ShieldCheck, Check, Wallet } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { apiFetch } from '../../lib/api';
+import { queryKeys } from '../../lib/queryClient';
 import { tField } from '../../i18n/translations';
 import { Card, LoadingState, ResponsiveTable, PrimaryButton, EmptyState } from '../../components/ui/CommonUI';
 import { ChangePasswordCard } from '../../components/dashboard/ChangePasswordCard';
@@ -30,9 +32,8 @@ interface TeacherDashboardData {
 }
 
 export function TeacherDashboard({ activeTab }: { activeTab: string }) {
-  const { lang, toast } = useApp();
-  const [data, setData] = useState<TeacherDashboardData | null>(null);
-  const [loading, setLoading] = useState(true);
+  const { lang, toast, user } = useApp();
+  const qc = useQueryClient();
 
   // Attendance form state
   const [selectedLessonId, setSelectedLessonId] = useState<number>(0);
@@ -65,37 +66,41 @@ export function TeacherDashboard({ activeTab }: { activeTab: string }) {
   const [bankName, setBankName] = useState('');
   const [iban, setIban] = useState('');
 
-  const loadData = useCallback(async () => {
-    try {
-      const res = await apiFetch<TeacherDashboardData>('/api/teacher/dashboard');
-      setData(res);
-      if (res.lessons.length && !selectedLessonId) setSelectedLessonId(res.lessons[0].id);
-      if (res.courses.length && !recCourseId) {
-        setRecCourseId(res.courses[0].id);
-        setEvalCourseId(res.courses[0].id);
-      }
-      if (res.students.length && !recStudentId) {
-        setRecStudentId(res.students[0].id);
-        setExamStudentId(res.students[0].id);
-        setEvalStudentId(res.students[0].id);
-      }
-      if (res.exams.length && !examId) setExamId(res.exams[0].id);
-      if (res.payoutDetails) {
-        setHolderName(res.payoutDetails.account_holder_name);
-        setBankName(res.payoutDetails.bank_name);
-      }
-    } catch (e: unknown) {
-      toast(e instanceof Error ? e.message : 'Error', 'error');
-    } finally {
-      setLoading(false);
-    }
-  }, [toast, selectedLessonId, recCourseId, recStudentId, examId]);
+  const { data, isLoading, error } = useQuery({
+    queryKey: queryKeys.teacherDashboard(user?.id),
+    queryFn: () => apiFetch<TeacherDashboardData>('/api/teacher/dashboard'),
+  });
 
   useEffect(() => {
-    loadData();
-  }, [loadData]);
+    if (error) {
+      toast(error instanceof Error ? error.message : 'Error', 'error');
+    }
+  }, [error, toast]);
 
-  if (loading) return <LoadingState />;
+  useEffect(() => {
+    if (!data) return;
+    if (data.lessons.length && !selectedLessonId) setSelectedLessonId(data.lessons[0].id);
+    if (data.courses.length && !recCourseId) {
+      setRecCourseId(data.courses[0].id);
+      setEvalCourseId(data.courses[0].id);
+    }
+    if (data.students.length && !recStudentId) {
+      setRecStudentId(data.students[0].id);
+      setExamStudentId(data.students[0].id);
+      setEvalStudentId(data.students[0].id);
+    }
+    if (data.exams.length && !examId) setExamId(data.exams[0].id);
+    if (data.payoutDetails) {
+      setHolderName((prev) => prev || data.payoutDetails!.account_holder_name);
+      setBankName((prev) => prev || data.payoutDetails!.bank_name);
+    }
+  }, [data, selectedLessonId, recCourseId, recStudentId, examId]);
+
+  const loadData = useCallback(() => {
+    void qc.invalidateQueries({ queryKey: queryKeys.teacherDashboard(user?.id) });
+  }, [qc, user?.id]);
+
+  if (isLoading) return <LoadingState />;
   if (!data) return <EmptyState title={lang === 'ar' ? 'لا يوجد ملف معلم' : 'Teacher profile not found'} />;
 
   if (activeTab === 'home') {

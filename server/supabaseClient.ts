@@ -152,6 +152,37 @@ export async function getSupabaseLiveHealth() {
   };
 }
 
+export async function pingSupabaseDatabase(): Promise<{
+  connected: boolean;
+  latencyMs: number;
+  error?: string;
+}> {
+  const startedAt = Date.now();
+  const client = getSupabaseAdmin();
+  if (!client) {
+    return {
+      connected: false,
+      latencyMs: Date.now() - startedAt,
+      error: 'Supabase is not configured',
+    };
+  }
+
+  try {
+    const { error } = await client.from('levels').select('id', { count: 'exact', head: true });
+    const latencyMs = Date.now() - startedAt;
+    if (error) {
+      return { connected: false, latencyMs, error: error.message };
+    }
+    return { connected: true, latencyMs };
+  } catch (err) {
+    return {
+      connected: false,
+      latencyMs: Date.now() - startedAt,
+      error: err instanceof Error ? err.message : 'Database ping failed',
+    };
+  }
+}
+
 export async function provisionSupabaseAuthUser(
   email: string,
   password: string,
@@ -225,4 +256,21 @@ export async function requestSupabasePasswordReset(email: string, redirectTo?: s
   const { error } = await client.auth.resetPasswordForEmail(email, redirectTo ? { redirectTo } : undefined);
   if (error) return { sent: false, reason: error.message };
   return { sent: true as const };
+}
+
+export async function broadcastRealtimeEvent(
+  event: string,
+  payload: Record<string, unknown>
+): Promise<void> {
+  const client = getSupabaseAdmin();
+  if (!client) return;
+  try {
+    const channel = client.channel('noor-bayan-live');
+    await channel.httpSend(event, {
+      ...payload,
+      emittedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.warn('[realtime] broadcast warning:', err instanceof Error ? err.message : err);
+  }
 }

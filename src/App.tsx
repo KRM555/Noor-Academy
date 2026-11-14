@@ -21,7 +21,10 @@ import {
   GraduationCap,
   KeyRound,
 } from 'lucide-react';
+import { QueryClientProvider, useQuery } from '@tanstack/react-query';
 import { AppProvider, useApp } from './contexts/AppContext';
+import { apiFetch } from './lib/api';
+import { queryClient, queryKeys } from './lib/queryClient';
 import type { PublicOverview } from './types';
 import { PublicLayout } from './components/public/PublicLayout';
 import { HomePage } from './pages/public/HomePage';
@@ -47,6 +50,8 @@ import { NoorLettersGame } from './components/games/NoorLettersGame';
 import { QuranMemoryGame } from './components/games/QuranMemoryGame';
 import { Noor3DExplorer } from './components/games/Noor3DExplorer';
 import { LoadingState } from './components/ui/CommonUI';
+import { OfflineIndicator } from './components/ui/PWAComponents';
+import { useSupabaseRealtime } from './hooks/useSupabaseRealtime';
 
 const ALL_DASHBOARD_TABS: NavTab[] = [
   // Student & Guardian Tabs
@@ -86,11 +91,17 @@ function getDefaultTabForRole(role?: string): string {
 
 function RouterContent() {
   const { user, authLoading, lang } = useApp();
+  useSupabaseRealtime();
   const [path, setPath] = useState<string>(() => window.location.pathname || '/');
-  const [overview, setOverview] = useState<PublicOverview | null>(null);
   const [activeGameSlug, setActiveGameSlug] = useState<string | null>(null);
   const [preCourseId, setPreCourseId] = useState<number | null>(null);
   const [preLevelId, setPreLevelId] = useState<number | null>(null);
+
+  const { data: overview = null } = useQuery({
+    queryKey: queryKeys.publicOverview,
+    queryFn: () => apiFetch<PublicOverview>('/api/public/overview'),
+    staleTime: 2 * 60 * 1000,
+  });
 
   const navigate = useCallback((nextPath: string) => {
     window.history.pushState({}, '', nextPath);
@@ -200,21 +211,19 @@ function RouterContent() {
     document.querySelector('meta[property="og:description"]')?.setAttribute('content', nextDesc);
   }, [path, lang]);
 
-  useEffect(() => {
-    fetch('/api/public/overview')
-      .then((r) => r.json())
-      .then(setOverview)
-      .catch(() => {});
+  const exitGame = useCallback(() => {
+    setActiveGameSlug(null);
+    void queryClient.invalidateQueries({ queryKey: ['dashboard', 'student'] });
   }, []);
 
   if (activeGameSlug === 'noor-letters') {
-    return <NoorLettersGame onExit={() => setActiveGameSlug(null)} />;
+    return <NoorLettersGame onExit={exitGame} />;
   }
   if (activeGameSlug === 'quran-memory') {
-    return <QuranMemoryGame onExit={() => setActiveGameSlug(null)} />;
+    return <QuranMemoryGame onExit={exitGame} />;
   }
   if (activeGameSlug === 'noor-3d-lantern') {
-    return <Noor3DExplorer onExit={() => setActiveGameSlug(null)} />;
+    return <Noor3DExplorer onExit={exitGame} />;
   }
 
   // Dashboard Route Guard
@@ -366,8 +375,11 @@ function RouterContent() {
 
 export default function App() {
   return (
-    <AppProvider>
-      <RouterContent />
-    </AppProvider>
+    <QueryClientProvider client={queryClient}>
+      <AppProvider>
+        <RouterContent />
+        <OfflineIndicator />
+      </AppProvider>
+    </QueryClientProvider>
   );
 }

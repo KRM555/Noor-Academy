@@ -14,6 +14,7 @@ import { useApp } from '../../contexts/AppContext';
 import { dict, tField } from '../../i18n/translations';
 import type { UserRole } from '../../types';
 import { AcademyLogo, Card, PrimaryButton } from '../ui/CommonUI';
+import { PWAInstallButton } from '../ui/PWAComponents';
 
 export interface NavTab {
   id: string;
@@ -163,6 +164,10 @@ export function DashboardShell({
               <Globe className="w-3.5 h-3.5" />
               <span>{t.switchLang}</span>
             </button>
+
+            <div className="hidden sm:flex">
+              <PWAInstallButton compact />
+            </div>
 
             <button
               onClick={() => setNotifOpen((o) => !o)}

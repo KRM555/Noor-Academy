@@ -1,7 +1,9 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { Users, BookOpen, CheckCircle2, Award, Download, Heart } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { apiFetch } from '../../lib/api';
+import { queryKeys } from '../../lib/queryClient';
 import { tField } from '../../i18n/translations';
 import { generateCertificatePDF } from '../../lib/pdfCertificate';
 import { Card, LoadingState, EmptyState, ResponsiveTable, PrimaryButton } from '../../components/ui/CommonUI';
@@ -30,21 +32,14 @@ interface GuardianPayload {
 }
 
 export function GuardianDashboard({ activeTab }: { activeTab: string }) {
-  const { lang } = useApp();
-  const [data, setData] = useState<GuardianPayload | null>(null);
+  const { lang, user } = useApp();
   const [selectedChildId, setSelectedChildId] = useState<number | null>(null);
-  const [loading, setLoading] = useState(true);
+  const { data, isLoading } = useQuery({
+    queryKey: queryKeys.guardianDashboard(user?.id),
+    queryFn: () => apiFetch<GuardianPayload>('/api/guardian/dashboard'),
+  });
 
-  useEffect(() => {
-    apiFetch<GuardianPayload>('/api/guardian/dashboard')
-      .then((res) => {
-        setData(res);
-        if (res.children.length > 0) setSelectedChildId(res.children[0].id);
-      })
-      .finally(() => setLoading(false));
-  }, []);
-
-  if (loading) return <LoadingState label={lang === 'ar' ? 'جاري تحميل متابعة الأبناء...' : 'Loading family progress...'} />;
+  if (isLoading) return <LoadingState label={lang === 'ar' ? 'جاري تحميل متابعة الأبناء...' : 'Loading family progress...'} />;
   if (!data) return <EmptyState title={lang === 'ar' ? 'لا توجد بيانات لولي الأمر بعد' : 'Guardian data unavailable'} />;
 
   const selectedChild = data.children.find((c) => c.id === selectedChildId) || data.children[0];

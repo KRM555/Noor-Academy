@@ -1,19 +1,22 @@
-import express, { Request, Response, NextFunction } from 'express';
+import express, { type Request, type Response, type NextFunction } from 'express';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import dotenv from 'dotenv';
 import { z } from 'zod';
-import { createServer as createViteServer } from 'vite';
+import type { ViteDevServer } from 'vite';
 import {
   requireSupabaseAdmin,
   createEphemeralSupabaseAnon,
   insertRowSafe,
   getSupabaseLiveHealth,
+  pingSupabaseDatabase,
   provisionSupabaseAuthUser,
   syncUsersToSupabaseAuth,
   requestSupabasePasswordReset,
+  broadcastRealtimeEvent,
 } from './server/supabaseClient.ts';
+import { AppError, asyncHandler, apiNotFoundHandler, globalErrorHandler } from './server/errorHandler.ts';
 
 dotenv.config();
 
@@ -33,8 +36,45 @@ if (!process.env.SESSION_SECRET) {
 requireSupabaseAdmin();
 
 const app = express();
+app.set('trust proxy', 1);
 app.disable('x-powered-by');
 app.use(express.json({ limit: '2mb' }));
+
+let isShuttingDown = false;
+app.use((req, res, next) => {
+  if (isShuttingDown) {
+    res.setHeader('Connection', 'close');
+    if (req.path.startsWith('/api')) {
+      res.status(503).json({ error: 'Server is restarting, please retry shortly.' });
+      return;
+    }
+  }
+  next();
+});
+
+// Configurable CORS for production custom domains / separated frontends
+const allowedOrigins = new Set(
+  [process.env.CORS_ALLOWED_ORIGINS || '', process.env.APP_URL || '']
+    .join(',')
+    .split(',')
+    .map((origin) => origin.trim().replace(/\/+$/, ''))
+    .filter((origin) => origin.startsWith('http://') || origin.startsWith('https://'))
+);
+
+app.use('/api', (req, res, next) => {
+  const origin = req.headers.origin?.replace(/\/+$/, '');
+  if (origin && allowedOrigins.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  }
+  if (req.method === 'OPTIONS') {
+    res.status(204).end();
+    return;
+  }
+  next();
+});
 
 // Security Headers
 app.use((req, res, next) => {
@@ -57,9 +97,12 @@ app.use((req, res, next) => {
     p.endsWith('.sqlite') ||
     p.endsWith('.sqlite3') ||
     p === '/server.ts' ||
+    p === '/server.js' ||
     p.startsWith('/server/') ||
     p === '/supabase_schema.sql' ||
+    p === '/vite.config.ts' ||
     p.startsWith('/.env') ||
+    p.startsWith('/.git') ||
     p === '/package.json' ||
     p === '/package-lock.json' ||
     p === '/tsconfig.json'
@@ -195,7 +238,7 @@ async function writeAuditLog(
   }
 }
 
-async function authenticate(req: AuthRequest, res: Response, next: NextFunction) {
+const authenticate = asyncHandler<AuthRequest>(async (req, res, next) => {
   const authHeader = req.headers.authorization;
   const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
   if (!token) {
@@ -222,7 +265,7 @@ async function authenticate(req: AuthRequest, res: Response, next: NextFunction)
   }
   req.user = profile as AuthUser;
   next();
-}
+});
 
 function requireRole(...roles: Array<'student' | 'teacher' | 'admin' | 'guardian'>) {
   return (req: AuthRequest, res: Response, next: NextFunction) => {
@@ -239,9 +282,28 @@ function requireRole(...roles: Array<'student' | 'teacher' | 'admin' | 'guardian
 }
 
 // ============================================================================
+// HEALTH CHECK (Liveness & Supabase Readiness for Hosting Probes)
+// ============================================================================
+app.get('/api/health', asyncHandler(async (_req, res) => {
+  const db = await pingSupabaseDatabase();
+  const payload = {
+    status: db.connected ? 'ok' : 'degraded',
+    environment: IS_PRODUCTION ? 'production' : 'development',
+    uptimeSeconds: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString(),
+    database: {
+      engine: 'supabase_postgresql',
+      connected: db.connected,
+      latencyMs: db.latencyMs,
+    },
+  };
+  res.status(db.connected ? 200 : 503).json(payload);
+}));
+
+// ============================================================================
 // PUBLIC ROUTES (No Auth Required)
 // ============================================================================
-app.get('/api/public/overview', async (_req, res) => {
+app.get('/api/public/overview', asyncHandler(async (_req, res) => {
   const sb = requireSupabaseAdmin();
   const [
     studentsRes,
@@ -302,9 +364,9 @@ app.get('/api/public/overview', async (_req, res) => {
     testimonials: testimonialsRes.data || [],
     legal: legalRes.data || [],
   });
-});
+}));
 
-app.get('/api/public/courses/:id', async (req, res) => {
+app.get('/api/public/courses/:id', asyncHandler(async (req, res) => {
   const sb = requireSupabaseAdmin();
   const courseId = Number(req.params.id);
   const { data: c } = await sb
@@ -351,9 +413,9 @@ app.get('/api/public/courses/:id', async (req, res) => {
     .order('lesson_date', { ascending: true });
 
   res.json({ course, lessons: lessons || [] });
-});
+}));
 
-app.get('/api/public/teachers/:id', async (req, res) => {
+app.get('/api/public/teachers/:id', asyncHandler(async (req, res) => {
   const sb = requireSupabaseAdmin();
   const teacherId = Number(req.params.id);
 
@@ -378,9 +440,9 @@ app.get('/api/public/teachers/:id', async (req, res) => {
   }
 
   res.json({ teacher, courses: courses || [] });
-});
+}));
 
-app.get('/api/public/certificates/verify/:code', verifyLimiter, async (req, res) => {
+app.get('/api/public/certificates/verify/:code', verifyLimiter, asyncHandler(async (req, res) => {
   const code = String(req.params.code || '').trim().toUpperCase();
   if (code.length < 6 || code.length > 48) {
     res.status(400).json({ valid: false, error: 'Invalid verification code format' });
@@ -399,9 +461,9 @@ app.get('/api/public/certificates/verify/:code', verifyLimiter, async (req, res)
     return;
   }
   res.json({ valid: !cert.revoked_at, certificate: cert });
-});
+}));
 
-app.post('/api/public/placement-test', publicSubmitLimiter, async (req, res) => {
+app.post('/api/public/placement-test', publicSubmitLimiter, asyncHandler(async (req, res) => {
   const parsed = placementSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: 'Invalid placement test submission', details: parsed.error.flatten().fieldErrors });
@@ -445,9 +507,9 @@ app.post('/api/public/placement-test', publicSubmitLimiter, async (req, res) => 
   });
 
   res.json({ score, correctCount, total: key.length, recommendedLevel: recommended });
-});
+}));
 
-app.post('/api/public/admissions', publicSubmitLimiter, async (req, res) => {
+app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req, res) => {
   const parsed = admissionSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: 'All required fields and valid consent must be provided' });
@@ -482,8 +544,14 @@ app.post('/api/public/admissions', publicSubmitLimiter, async (req, res) => {
     insertRowSafe('consents', { email: guardian_email, doc_type: 'privacy', doc_version: '1.0' }),
   ]);
 
+  void broadcastRealtimeEvent('admission:created', {
+    admissionId: inserted.id,
+    student_name,
+    status: 'pending',
+  });
+
   res.status(201).json({ id: inserted.id, status: 'pending', syncedToSupabase: true });
-});
+}));
 
 // ============================================================================
 // AUTHENTICATION ROUTES
@@ -492,7 +560,7 @@ app.get('/api/auth/config', (_req, res) => {
   res.json({ demoEnabled: ALLOW_DEMO_LOGIN });
 });
 
-app.post('/api/auth/login', loginLimiter, async (req, res) => {
+app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
   const { email, password, demoRole } = req.body as { email?: string; password?: string; demoRole?: string };
   const sb = requireSupabaseAdmin();
   let profile: AuthUser | null = null;
@@ -568,13 +636,13 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
       preferred_lang: profile.preferred_lang,
     },
   });
-});
+}));
 
 app.get('/api/auth/me', authenticate, (req: AuthRequest, res) => {
   res.json({ user: req.user });
 });
 
-app.post('/api/auth/change-password', authenticate, async (req: AuthRequest, res) => {
+app.post('/api/auth/change-password', authenticate, asyncHandler<AuthRequest>(async (req, res) => {
   const schema = z.object({
     currentPassword: z.string().min(1),
     newPassword: z.string().min(8, 'Password must be at least 8 characters').max(128),
@@ -607,9 +675,9 @@ app.post('/api/auth/change-password', authenticate, async (req: AuthRequest, res
 
   await writeAuditLog(req.user!.id, req.user!.full_name, 'CHANGE_PASSWORD', 'profile', req.user!.id, {});
   res.json({ ok: true });
-});
+}));
 
-app.post('/api/auth/forgot-password', loginLimiter, async (req, res) => {
+app.post('/api/auth/forgot-password', loginLimiter, asyncHandler(async (req, res) => {
   const schema = z.object({ email: z.string().trim().email() });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -622,9 +690,9 @@ app.post('/api/auth/forgot-password', loginLimiter, async (req, res) => {
     emailSentViaSupabase: result.sent,
     mode: result.sent ? 'supabase_email' : 'admin_assisted',
   });
-});
+}));
 
-app.get('/api/notifications', authenticate, async (req: AuthRequest, res) => {
+app.get('/api/notifications', authenticate, asyncHandler<AuthRequest>(async (req, res) => {
   const sb = requireSupabaseAdmin();
   const { data } = await sb
     .from('notifications')
@@ -633,18 +701,18 @@ app.get('/api/notifications', authenticate, async (req: AuthRequest, res) => {
     .order('created_at', { ascending: false })
     .limit(20);
   res.json({ notifications: data || [] });
-});
+}));
 
-app.post('/api/notifications/read-all', authenticate, async (req: AuthRequest, res) => {
+app.post('/api/notifications/read-all', authenticate, asyncHandler<AuthRequest>(async (req, res) => {
   const sb = requireSupabaseAdmin();
   await sb.from('notifications').update({ is_read: true }).eq('profile_id', req.user!.id);
   res.json({ ok: true });
-});
+}));
 
 // ============================================================================
 // STUDENT ROUTES (Strictly scoped to logged-in student)
 // ============================================================================
-app.get('/api/student/dashboard', authenticate, requireRole('student'), async (req: AuthRequest, res) => {
+app.get('/api/student/dashboard', authenticate, requireRole('student'), asyncHandler<AuthRequest>(async (req, res) => {
   const sb = requireSupabaseAdmin();
   const { data: studentRow } = await sb
     .from('students')
@@ -855,9 +923,9 @@ app.get('/api/student/dashboard', authenticate, requireRole('student'), async (r
     certificates,
     games,
   });
-});
+}));
 
-app.post('/api/student/games/progress', authenticate, requireRole('student'), async (req: AuthRequest, res) => {
+app.post('/api/student/games/progress', authenticate, requireRole('student'), asyncHandler<AuthRequest>(async (req, res) => {
   const { game_slug, score, stars, completed_levels } = req.body as {
     game_slug: string;
     score: number;
@@ -908,12 +976,12 @@ app.post('/api/student/games/progress', authenticate, requireRole('student'), as
   }
 
   res.json({ ok: true });
-});
+}));
 
 // ============================================================================
 // GUARDIAN / PARENT ROUTES (Strictly scoped to children of logged-in guardian)
 // ============================================================================
-app.get('/api/guardian/dashboard', authenticate, requireRole('guardian'), async (req: AuthRequest, res) => {
+app.get('/api/guardian/dashboard', authenticate, requireRole('guardian'), asyncHandler<AuthRequest>(async (req, res) => {
   const sb = requireSupabaseAdmin();
   const { data: guardian } = await sb
     .from('guardians')
@@ -1075,7 +1143,7 @@ app.get('/api/guardian/dashboard', authenticate, requireRole('guardian'), async 
     evaluations,
     certificates,
   });
-});
+}));
 
 // ============================================================================
 // TEACHER ROUTES (Strictly scoped to courses taught by this teacher)
@@ -1128,7 +1196,7 @@ async function assertTeacherTeachesStudent(teacherId: number, studentId: number,
   return Boolean(data && data.length > 0);
 }
 
-app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), async (req: AuthRequest, res) => {
+app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
   const teacher = await getTeacherByProfile(req.user!.id);
   if (!teacher) {
     res.status(404).json({ error: 'Teacher profile not found' });
@@ -1307,9 +1375,9 @@ app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), async (r
     payroll: payrollRes.data || [],
     payoutDetails,
   });
-});
+}));
 
-app.get('/api/teacher/students/:studentId', authenticate, requireRole('teacher'), async (req: AuthRequest, res) => {
+app.get('/api/teacher/students/:studentId', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
   const teacher = await getTeacherByProfile(req.user!.id);
   const studentId = Number(req.params.studentId);
   if (!teacher || !(await assertTeacherTeachesStudent(teacher.id, studentId))) {
@@ -1323,9 +1391,9 @@ app.get('/api/teacher/students/:studentId', authenticate, requireRole('teacher')
     .eq('id', studentId)
     .maybeSingle();
   res.json({ student });
-});
+}));
 
-app.post('/api/teacher/attendance', authenticate, requireRole('teacher'), async (req: AuthRequest, res) => {
+app.post('/api/teacher/attendance', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
   const teacher = await getTeacherByProfile(req.user!.id);
   const { lesson_id, student_id, status, notes } = req.body;
   const sb = requireSupabaseAdmin();
@@ -1374,10 +1442,17 @@ app.post('/api/teacher/attendance', authenticate, requireRole('teacher'), async 
     });
   }
 
-  res.json({ ok: true });
-});
+  void broadcastRealtimeEvent('attendance:updated', {
+    lesson_id: lesson.id,
+    course_id: lesson.course_id,
+    student_id: Number(student_id),
+    status,
+  });
 
-app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), async (req: AuthRequest, res) => {
+  res.json({ ok: true });
+}));
+
+app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
   const teacher = await getTeacherByProfile(req.user!.id);
   const { exam_id, student_id, score, feedback_ar, feedback_en } = req.body;
   const sb = requireSupabaseAdmin();
@@ -1428,10 +1503,16 @@ app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyn
     });
   }
 
-  res.json({ ok: true });
-});
+  void broadcastRealtimeEvent('academic:updated', {
+    kind: 'exam_result',
+    exam_id: exam.id,
+    student_id: Number(student_id),
+  });
 
-app.post('/api/teacher/recitations', authenticate, requireRole('teacher'), async (req: AuthRequest, res) => {
+  res.json({ ok: true });
+}));
+
+app.post('/api/teacher/recitations', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
   const teacher = await getTeacherByProfile(req.user!.id);
   const { student_id, course_id, surah_name, ayah_from, ayah_to, tajweed_score, memorization_score, notes_ar } = req.body;
 
@@ -1456,10 +1537,17 @@ app.post('/api/teacher/recitations', authenticate, requireRole('teacher'), async
     recorded_by: req.user!.id,
   });
 
-  res.status(201).json({ id: inserted.id });
-});
+  void broadcastRealtimeEvent('academic:updated', {
+    kind: 'recitation',
+    recitation_id: inserted.id,
+    student_id: Number(student_id),
+    course_id: Number(course_id),
+  });
 
-app.post('/api/teacher/evaluations', authenticate, requireRole('teacher'), async (req: AuthRequest, res) => {
+  res.status(201).json({ id: inserted.id });
+}));
+
+app.post('/api/teacher/evaluations', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
   const teacher = await getTeacherByProfile(req.user!.id);
   const { student_id, course_id, period, behavior_score, participation_score, summary_ar, summary_en } = req.body;
 
@@ -1483,10 +1571,17 @@ app.post('/api/teacher/evaluations', authenticate, requireRole('teacher'), async
     evaluated_by: req.user!.id,
   });
 
-  res.status(201).json({ id: inserted.id });
-});
+  void broadcastRealtimeEvent('academic:updated', {
+    kind: 'evaluation',
+    evaluation_id: inserted.id,
+    student_id: Number(student_id),
+    course_id: Number(course_id),
+  });
 
-app.put('/api/teacher/payout-details', authenticate, requireRole('teacher'), async (req: AuthRequest, res) => {
+  res.status(201).json({ id: inserted.id });
+}));
+
+app.put('/api/teacher/payout-details', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
   const teacher = await getTeacherByProfile(req.user!.id);
   if (!teacher) {
     res.status(404).json({ error: 'Teacher not found' });
@@ -1527,12 +1622,12 @@ app.put('/api/teacher/payout-details', authenticate, requireRole('teacher'), asy
   }
 
   res.json({ masked_iban: maskIban(cleanIban) });
-});
+}));
 
 // ============================================================================
 // ADMIN ROUTES (Strictly role === 'admin')
 // ============================================================================
-app.get('/api/admin/dashboard', authenticate, requireRole('admin'), async (_req, res) => {
+app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler(async (_req, res) => {
   const sb = requireSupabaseAdmin();
   const [
     profilesRes,
@@ -1703,9 +1798,9 @@ app.get('/api/admin/dashboard', authenticate, requireRole('admin'), async (_req,
     legal: legalRes.data || [],
     auditLogs: auditLogsRes.data || [],
   });
-});
+}));
 
-app.post('/api/admin/courses', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.post('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const { title_ar, title_en, description_ar, description_en, level_id, teacher_id, schedule_ar, schedule_en, price_monthly, capacity } = req.body;
   const inserted = await insertRowSafe<{ id: number }>('courses', {
     title_ar,
@@ -1723,17 +1818,17 @@ app.post('/api/admin/courses', authenticate, requireRole('admin'), async (req: A
 
   await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_COURSE', 'course', inserted.id, { title_ar });
   res.status(201).json({ id: inserted.id });
-});
+}));
 
-app.delete('/api/admin/courses/:id', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.delete('/api/admin/courses/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = Number(req.params.id);
   const sb = requireSupabaseAdmin();
   await sb.from('courses').update({ deleted_at: new Date().toISOString() }).eq('id', id);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'SOFT_DELETE_COURSE', 'course', id, {});
   res.json({ ok: true });
-});
+}));
 
-app.post('/api/admin/lessons', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.post('/api/admin/lessons', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const { course_id, title_ar, title_en, lesson_date, start_time, duration_min, objectives_ar, objectives_en, live_url } = req.body;
   const lesson = await insertRowSafe<{ id: number }>('lessons', {
     course_id: Number(course_id),
@@ -1756,17 +1851,17 @@ app.post('/api/admin/lessons', authenticate, requireRole('admin'), async (req: A
     });
   }
   res.status(201).json({ id: lesson.id });
-});
+}));
 
-app.delete('/api/admin/lessons/:id', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.delete('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = Number(req.params.id);
   const sb = requireSupabaseAdmin();
   await sb.from('lessons').update({ deleted_at: new Date().toISOString() }).eq('id', id);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'SOFT_DELETE_LESSON', 'lesson', id, {});
   res.json({ ok: true });
-});
+}));
 
-app.post('/api/admin/teachers', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.post('/api/admin/teachers', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const { email, name_ar, name_en, bio_ar, bio_en, qualifications_ar, qualifications_en, specialty_ar, specialty_en, hourly_rate } = req.body;
   if (!email || !name_ar) {
     res.status(400).json({ error: 'Teacher email and Arabic name are required' });
@@ -1811,17 +1906,17 @@ app.post('/api/admin/teachers', authenticate, requireRole('admin'), async (req: 
 
   await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_TEACHER', 'teacher', teacher.id, { email: cleanEmail, name_ar: cleanName });
   res.status(201).json({ id: teacher.id, temporary_password: tempPassword });
-});
+}));
 
-app.delete('/api/admin/teachers/:id', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.delete('/api/admin/teachers/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = Number(req.params.id);
   const sb = requireSupabaseAdmin();
   await sb.from('teachers').update({ deleted_at: new Date().toISOString() }).eq('id', id);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'SOFT_DELETE_TEACHER', 'teacher', id, {});
   res.json({ ok: true });
-});
+}));
 
-app.post('/api/admin/students', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.post('/api/admin/students', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const { email, full_name_ar, full_name_en, age, level_id, guardian_name, guardian_phone, guardian_email, course_id } = req.body;
   if (!email || !full_name_ar || !age) {
     res.status(400).json({ error: 'Student email, name, and age are required' });
@@ -1879,26 +1974,26 @@ app.post('/api/admin/students', authenticate, requireRole('admin'), async (req: 
 
   await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_STUDENT', 'student', student.id, { email: cleanEmail, full_name_ar: cleanName });
   res.status(201).json({ id: student.id, student_code: code, temporary_password: tempPassword });
-});
+}));
 
-app.patch('/api/admin/students/:id/level', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.patch('/api/admin/students/:id/level', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = Number(req.params.id);
   const { level_id } = req.body;
   const sb = requireSupabaseAdmin();
   await sb.from('students').update({ level_id: Number(level_id) }).eq('id', id);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_STUDENT_LEVEL', 'student', id, { level_id });
   res.json({ ok: true });
-});
+}));
 
-app.delete('/api/admin/students/:id', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.delete('/api/admin/students/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = Number(req.params.id);
   const sb = requireSupabaseAdmin();
   await sb.from('students').update({ deleted_at: new Date().toISOString() }).eq('id', id);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'SOFT_DELETE_STUDENT', 'student', id, {});
   res.json({ ok: true });
-});
+}));
 
-app.post('/api/admin/enrollments', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.post('/api/admin/enrollments', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const studentId = Number(req.body.student_id);
   const courseId = Number(req.body.course_id);
   const sb = requireSupabaseAdmin();
@@ -1921,9 +2016,9 @@ app.post('/api/admin/enrollments', authenticate, requireRole('admin'), async (re
     course_id: courseId,
   });
   res.status(201).json({ ok: true });
-});
+}));
 
-app.post('/api/admin/admissions/:id/decision', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.post('/api/admin/admissions/:id/decision', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = Number(req.params.id);
   const { decision, student_email } = req.body as { decision: 'approved' | 'rejected'; student_email?: string };
   const sb = requireSupabaseAdmin();
@@ -2009,9 +2104,9 @@ app.post('/api/admin/admissions/:id/decision', authenticate, requireRole('admin'
     student_name: reqRow.student_name,
   });
   res.json({ ok: true, ...(tempPassword ? { temporary_password: tempPassword } : {}) });
-});
+}));
 
-app.post('/api/admin/announcements', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.post('/api/admin/announcements', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const { title_ar, title_en, body_ar, body_en, target_scope, target_course_id, student_ids } = req.body as {
     title_ar: string;
     title_en?: string;
@@ -2075,10 +2170,17 @@ app.post('/api/admin/announcements', authenticate, requireRole('admin'), async (
     });
   }
 
-  res.status(201).json({ id: ann.id });
-});
+  void broadcastRealtimeEvent('notification:created', {
+    announcementId: ann.id,
+    targetProfileIds,
+    title_ar,
+    title_en: title_en || title_ar,
+  });
 
-app.post('/api/admin/exams', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+  res.status(201).json({ id: ann.id });
+}));
+
+app.post('/api/admin/exams', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const { course_id, title_ar, title_en, exam_date, max_score } = req.body;
   const inserted = await insertRowSafe<{ id: number }>('exams', {
     course_id: Number(course_id),
@@ -2088,9 +2190,9 @@ app.post('/api/admin/exams', authenticate, requireRole('admin'), async (req: Aut
     max_score: Number(max_score || 100),
   });
   res.status(201).json({ id: inserted.id });
-});
+}));
 
-app.post('/api/admin/certificates', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.post('/api/admin/certificates', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const { student_id, course_id, title_ar, title_en, grade_label } = req.body;
   const code = generateCertificateCode();
   const inserted = await insertRowSafe<{ id: number }>('certificates', {
@@ -2108,53 +2210,55 @@ app.post('/api/admin/certificates', authenticate, requireRole('admin'), async (r
     student_id,
     course_id,
   });
+  void broadcastRealtimeEvent('academic:updated', {
+    kind: 'certificate',
+    student_id: Number(student_id),
+    verification_code: code,
+  });
   res.status(201).json({ id: inserted.id, verification_code: code });
-});
+}));
 
-app.post('/api/admin/certificates/:id/revoke', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.post('/api/admin/certificates/:id/revoke', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = Number(req.params.id);
   const sb = requireSupabaseAdmin();
   await sb.from('certificates').update({ revoked_at: new Date().toISOString() }).eq('id', id);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'REVOKE_CERTIFICATE', 'certificate', id, {});
   res.json({ ok: true });
-});
+}));
 
-app.post('/api/admin/payroll', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.post('/api/admin/payroll', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const { teacher_id, month_year, base_amount, bonus_amount, deduction_amount } = req.body;
   const net = Number(base_amount) + Number(bonus_amount || 0) - Number(deduction_amount || 0);
-  try {
-    const inserted = await insertRowSafe<{ id: number }>('payroll', {
-      teacher_id: Number(teacher_id),
-      month_year,
-      base_amount: Number(base_amount),
-      bonus_amount: Number(bonus_amount || 0),
-      deduction_amount: Number(deduction_amount || 0),
-      net_amount: net,
-      status: 'pending',
-      created_by: req.user!.id,
-    });
-
-    await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_PAYROLL', 'payroll', inserted.id, { teacher_id, month_year, net });
-    res.status(201).json({ id: inserted.id });
-  } catch (err: unknown) {
+  const inserted = await insertRowSafe<{ id: number }>('payroll', {
+    teacher_id: Number(teacher_id),
+    month_year,
+    base_amount: Number(base_amount),
+    bonus_amount: Number(bonus_amount || 0),
+    deduction_amount: Number(deduction_amount || 0),
+    net_amount: net,
+    status: 'pending',
+    created_by: req.user!.id,
+  }).catch((err: unknown) => {
     const message = err instanceof Error ? err.message : '';
     if (message.includes('duplicate key') || message.includes('payroll_teacher_id_month_year_key')) {
-      res.status(409).json({ error: 'Duplicate payroll: this teacher already has a payroll record for this month.' });
-      return;
+      throw new AppError(409, 'Duplicate payroll: this teacher already has a payroll record for this month.');
     }
     throw err;
-  }
-});
+  });
 
-app.patch('/api/admin/payroll/:id/pay', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_PAYROLL', 'payroll', inserted.id, { teacher_id, month_year, net });
+  res.status(201).json({ id: inserted.id });
+}));
+
+app.patch('/api/admin/payroll/:id/pay', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = Number(req.params.id);
   const sb = requireSupabaseAdmin();
   await sb.from('payroll').update({ status: 'paid', paid_at: new Date().toISOString() }).eq('id', id);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'MARK_PAYROLL_PAID', 'payroll', id, {});
   res.json({ ok: true });
-});
+}));
 
-app.put('/api/admin/legal/:docType', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.put('/api/admin/legal/:docType', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const docType = String(req.params.docType);
   const { version, title_ar, title_en, content_ar, content_en } = req.body;
   const sb = requireSupabaseAdmin();
@@ -2171,9 +2275,9 @@ app.put('/api/admin/legal/:docType', authenticate, requireRole('admin'), async (
     .eq('doc_type', docType);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_LEGAL_DOC', 'legal_document', docType, { version });
   res.json({ ok: true });
-});
+}));
 
-app.patch('/api/admin/users/:id/role', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
+app.patch('/api/admin/users/:id/role', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = String(req.params.id);
   const { role, is_active } = req.body as { role?: 'student' | 'teacher' | 'admin' | 'guardian'; is_active?: boolean | number };
   const sb = requireSupabaseAdmin();
@@ -2194,57 +2298,136 @@ app.patch('/api/admin/users/:id/role', authenticate, requireRole('admin'), async
     is_active: newActive,
   });
   res.json({ ok: true });
-});
+}));
 
 app.get('/api/admin/supabase-schema', authenticate, requireRole('admin'), (_req, res) => {
   const sql = fs.readFileSync(path.resolve(process.cwd(), 'supabase_schema.sql'), 'utf8');
   res.json({ sql });
 });
 
-app.get('/api/admin/launch-status', authenticate, requireRole('admin'), async (_req, res) => {
+app.get('/api/admin/launch-status', authenticate, requireRole('admin'), asyncHandler(async (_req, res) => {
   const health = await getSupabaseLiveHealth();
   res.json(health);
-});
+}));
 
-app.post('/api/admin/supabase/sync-users', authenticate, requireRole('admin'), async (req: AuthRequest, res) => {
-  try {
-    const sb = requireSupabaseAdmin();
-    const { data: profiles } = await sb
-      .from('profiles')
-      .select('email, full_name, role')
-      .is('deleted_at', null)
-      .eq('is_active', true);
-    const result = await syncUsersToSupabaseAuth((profiles || []) as Array<{ email: string; full_name: string; role: string }>);
-    await writeAuditLog(req.user!.id, req.user!.full_name, 'SYNC_SUPABASE_AUTH', 'supabase', 'auth', result);
-    res.json(result);
-  } catch (err) {
-    res.status(502).json({ error: err instanceof Error ? err.message : 'Supabase sync failed' });
-  }
-});
+app.post('/api/admin/supabase/sync-users', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const sb = requireSupabaseAdmin();
+  const { data: profiles } = await sb
+    .from('profiles')
+    .select('email, full_name, role')
+    .is('deleted_at', null)
+    .eq('is_active', true);
+  const result = await syncUsersToSupabaseAuth((profiles || []) as Array<{ email: string; full_name: string; role: string }>).catch(
+    (err: unknown) => {
+      throw new AppError(502, err instanceof Error ? err.message : 'Supabase sync failed');
+    }
+  );
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'SYNC_SUPABASE_AUTH', 'supabase', 'auth', result);
+  res.json(result);
+}));
+
+// Unmatched API endpoints return structured JSON 404 instead of SPA HTML
+app.use('/api', apiNotFoundHandler);
 
 // ============================================================================
-// VITE DEV / PRODUCTION STATIC MOUNT
+// VITE DEV / PRODUCTION STATIC MOUNT + GLOBAL ERROR MIDDLEWARE + GRACEFUL SHUTDOWN
 // ============================================================================
 async function startServer() {
   const PORT = Number(process.env.PORT || 3000);
+  let viteServer: ViteDevServer | null = null;
 
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
+  if (!IS_PRODUCTION) {
+    const { createServer: createViteServer } = await import('vite');
+    viteServer = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
-    app.use(vite.middlewares);
+    app.use(viteServer.middlewares);
   } else {
     const distPath = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    const indexHtmlPath = path.join(distPath, 'index.html');
+    if (!fs.existsSync(indexHtmlPath)) {
+      console.warn('[hosting] dist/index.html not found — run "npm run build" before starting in production.');
+    }
+
+    app.use(
+      express.static(distPath, {
+        index: false,
+        setHeaders: (res, filePath) => {
+          if (filePath.endsWith('index.html')) {
+            res.setHeader('Cache-Control', 'no-cache');
+          } else if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          }
+        },
+      })
+    );
+
+    app.get('*', (req, res, next) => {
+      if (req.path.startsWith('/api')) {
+        next();
+        return;
+      }
+      if (!fs.existsSync(indexHtmlPath)) {
+        res.status(503).json({ error: 'Frontend build missing. Run npm run build first.' });
+        return;
+      }
+      res.setHeader('Cache-Control', 'no-cache');
+      res.sendFile(indexHtmlPath);
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Noor & Bayan Academy (Supabase PostgreSQL) running on http://localhost:${PORT}`);
+  // Global Error Handling Middleware (always registered last)
+  app.use(globalErrorHandler);
+
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
+    console.log(
+      `Noor & Bayan Academy (Supabase PostgreSQL, ${IS_PRODUCTION ? 'production' : 'development'}) running on http://0.0.0.0:${PORT}`
+    );
+  });
+
+  const gracefulShutdown = async (signal: string, exitCode = 0) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.log(`[shutdown] Received ${signal}. Closing HTTP server gracefully...`);
+
+    const forceTimer = setTimeout(() => {
+      console.error('[shutdown] Timed out closing active connections — forcing exit.');
+      process.exit(1);
+    }, 10_000);
+    forceTimer.unref();
+
+    httpServer.close(async (closeErr) => {
+      if (closeErr) {
+        console.error('[shutdown] HTTP close error:', closeErr.message);
+      }
+      if (viteServer) {
+        try {
+          await viteServer.close();
+        } catch (viteErr) {
+          console.warn('[shutdown] Vite close warning:', viteErr);
+        }
+      }
+      clearTimeout(forceTimer);
+      console.log('[shutdown] Clean exit complete.');
+      process.exit(exitCode);
+    });
+    httpServer.closeIdleConnections?.();
+  };
+
+  process.on('SIGINT', () => {
+    void gracefulShutdown('SIGINT', 0);
+  });
+  process.on('SIGTERM', () => {
+    void gracefulShutdown('SIGTERM', 0);
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error('[process] Unhandled promise rejection:', reason);
+  });
+  process.on('uncaughtException', (err) => {
+    console.error('[process] Uncaught exception:', err);
+    void gracefulShutdown('uncaughtException', 1);
   });
 }
 
-startServer();
+void startServer();

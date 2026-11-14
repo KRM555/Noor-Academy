@@ -1,7 +1,9 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { Award, Search, CheckCircle2, XCircle, Gamepad2, PhoneCall, Mail, BookOpen } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { apiFetch } from '../../lib/api';
+import { queryKeys } from '../../lib/queryClient';
 import { dict, tField } from '../../i18n/translations';
 import type { Course, LegalDocument, PublicOverview, Teacher } from '../../types';
 import { Card, PrimaryButton, SecondaryButton, ResilientImage, LoadingState } from '../../components/ui/CommonUI';
@@ -89,14 +91,15 @@ export function CourseDetailPage({
   onBack: () => void;
 }) {
   const { lang } = useApp();
-  const [data, setData] = useState<{
-    course: Course & { age_range?: string; teacher_qualifications_ar?: string; teacher_qualifications_en?: string };
-    lessons: Array<{ id: number; title_ar: string; title_en: string; lesson_date: string; duration_min: number; objectives_ar: string; objectives_en: string }>;
-  } | null>(null);
-
-  useEffect(() => {
-    apiFetch(`/api/public/courses/${courseId}`).then((d) => setData(d as never)).catch(() => {});
-  }, [courseId]);
+  const { data } = useQuery({
+    queryKey: queryKeys.courseDetail(courseId),
+    queryFn: () =>
+      apiFetch<{
+        course: Course & { age_range?: string; teacher_qualifications_ar?: string; teacher_qualifications_en?: string };
+        lessons: Array<{ id: number; title_ar: string; title_en: string; lesson_date: string; duration_min: number; objectives_ar: string; objectives_en: string }>;
+      }>(`/api/public/courses/${courseId}`),
+    staleTime: 2 * 60 * 1000,
+  });
 
   if (!data) return <div className="max-w-5xl mx-auto px-4 py-12"><LoadingState /></div>;
   const { course, lessons } = data;
@@ -233,11 +236,11 @@ export function TeacherDetailPage({
   onBack: () => void;
 }) {
   const { lang } = useApp();
-  const [data, setData] = useState<{ teacher: Teacher; courses: Course[] } | null>(null);
-
-  useEffect(() => {
-    apiFetch(`/api/public/teachers/${teacherId}`).then((d) => setData(d as never)).catch(() => {});
-  }, [teacherId]);
+  const { data } = useQuery({
+    queryKey: queryKeys.teacherDetail(teacherId),
+    queryFn: () => apiFetch<{ teacher: Teacher; courses: Course[] }>(`/api/public/teachers/${teacherId}`),
+    staleTime: 2 * 60 * 1000,
+  });
 
   if (!data) return <div className="max-w-5xl mx-auto px-4 py-12"><LoadingState /></div>;
   const { teacher, courses } = data;

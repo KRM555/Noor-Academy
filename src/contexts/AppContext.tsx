@@ -1,6 +1,8 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import type { AuthUser, Lang, NotificationItem, Theme } from '../types';
 import { apiFetch, getStoredToken, setStoredToken } from '../lib/api';
+import { queryKeys } from '../lib/queryClient';
 
 interface ToastMessage {
   id: number;
@@ -29,12 +31,22 @@ interface AppContextValue {
 const AppContext = createContext<AppContextValue | null>(null);
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
+  const qc = useQueryClient();
   const [lang, setLangState] = useState<Lang>(() => (localStorage.getItem('nb_lang') as Lang) || 'ar');
   const [theme, setThemeState] = useState<Theme>(() => (localStorage.getItem('nb_theme') as Theme) || 'day');
   const [user, setUser] = useState<AuthUser | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
-  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+
+  const { data: notifications = [] } = useQuery({
+    queryKey: queryKeys.notifications(user?.id),
+    queryFn: async () => {
+      const data = await apiFetch<{ notifications: NotificationItem[] }>('/api/notifications');
+      return data.notifications;
+    },
+    enabled: Boolean(user),
+    staleTime: 30 * 1000,
+  });
 
   const toast = useCallback((text: string, tone: 'success' | 'error' | 'info' = 'info') => {
     const id = Date.now() + Math.floor(Math.random() * 1000);
@@ -78,26 +90,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [theme]);
 
   const refreshNotifications = useCallback(async () => {
-    if (!getStoredToken()) {
-      setNotifications([]);
-      return;
-    }
-    try {
-      const data = await apiFetch<{ notifications: NotificationItem[] }>('/api/notifications');
-      setNotifications(data.notifications);
-    } catch {
-      setNotifications([]);
-    }
-  }, []);
+    if (!getStoredToken() || !user) return;
+    await qc.invalidateQueries({ queryKey: queryKeys.notifications(user.id) });
+  }, [qc, user]);
 
   const markAllNotificationsRead = useCallback(async () => {
     try {
       await apiFetch('/api/notifications/read-all', { method: 'POST' });
-      setNotifications((prev) => prev.map((n) => ({ ...n, is_read: 1 })));
+      qc.setQueryData<NotificationItem[]>(queryKeys.notifications(user?.id), (prev) =>
+        (prev || []).map((n) => ({ ...n, is_read: 1 }))
+      );
     } catch {
       // ignore
     }
-  }, []);
+  }, [qc, user?.id]);
 
   useEffect(() => {
     async function initAuth() {
@@ -109,7 +115,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       try {
         const res = await apiFetch<{ user: AuthUser }>('/api/auth/me');
         setUser(res.user);
-        await refreshNotifications();
       } catch {
         setStoredToken(null);
         setUser(null);
@@ -117,8 +122,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setAuthLoading(false);
       }
     }
-    initAuth();
-  }, [refreshNotifications]);
+    void initAuth();
+  }, []);
 
   const loginWithCredentials = async (email: string, password: string) => {
     const res = await apiFetch<{ token: string; user: AuthUser }>('/api/auth/login', {
@@ -127,7 +132,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     });
     setStoredToken(res.token);
     setUser(res.user);
-    await refreshNotifications();
+    void qc.invalidateQueries({ queryKey: queryKeys.notifications(res.user.id) });
     return res.user;
   };
 
@@ -138,14 +143,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     });
     setStoredToken(res.token);
     setUser(res.user);
-    await refreshNotifications();
+    void qc.invalidateQueries({ queryKey: queryKeys.notifications(res.user.id) });
     return res.user;
   };
 
   const logout = () => {
     setStoredToken(null);
     setUser(null);
-    setNotifications([]);
+    qc.removeQueries({ queryKey: ['dashboard'] });
+    qc.removeQueries({ queryKey: ['notifications'] });
+    qc.removeQueries({ queryKey: ['admin'] });
   };
 
   return (

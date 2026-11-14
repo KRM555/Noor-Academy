@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ResponsiveContainer,
   BarChart,
@@ -11,6 +12,7 @@ import {
 import { Trash2, CheckCircle2, XCircle, Download, ShieldAlert, Rocket, RefreshCw } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { apiFetch } from '../../lib/api';
+import { queryKeys } from '../../lib/queryClient';
 import { isBrowserSupabaseConfigured } from '../../lib/supabase';
 import { tField } from '../../i18n/translations';
 import { generateCertificatePDF } from '../../lib/pdfCertificate';
@@ -49,27 +51,10 @@ export function AdminDashboard({
   activeTab: string;
   onLaunchGame: (slug: string) => void;
 }) {
-  const { lang, toast } = useApp();
-  const [data, setData] = useState<AdminData | null>(null);
-  const [loading, setLoading] = useState(true);
+  const { lang, toast, user } = useApp();
+  const qc = useQueryClient();
   const [deleteTarget, setDeleteTarget] = useState<{ type: 'courses' | 'lessons' | 'teachers' | 'students'; id: number } | null>(null);
-  const [schemaSql, setSchemaSql] = useState('');
   const [syncingSupabase, setSyncingSupabase] = useState(false);
-  const [launchStatus, setLaunchStatus] = useState<{
-    supabaseConfigured: boolean;
-    supabaseUrlPresent: boolean;
-    supabaseAnonPresent: boolean;
-    supabaseServiceRolePresent: boolean;
-    viteSupabasePresent?: boolean;
-    supabaseHost?: string | null;
-    sessionSecretConfigured: boolean;
-    demoLoginEnabled: boolean;
-    nodeEnv: string;
-    authConnected?: boolean;
-    authUsersCount?: number;
-    schemaApplied?: boolean;
-    connectionError?: string | null;
-  } | null>(null);
 
   // Form states
   const [newCourse, setNewCourse] = useState({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '1', schedule_ar: 'الإثنين · 5:00 م', price_monthly: '350' });
@@ -88,51 +73,56 @@ export function AdminDashboard({
   const [newCert, setNewCert] = useState({ student_id: '1', course_id: '1', title_ar: 'شهادة إتمام المستوى', title_en: 'Level Completion Certificate', grade_label: 'امتياز · 98%' });
   const [newPay, setNewPay] = useState({ teacher_id: '1', month_year: '2026-11', base_amount: '5400', bonus_amount: '250', deduction_amount: '0' });
 
-  const loadData = useCallback(async () => {
-    try {
-      const res = await apiFetch<AdminData>('/api/admin/dashboard');
-      setData(res);
-    } catch (e: unknown) {
-      toast(e instanceof Error ? e.message : 'Error', 'error');
-    } finally {
-      setLoading(false);
-    }
-  }, [toast]);
+  const { data, isLoading, error } = useQuery({
+    queryKey: queryKeys.adminDashboard(user?.id),
+    queryFn: () => apiFetch<AdminData>('/api/admin/dashboard'),
+  });
 
   useEffect(() => {
-    loadData();
-  }, [loadData]);
+    if (error) {
+      toast(error instanceof Error ? error.message : 'Error', 'error');
+    }
+  }, [error, toast]);
+
+  const { data: launchStatus = null } = useQuery({
+    queryKey: queryKeys.adminLaunchStatus,
+    queryFn: () =>
+      apiFetch<{
+        supabaseConfigured: boolean;
+        supabaseUrlPresent: boolean;
+        supabaseAnonPresent: boolean;
+        supabaseServiceRolePresent: boolean;
+        viteSupabasePresent?: boolean;
+        supabaseHost?: string | null;
+        sessionSecretConfigured: boolean;
+        demoLoginEnabled: boolean;
+        nodeEnv: string;
+        authConnected?: boolean;
+        authUsersCount?: number;
+        schemaApplied?: boolean;
+        connectionError?: string | null;
+      }>('/api/admin/launch-status'),
+    enabled: activeTab === 'settings',
+  });
+
+  const { data: schemaData } = useQuery({
+    queryKey: queryKeys.adminSchema,
+    queryFn: () => apiFetch<{ sql: string }>('/api/admin/supabase-schema'),
+    enabled: activeTab === 'settings',
+    staleTime: Infinity,
+  });
+  const schemaSql = schemaData?.sql || '';
+
+  const loadData = useCallback(() => {
+    void qc.invalidateQueries({ queryKey: queryKeys.adminDashboard(user?.id) });
+    void qc.invalidateQueries({ queryKey: queryKeys.publicOverview });
+  }, [qc, user?.id]);
 
   const fetchLaunchStatus = useCallback(() => {
-    apiFetch<{
-      supabaseConfigured: boolean;
-      supabaseUrlPresent: boolean;
-      supabaseAnonPresent: boolean;
-      supabaseServiceRolePresent: boolean;
-      viteSupabasePresent?: boolean;
-      supabaseHost?: string | null;
-      sessionSecretConfigured: boolean;
-      demoLoginEnabled: boolean;
-      nodeEnv: string;
-      authConnected?: boolean;
-      authUsersCount?: number;
-      schemaApplied?: boolean;
-      connectionError?: string | null;
-    }>('/api/admin/launch-status')
-      .then(setLaunchStatus)
-      .catch(() => {});
-  }, []);
+    void qc.invalidateQueries({ queryKey: queryKeys.adminLaunchStatus });
+  }, [qc]);
 
-  useEffect(() => {
-    if (activeTab === 'settings') {
-      if (!schemaSql) {
-        apiFetch<{ sql: string }>('/api/admin/supabase-schema').then((d) => setSchemaSql(d.sql)).catch(() => {});
-      }
-      fetchLaunchStatus();
-    }
-  }, [activeTab, schemaSql, fetchLaunchStatus]);
-
-  if (loading) return <LoadingState />;
+  if (isLoading) return <LoadingState />;
   if (!data) return null;
 
   const confirmSoftDelete = async () => {

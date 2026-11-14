@@ -1,4 +1,5 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import {
   ResponsiveContainer,
   BarChart,
@@ -11,6 +12,7 @@ import {
 import { ExternalLink, Download, Gamepad2, Calendar, Award } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { apiFetch } from '../../lib/api';
+import { queryKeys } from '../../lib/queryClient';
 import { tField } from '../../i18n/translations';
 import { generateCertificatePDF } from '../../lib/pdfCertificate';
 import { Card, LoadingState, ResponsiveTable, PrimaryButton, EmptyState } from '../../components/ui/CommonUI';
@@ -49,18 +51,19 @@ export function StudentDashboard({
   activeTab: string;
   onLaunchGame: (slug: string) => void;
 }) {
-  const { lang, toast } = useApp();
-  const [data, setData] = useState<StudentDashboardData | null>(null);
-  const [loading, setLoading] = useState(true);
+  const { lang, toast, user } = useApp();
+  const { data, isLoading, error } = useQuery({
+    queryKey: queryKeys.studentDashboard(user?.id),
+    queryFn: () => apiFetch<StudentDashboardData>('/api/student/dashboard'),
+  });
 
   useEffect(() => {
-    apiFetch<StudentDashboardData>('/api/student/dashboard')
-      .then(setData)
-      .catch((e) => toast(e.message, 'error'))
-      .finally(() => setLoading(false));
-  }, [toast]);
+    if (error) {
+      toast(error instanceof Error ? error.message : 'Error', 'error');
+    }
+  }, [error, toast]);
 
-  if (loading) return <LoadingState />;
+  if (isLoading) return <LoadingState />;
   if (!data) return <EmptyState title={lang === 'ar' ? 'لا توجد بيانات طالب مرتبطة' : 'No linked student record'} />;
 
   const nextLesson = data.lessons[0];

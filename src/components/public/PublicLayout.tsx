@@ -3,6 +3,7 @@ import { Sun, Moon, Menu, X, Globe, LogIn, LayoutDashboard } from 'lucide-react'
 import { useApp } from '../../contexts/AppContext';
 import { dict } from '../../i18n/translations';
 import { AcademyLogo } from '../ui/CommonUI';
+import { PWAInstallButton } from '../ui/PWAComponents';
 
 interface PublicLayoutProps {
   currentPath: string;
@@ -82,6 +83,10 @@ export function PublicLayout({ currentPath, onNavigate, children }: PublicLayout
               <span>{t.switchLang}</span>
             </button>
 
+            <div className="hidden md:flex">
+              <PWAInstallButton compact />
+            </div>
+
             {user ? (
               <button
                 onClick={() => go('/dashboard')}
@@ -151,6 +156,9 @@ export function PublicLayout({ currentPath, onNavigate, children }: PublicLayout
               >
                 {t.navApply}
               </button>
+            </div>
+            <div className="pt-1 flex justify-center">
+              <PWAInstallButton />
             </div>
           </div>
         )}
