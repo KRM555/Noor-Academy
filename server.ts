@@ -3044,7 +3044,14 @@ app.post(
       return;
     }
 
-    const existingSub = await getExamSubmission(sb, examId, studentId);
+    const [{ data: existingResult }, existingSub] = await Promise.all([
+      sb.from('exam_results').select('id').eq('exam_id', examId).eq('student_id', studentId).maybeSingle(),
+      getExamSubmission(sb, examId, studentId),
+    ]);
+    if (existingResult || existingSub?.status === 'graded') {
+      res.status(409).json({ error: 'This exam has already been graded.' });
+      return;
+    }
     if (existingSub && existingSub.quiz_answers.length > 0) {
       res.status(409).json({ error: 'Quiz answers have already been submitted for this exam.' });
       return;
@@ -4095,6 +4102,10 @@ app.post('/api/admin/exams', authenticate, requireRole('admin'), asyncHandler<Au
     res.status(400).json({ error: 'Invalid exam payload', details: parsed.error.flatten().fieldErrors });
     return;
   }
+  if ((parsed.data.exam_mode === 'quiz' || parsed.data.exam_mode === 'hybrid') && parsed.data.questions.length === 0) {
+    res.status(400).json({ error: 'Online quiz and hybrid exams require at least one question.' });
+    return;
+  }
   const sb = requireSupabaseAdmin();
   const questions = normalizeQuestions(parsed.data.questions);
   const inserted = await insertRowSafe<{ id: number }>('exams', {
@@ -4128,7 +4139,9 @@ app.post('/api/admin/exams', authenticate, requireRole('admin'), asyncHandler<Au
   await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_EXAM', 'exam', inserted.id, {
     course_id: parsed.data.course_id,
     exam_mode: parsed.data.exam_mode,
+    question_count: questions.length,
   });
+  void broadcastRealtimeEvent('academic:updated', { kind: 'exam' });
   res.status(201).json({ id: inserted.id });
 }));
 
