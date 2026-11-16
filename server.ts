@@ -19,6 +19,16 @@ import {
 } from './server/supabaseClient.ts';
 import { AppError, asyncHandler, apiNotFoundHandler, globalErrorHandler } from './server/errorHandler.ts';
 import {
+  saveAdmissionMeta,
+  getAdmissionMeta,
+  listAdmissionMetas,
+  generateApplicationId,
+  saveTeacherApplication,
+  getTeacherApplication,
+  listTeacherApplications,
+  deletePendingAuthProfileIfSafe,
+} from './server/applicationVault.ts';
+import {
   getExamVaultConfig,
   saveExamVaultConfig,
   getExamSubmission,
@@ -41,7 +51,7 @@ import {
 dotenv.config();
 
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-const ALLOW_DEMO_LOGIN = !IS_PRODUCTION && process.env.ALLOW_DEMO_LOGIN === 'true';
+const ALLOW_DEMO_LOGIN = false;
 
 if (IS_PRODUCTION && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 24)) {
   throw new Error('FATAL: SESSION_SECRET environment variable (min 24 chars) is required in production.');
@@ -225,12 +235,26 @@ const placementSchema = z.object({
 const admissionSchema = z.object({
   student_name: z.string().trim().min(2).max(120),
   student_age: z.coerce.number().int().min(3).max(22),
+  student_email: z.string().trim().email().max(160),
+  student_password: z.string().min(8).max(128),
   guardian_name: z.string().trim().min(2).max(120),
   guardian_email: z.string().trim().email().max(160),
   guardian_phone: z.string().trim().min(6).max(32),
   preferred_course_id: z.coerce.number().int().positive().nullable().optional(),
   recommended_level_id: z.coerce.number().int().positive().nullable().optional(),
   notes: z.string().trim().max(1000).optional(),
+  consent_accepted: z.literal(true).or(z.literal(1)).or(z.boolean().refine((v) => v === true)),
+});
+
+const teacherApplicationSchema = z.object({
+  name_ar: z.string().trim().min(2).max(140),
+  name_en: z.string().trim().max(140).optional(),
+  email: z.string().trim().email().max(160),
+  password: z.string().min(8).max(128),
+  phone: z.string().trim().min(6).max(32),
+  specialty_ar: z.string().trim().min(2).max(200),
+  qualifications_ar: z.string().trim().min(2).max(400),
+  bio_ar: z.string().trim().max(1500).optional(),
   consent_accepted: z.literal(true).or(z.literal(1)).or(z.boolean().refine((v) => v === true)),
 });
 
@@ -656,12 +680,14 @@ app.post('/api/public/placement-test', publicSubmitLimiter, asyncHandler(async (
 app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req, res) => {
   const parsed = admissionSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: 'All required fields and valid consent must be provided' });
+    res.status(400).json({ error: 'All required fields (including valid student email and password min 8 chars) and consent must be provided.' });
     return;
   }
   const {
     student_name,
     student_age,
+    student_email,
+    student_password,
     guardian_name,
     guardian_email,
     guardian_phone,
@@ -670,34 +696,169 @@ app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req,
     notes,
   } = parsed.data;
 
-  const inserted = await insertRowSafe<{ id: number }>('admission_requests', {
+  const cleanStudentEmail = student_email.toLowerCase();
+  const cleanGuardianEmail = guardian_email.toLowerCase();
+  if (cleanStudentEmail === cleanGuardianEmail) {
+    res.status(400).json({ error: 'Student login email and guardian email must be different so each portal stays separate.' });
+    return;
+  }
+
+  const sb = requireSupabaseAdmin();
+  const { data: existingProfile } = await sb
+    .from('profiles')
+    .select('id')
+    .ilike('email', cleanStudentEmail)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (existingProfile) {
+    res.status(409).json({ error: 'This student email is already registered or has a pending application.' });
+    return;
+  }
+
+  const { user: authUser, alreadyExisted } = await provisionSupabaseAuthUser(
+    cleanStudentEmail,
+    student_password,
     student_name,
-    student_age,
-    guardian_name,
-    guardian_email,
-    guardian_phone,
-    preferred_course_id: preferred_course_id || null,
-    recommended_level_id: recommended_level_id || null,
-    notes: notes || '',
-    consent_accepted: true,
-    status: 'pending',
-  });
+    'student',
+    { updateExistingPassword: true }
+  );
+  const { error: profErr } = await sb.from('profiles').upsert(
+    {
+      id: authUser.id,
+      email: cleanStudentEmail,
+      full_name: student_name,
+      role: 'student',
+      is_active: false,
+      preferred_lang: 'ar',
+    },
+    { onConflict: 'id' }
+  );
+  if (profErr) {
+    if (!alreadyExisted) {
+      await sb.auth.admin.deleteUser(authUser.id).catch(() => {});
+    }
+    res.status(500).json({ error: profErr.message });
+    return;
+  }
+
+  let inserted: { id: number };
+  try {
+    inserted = await insertRowSafe<{ id: number }>('admission_requests', {
+      student_name,
+      student_age,
+      guardian_name,
+      guardian_email: cleanGuardianEmail,
+      guardian_phone,
+      preferred_course_id: preferred_course_id || null,
+      recommended_level_id: recommended_level_id || null,
+      notes: notes || '',
+      consent_accepted: true,
+      status: 'pending',
+    });
+
+    await saveAdmissionMeta(sb, {
+      admission_id: inserted.id,
+      student_email: cleanStudentEmail,
+      pending_profile_id: authUser.id,
+      created_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    await deletePendingAuthProfileIfSafe(sb, authUser.id);
+    throw err;
+  }
 
   await Promise.all([
-    insertRowSafe('consents', { email: guardian_email, doc_type: 'terms', doc_version: '1.0' }),
-    insertRowSafe('consents', { email: guardian_email, doc_type: 'privacy', doc_version: '1.0' }),
+    insertRowSafe('consents', { email: cleanGuardianEmail, doc_type: 'terms', doc_version: '1.0' }),
+    insertRowSafe('consents', { email: cleanStudentEmail, doc_type: 'privacy', doc_version: '1.0' }),
   ]);
 
   void broadcastRealtimeEvent('admission:created', { kind: 'admission' });
 
-  res.status(201).json({ id: inserted.id, status: 'pending', syncedToSupabase: true });
+  res.status(201).json({ id: inserted.id, status: 'pending', student_email: cleanStudentEmail, syncedToSupabase: true });
+}));
+
+app.post('/api/public/teacher-applications', publicSubmitLimiter, asyncHandler(async (req, res) => {
+  const parsed = teacherApplicationSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'All required teacher application fields (password min 8 chars) and consent must be provided.' });
+    return;
+  }
+
+  const { name_ar, name_en, email, password, phone, specialty_ar, qualifications_ar, bio_ar } = parsed.data;
+  const cleanEmail = email.toLowerCase();
+  const sb = requireSupabaseAdmin();
+
+  const { data: existingProfile } = await sb
+    .from('profiles')
+    .select('id')
+    .ilike('email', cleanEmail)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (existingProfile) {
+    res.status(409).json({ error: 'This email is already registered or has a pending application.' });
+    return;
+  }
+
+  const { user: authUser, alreadyExisted } = await provisionSupabaseAuthUser(
+    cleanEmail,
+    password,
+    name_ar,
+    'teacher',
+    { updateExistingPassword: true }
+  );
+  const { error: profErr } = await sb.from('profiles').upsert(
+    {
+      id: authUser.id,
+      email: cleanEmail,
+      full_name: name_ar,
+      role: 'teacher',
+      is_active: false,
+      preferred_lang: 'ar',
+    },
+    { onConflict: 'id' }
+  );
+  if (profErr) {
+    if (!alreadyExisted) {
+      await sb.auth.admin.deleteUser(authUser.id).catch(() => {});
+    }
+    res.status(500).json({ error: profErr.message });
+    return;
+  }
+
+  const appId = generateApplicationId();
+  try {
+    await saveTeacherApplication(sb, {
+      id: appId,
+      profile_id: authUser.id,
+      email: cleanEmail,
+      name_ar,
+      name_en: (name_en || name_ar).trim(),
+      phone,
+      specialty_ar,
+      qualifications_ar,
+      bio_ar: bio_ar || '',
+      status: 'pending',
+      created_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    await deletePendingAuthProfileIfSafe(sb, authUser.id);
+    throw err;
+  }
+
+  await insertRowSafe('consents', { email: cleanEmail, doc_type: 'terms', doc_version: '1.0' });
+  void broadcastRealtimeEvent('admission:created', { kind: 'teacher_application' });
+
+  res.status(201).json({ id: appId, status: 'pending', email: cleanEmail });
 }));
 
 // ============================================================================
 // AUTHENTICATION ROUTES
 // ============================================================================
 app.get('/api/auth/config', (_req, res) => {
-  res.json({ demoEnabled: ALLOW_DEMO_LOGIN });
+  res.json({
+    demoEnabled: ALLOW_DEMO_LOGIN,
+    googleOAuthEnabled: Boolean(process.env.VITE_SUPABASE_URL && process.env.VITE_SUPABASE_ANON_KEY),
+  });
 });
 
 app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
@@ -754,14 +915,46 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
       password,
     });
     if (authErr) {
+      const { data: uData } = await sb.auth.admin.getUserById(profileRow.id).catch(() => ({ data: { user: null } }));
+      const authUserObj = uData?.user;
+      const appProviders = Array.isArray(authUserObj?.app_metadata?.providers)
+        ? (authUserObj.app_metadata.providers as string[])
+        : [];
+      const identityProviders = Array.isArray(authUserObj?.identities)
+        ? authUserObj.identities.map((id) => id.provider).filter((p): p is string => Boolean(p))
+        : [];
+      const allProviders = new Set([...appProviders, ...identityProviders]);
+      if (allProviders.has('google') && !allProviders.has('email')) {
+        res.status(401).json({
+          error: 'This email is linked via Google Sign-In without an email password yet. Sign in with Google or use Forgot Password to set one.',
+          code: 'GOOGLE_ONLY_ACCOUNT',
+        });
+        return;
+      }
       res.status(401).json({ error: 'Invalid credentials' });
       return;
     }
     profile = profileRow as AuthUser;
   }
 
-  if (!profile || !profile.is_active) {
-    res.status(403).json({ error: 'Account disabled or not found' });
+  if (!profile) {
+    res.status(401).json({ error: 'Invalid credentials' });
+    return;
+  }
+
+  if (!profile.is_active) {
+    if (profile.role === 'student' || profile.role === 'teacher') {
+      const table = profile.role === 'student' ? 'students' : 'teachers';
+      const { data: linked } = await sb.from(table).select('id').eq('profile_id', profile.id).maybeSingle();
+      if (!linked) {
+        res.status(403).json({
+          error: 'Your application is pending administrator approval. Please wait until your account is activated.',
+          code: 'APPLICATION_PENDING',
+        });
+        return;
+      }
+    }
+    res.status(403).json({ error: 'Account disabled or not active. Please contact academy administration.' });
     return;
   }
 
@@ -860,12 +1053,60 @@ app.post('/api/auth/forgot-password', loginLimiter, asyncHandler(async (req, res
     res.status(400).json({ error: 'Valid email is required.' });
     return;
   }
-  const result = await requestSupabasePasswordReset(parsed.data.email, process.env.APP_URL ? `${process.env.APP_URL}/login` : undefined);
+  const rawOrigin = String(req.headers.origin || process.env.APP_URL || '').trim().replace(/\/+$/, '');
+  const safeOrigin = /^https?:\/\/[a-zA-Z0-9.-]+(:\d+)?$/.test(rawOrigin) ? rawOrigin : undefined;
+  const redirectTo = safeOrigin ? `${safeOrigin}/login?mode=reset-password` : undefined;
+  const result = await requestSupabasePasswordReset(parsed.data.email.toLowerCase(), redirectTo);
   res.json({
     ok: true,
     emailSentViaSupabase: result.sent,
     mode: result.sent ? 'supabase_email' : 'admin_assisted',
+    ...(result.sent ? {} : { reason: result.reason }),
   });
+}));
+
+app.post('/api/auth/complete-password-reset', loginLimiter, asyncHandler(async (req, res) => {
+  const schema = z.object({
+    access_token: z.string().min(20).max(8192),
+    newPassword: z.string().min(8, 'Password must be at least 8 characters').max(128),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Valid recovery token and a new password (min 8 chars) are required.' });
+    return;
+  }
+
+  const sb = requireSupabaseAdmin();
+  const { data: authData, error: authErr } = await sb.auth.getUser(parsed.data.access_token);
+  if (authErr || !authData?.user?.id || !authData.user.email) {
+    res.status(401).json({ error: 'Invalid or expired password recovery link. Please request a new reset email.' });
+    return;
+  }
+
+  const { data: profile } = await sb
+    .from('profiles')
+    .select('id, email, full_name, is_active')
+    .eq('id', authData.user.id)
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (!profile) {
+    res.status(404).json({ error: 'No academy profile found for this recovery link.' });
+    return;
+  }
+
+  const { error: updateErr } = await sb.auth.admin.updateUserById(authData.user.id, {
+    password: parsed.data.newPassword,
+  });
+  if (updateErr) {
+    res.status(500).json({ error: updateErr.message });
+    return;
+  }
+
+  await writeAuditLog(profile.id, profile.full_name, 'PASSWORD_RESET_COMPLETED', 'profile', profile.id, {
+    email: profile.email,
+  });
+  res.json({ ok: true, email: profile.email });
 }));
 
 app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(async (req, res) => {
@@ -942,7 +1183,13 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
     return;
   }
 
-  const { user } = await provisionSupabaseAuthUser(cleanEmail, parsed.data.password, parsed.data.full_name, 'guardian');
+  const { user } = await provisionSupabaseAuthUser(
+    cleanEmail,
+    parsed.data.password,
+    parsed.data.full_name,
+    'guardian',
+    { updateExistingPassword: true }
+  );
   const { error: profErr } = await sb.from('profiles').upsert(
     {
       id: user.id,
@@ -987,6 +1234,245 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
       preferred_lang: 'ar',
     },
     student_code: studentRow.student_code,
+  });
+}));
+
+// Ephemeral single-use OAuth handoff store for cross-site iframe / COOP popup fallback
+const oauthHandoffMap = new Map<string, { access_token?: string; error?: string; expiresAt: number }>();
+const OAUTH_HANDOFF_TTL_MS = 120_000;
+const oauthHandoffReadLimiter = createRateLimiter(5 * 60 * 1000, 180);
+
+function pruneOauthHandoffMap() {
+  const now = Date.now();
+  for (const [k, v] of oauthHandoffMap.entries()) {
+    if (v.expiresAt <= now) oauthHandoffMap.delete(k);
+  }
+  while (oauthHandoffMap.size > 500) {
+    const oldest = oauthHandoffMap.keys().next().value;
+    if (!oldest) break;
+    oauthHandoffMap.delete(oldest);
+  }
+}
+
+app.post('/api/auth/oauth-handoff', loginLimiter, (req, res) => {
+  const schema = z.object({
+    state: z.string().regex(/^[a-zA-Z0-9_-]{16,96}$/),
+    access_token: z.string().max(8192).optional(),
+    error: z.string().max(300).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid OAuth handoff payload' });
+    return;
+  }
+  pruneOauthHandoffMap();
+  oauthHandoffMap.set(parsed.data.state, {
+    access_token: parsed.data.access_token,
+    error: parsed.data.error,
+    expiresAt: Date.now() + OAUTH_HANDOFF_TTL_MS,
+  });
+  res.json({ ok: true });
+});
+
+app.get('/api/auth/oauth-handoff/:state', oauthHandoffReadLimiter, (req, res) => {
+  const state = String(req.params.state || '');
+  if (!/^[a-zA-Z0-9_-]{16,96}$/.test(state)) {
+    res.status(400).json({ error: 'Invalid state' });
+    return;
+  }
+  pruneOauthHandoffMap();
+  const entry = oauthHandoffMap.get(state);
+  if (!entry) {
+    res.json({ ready: false });
+    return;
+  }
+  oauthHandoffMap.delete(state);
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ready: true,
+    access_token: entry.access_token || null,
+    error: entry.error || null,
+  });
+});
+
+app.get(['/auth/google-callback', '/auth/google-callback/'], (_req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(`<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Google Sign-In — أكاديمية نور وبيان</title>
+  <style>
+    body{font-family:system-ui,-apple-system,sans-serif;background:#FAF8F3;color:#0F213E;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:24px;text-align:center}
+    .box{max-width:400px;background:#fff;border:1px solid #E5DEC9;border-radius:16px;padding:28px;box-shadow:0 8px 30px rgba(15,33,62,.06)}
+    h1{font-size:18px;margin:0 0 10px}
+    p{font-size:14px;color:#475569;margin:0 0 18px;line-height:1.6}
+    button{background:#0F766E;color:#fff;border:0;border-radius:10px;padding:10px 18px;font-weight:700;font-size:13px;cursor:pointer}
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1 id="title">جاري إتمام التحقق من حساب Google...</h1>
+    <p id="msg">سيتم إرجاعك تلقائياً إلى المنصة خلال لحظات.</p>
+    <button type="button" onclick="window.close()">إغلاق النافذة</button>
+  </div>
+  <script>
+    (function(){
+      var hashParams = new URLSearchParams((window.location.hash || '').replace(/^#/, ''));
+      var queryParams = new URLSearchParams(window.location.search || '');
+      var state = queryParams.get('oauth_state') || '';
+      var accessToken = hashParams.get('access_token') || '';
+      var errorMsg = queryParams.get('error_description') || queryParams.get('error') || hashParams.get('error_description') || hashParams.get('error') || '';
+      var payload = { type: 'NB_GOOGLE_OAUTH', state: state, access_token: accessToken, error: errorMsg };
+
+      var titleEl = document.getElementById('title');
+      var msgEl = document.getElementById('msg');
+      if (errorMsg) {
+        if (titleEl) titleEl.textContent = 'تعذر إتمام تسجيل الدخول عبر Google';
+        if (msgEl) msgEl.textContent = errorMsg;
+      } else if (accessToken) {
+        if (titleEl) titleEl.textContent = 'تم التحقق من حساب Google بنجاح';
+        if (msgEl) msgEl.textContent = 'يمكنك العودة إلى نافذة المنصة أو إغلاق هذه النافذة.';
+      } else {
+        if (titleEl) titleEl.textContent = 'لم يتم استلام رمز التحقق';
+        if (msgEl) msgEl.textContent = 'يرجى إغلاق النافذة والمحاولة مرة أخرى.';
+        payload.error = 'Missing access token from Google OAuth callback.';
+      }
+
+      try {
+        if (window.opener && !window.opener.closed) {
+          window.opener.postMessage(payload, window.location.origin);
+        }
+      } catch (e) {}
+      try {
+        if (typeof BroadcastChannel !== 'undefined') {
+          var ch = new BroadcastChannel('nb_google_oauth');
+          ch.postMessage(payload);
+          ch.close();
+        }
+      } catch (e) {}
+      try {
+        localStorage.setItem('nb_google_oauth_result', JSON.stringify({ state: state, access_token: accessToken, error: payload.error, ts: Date.now() }));
+      } catch (e) {}
+
+      if (state && /^[a-zA-Z0-9_-]{16,96}$/.test(state)) {
+        fetch('/api/auth/oauth-handoff', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ state: state, access_token: accessToken || undefined, error: payload.error || undefined }),
+          keepalive: true
+        }).catch(function(){}).finally(function(){
+          setTimeout(function(){ try { window.close(); } catch(e){} }, 350);
+        });
+      } else {
+        setTimeout(function(){ try { window.close(); } catch(e){} }, 350);
+      }
+    })();
+  </script>
+</body>
+</html>`);
+});
+
+app.post('/api/auth/google', loginLimiter, asyncHandler(async (req, res) => {
+  const schema = z.object({
+    access_token: z.string().min(20).max(8192),
+    intent: z.enum(['login', 'prefill']).default('login'),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid Google OAuth token payload.' });
+    return;
+  }
+
+  const sb = requireSupabaseAdmin();
+  const { data: authData, error: authErr } = await sb.auth.getUser(parsed.data.access_token);
+  if (authErr || !authData?.user?.email) {
+    res.status(401).json({ error: 'Invalid or expired Google session token.' });
+    return;
+  }
+
+  const sbUser = authData.user;
+  const rawEmail = sbUser.email;
+  if (!rawEmail) {
+    res.status(401).json({ error: 'Invalid or expired Google session token.' });
+    return;
+  }
+  const emailVerified = Boolean(sbUser.email_confirmed_at || sbUser.user_metadata?.email_verified);
+  if (!emailVerified) {
+    res.status(403).json({ error: 'Your Google email must be verified to continue.' });
+    return;
+  }
+
+  const cleanEmail = rawEmail.trim().toLowerCase();
+  const googleName = String(
+    sbUser.user_metadata?.full_name || sbUser.user_metadata?.name || cleanEmail.split('@')[0]
+  ).trim();
+
+  if (parsed.data.intent === 'prefill') {
+    res.json({
+      status: 'prefill',
+      googleProfile: {
+        email: cleanEmail,
+        full_name: googleName,
+      },
+    });
+    return;
+  }
+
+  const { data: profile } = await sb
+    .from('profiles')
+    .select('id, email, full_name, role, is_active, preferred_lang')
+    .ilike('email', cleanEmail)
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (!profile) {
+    res.json({
+      status: 'needs_registration',
+      googleProfile: {
+        email: cleanEmail,
+        full_name: googleName,
+      },
+    });
+    return;
+  }
+
+  if (!profile.is_active) {
+    if (profile.role === 'student' || profile.role === 'teacher') {
+      const table = profile.role === 'student' ? 'students' : 'teachers';
+      const { data: linked } = await sb.from(table).select('id').eq('profile_id', profile.id).maybeSingle();
+      if (!linked) {
+        res.status(403).json({
+          error: 'Your application is pending administrator approval. Please wait until your account is activated.',
+          code: 'APPLICATION_PENDING',
+        });
+        return;
+      }
+    }
+    res.status(403).json({ error: 'Account is disabled. Please contact academy administration.' });
+    return;
+  }
+
+  const token = signToken({ id: profile.id, role: profile.role, exp: Date.now() + 1000 * 60 * 60 * 24 * 7 });
+  setSessionCookie(req, res, token);
+
+  await writeAuditLog(profile.id, profile.full_name, 'LOGIN_GOOGLE_OAUTH', 'profile', profile.id, {
+    email: cleanEmail,
+    role: profile.role,
+  });
+
+  res.json({
+    status: 'authenticated',
+    token,
+    user: {
+      id: profile.id,
+      email: profile.email,
+      full_name: profile.full_name,
+      role: profile.role,
+      preferred_lang: profile.preferred_lang,
+    },
   });
 }));
 
@@ -3471,11 +3957,22 @@ app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler
     return { ...rest, student_name_ar: s?.full_name_ar ?? null, course_title_ar: c?.title_ar ?? null };
   });
 
+  const [admissionMetaMap, teacherApplications] = await Promise.all([
+    listAdmissionMetas(sb),
+    listTeacherApplications(sb),
+  ]);
+
   const admissionRequests = (admissionsRes.data || []).map((ar: Record<string, unknown>) => {
     const c = ar.courses as { title_ar?: string } | null;
     const l = ar.levels as { name_ar?: string } | null;
     const { courses: _c, levels: _l, ...rest } = ar;
-    return { ...rest, course_title_ar: c?.title_ar ?? null, level_name_ar: l?.name_ar ?? null };
+    const meta = admissionMetaMap.get(Number(rest.id));
+    return {
+      ...rest,
+      course_title_ar: c?.title_ar ?? null,
+      level_name_ar: l?.name_ar ?? null,
+      student_email: meta?.student_email ?? null,
+    };
   });
 
   const announcements = (announcementsRes.data || []).map((a: Record<string, unknown>) => {
@@ -3546,6 +4043,7 @@ app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler
     lessonLinks: lessonLinksRes.data || [],
     enrollments,
     admissionRequests,
+    teacherApplications,
     announcements,
     exams,
     certificates,
@@ -3942,6 +4440,10 @@ app.delete('/api/admin/enrollments/:id', authenticate, requireRole('admin'), asy
 app.post('/api/admin/admissions/:id/decision', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = Number(req.params.id);
   const { decision, student_email } = req.body as { decision: 'approved' | 'rejected'; student_email?: string };
+  if (decision !== 'approved' && decision !== 'rejected') {
+    res.status(400).json({ error: 'Invalid decision' });
+    return;
+  }
   const sb = requireSupabaseAdmin();
 
   const { data: reqRow } = await sb.from('admission_requests').select('*').eq('id', id).maybeSingle();
@@ -3949,46 +4451,60 @@ app.post('/api/admin/admissions/:id/decision', authenticate, requireRole('admin'
     res.status(404).json({ error: 'Admission request not found' });
     return;
   }
+  if (reqRow.status !== 'pending') {
+    res.status(409).json({ error: 'This admission request has already been processed.' });
+    return;
+  }
 
+  const meta = await getAdmissionMeta(sb, id);
   await sb.from('admission_requests').update({ status: decision, reviewed_by: req.user!.id }).eq('id', id);
 
   let tempPassword: string | undefined;
+  let resolvedEmail = (student_email || meta?.student_email || `student.${id}@noorbayan.academy`).trim().toLowerCase();
+  let studentCode: string | undefined;
 
   if (decision === 'approved') {
-    const emailToUse = (student_email || `student.${id}@noorbayan.academy`).trim().toLowerCase();
-    const { data: existingProfile } = await sb.from('profiles').select('id').ilike('email', emailToUse).maybeSingle();
-
     let profileId: string;
-    if (existingProfile) {
-      profileId = existingProfile.id;
+    if (meta?.pending_profile_id) {
+      profileId = meta.pending_profile_id;
+      await sb.from('profiles').update({ is_active: true }).eq('id', profileId);
+      resolvedEmail = meta.student_email;
     } else {
-      tempPassword = generateTempPassword();
-      const { user } = await provisionSupabaseAuthUser(emailToUse, tempPassword, reqRow.student_name, 'student');
-      profileId = user.id;
-      await sb.from('profiles').upsert(
-        {
-          id: profileId,
-          email: emailToUse,
-          full_name: reqRow.student_name,
-          role: 'student',
-          is_active: true,
-          preferred_lang: 'ar',
-        },
-        { onConflict: 'id' }
-      );
+      const { data: existingProfile } = await sb.from('profiles').select('id, is_active').ilike('email', resolvedEmail).maybeSingle();
+      if (existingProfile) {
+        profileId = existingProfile.id;
+        if (!existingProfile.is_active) {
+          await sb.from('profiles').update({ is_active: true }).eq('id', profileId);
+        }
+      } else {
+        tempPassword = generateTempPassword();
+        const { user } = await provisionSupabaseAuthUser(resolvedEmail, tempPassword, reqRow.student_name, 'student');
+        profileId = user.id;
+        await sb.from('profiles').upsert(
+          {
+            id: profileId,
+            email: resolvedEmail,
+            full_name: reqRow.student_name,
+            role: 'student',
+            is_active: true,
+            preferred_lang: 'ar',
+          },
+          { onConflict: 'id' }
+        );
+      }
     }
 
     const guardian = await insertRowSafe<{ id: number }>('guardians', {
       full_name: reqRow.guardian_name,
       phone: reqRow.guardian_phone,
-      email: reqRow.guardian_email,
+      email: String(reqRow.guardian_email || '').trim().toLowerCase(),
     });
 
-    const code = await generateUniqueStudentCode();
+    studentCode = await generateUniqueStudentCode();
     const student = await insertRowSafe<{ id: number }>('students', {
       profile_id: profileId,
       guardian_id: guardian.id,
-      student_code: code,
+      student_code: studentCode,
       full_name_ar: reqRow.student_name,
       full_name_en: reqRow.student_name,
       age: reqRow.student_age,
@@ -4016,15 +4532,104 @@ app.post('/api/admin/admissions/:id/decision', authenticate, requireRole('admin'
       profile_id: profileId,
       title_ar: 'أهلاً بك في أكاديمية نور وبيان',
       title_en: 'Welcome to Noor & Bayan Academy',
-      body_ar: 'تم قبول طلب انضمامك وتفعيل حسابك بنجاح.',
-      body_en: 'Your admission request has been approved.',
+      body_ar: `تم قبول طلب انضمامك وتفعيل حسابك بنجاح. كود الطالب: ${studentCode}`,
+      body_en: `Your admission request has been approved. Student Code: ${studentCode}`,
     });
+  } else if (meta?.pending_profile_id) {
+    await deletePendingAuthProfileIfSafe(sb, meta.pending_profile_id);
   }
 
   await writeAuditLog(req.user!.id, req.user!.full_name, `ADMISSION_${decision.toUpperCase()}`, 'admission_request', id, {
     student_name: reqRow.student_name,
+    student_email: resolvedEmail,
   });
-  res.json({ ok: true, ...(tempPassword ? { temporary_password: tempPassword } : {}) });
+  void broadcastRealtimeEvent('academic:updated', { kind: 'admission' });
+  res.json({
+    ok: true,
+    student_email: resolvedEmail,
+    ...(studentCode ? { student_code: studentCode } : {}),
+    ...(tempPassword ? { temporary_password: tempPassword } : {}),
+  });
+}));
+
+app.post('/api/admin/teacher-applications/:id/decision', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const id = Number(req.params.id);
+  const schema = z.object({
+    decision: z.enum(['approved', 'rejected']),
+    hourly_rate: z.coerce.number().min(0).max(50000).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid teacher decision payload' });
+    return;
+  }
+
+  const sb = requireSupabaseAdmin();
+  const appRecord = await getTeacherApplication(sb, id);
+  if (!appRecord) {
+    res.status(404).json({ error: 'Teacher application not found' });
+    return;
+  }
+  if (appRecord.status !== 'pending') {
+    res.status(409).json({ error: 'This teacher application has already been processed.' });
+    return;
+  }
+
+  const { decision, hourly_rate } = parsed.data;
+  if (decision === 'approved') {
+    if (!appRecord.profile_id) {
+      res.status(400).json({ error: 'Missing applicant profile link' });
+      return;
+    }
+    await sb.from('profiles').update({ is_active: true, role: 'teacher' }).eq('id', appRecord.profile_id);
+    const teacher = await insertRowSafe<{ id: number }>('teachers', {
+      profile_id: appRecord.profile_id,
+      name_ar: appRecord.name_ar,
+      name_en: appRecord.name_en || appRecord.name_ar,
+      bio_ar: appRecord.bio_ar || '',
+      bio_en: appRecord.bio_ar || '',
+      qualifications_ar: appRecord.qualifications_ar || '',
+      qualifications_en: appRecord.qualifications_ar || '',
+      specialty_ar: appRecord.specialty_ar || '',
+      specialty_en: appRecord.specialty_ar || '',
+      avatar_url: '/assets/images/teacher_portrait_1.webp',
+      hourly_rate: hourly_rate ?? 180,
+      is_public: true,
+    });
+    await insertRowSafe('notifications', {
+      profile_id: appRecord.profile_id,
+      title_ar: 'تم اعتماد حسابك كمعلم في أكاديمية نور وبيان',
+      title_en: 'Teacher Account Approved',
+      body_ar: 'مرحباً بك في هيئة التدريس! يمكنك الآن تسجيل الدخول ومتابعة حلقاتك وطلابك.',
+      body_en: 'Welcome to our faculty! You can now sign in to manage your courses and students.',
+    });
+    await saveTeacherApplication(sb, {
+      ...appRecord,
+      status: 'approved',
+      reviewed_by: req.user!.id,
+      reviewed_at: new Date().toISOString(),
+    });
+    await writeAuditLog(req.user!.id, req.user!.full_name, 'TEACHER_APP_APPROVED', 'teacher', teacher.id, {
+      email: appRecord.email,
+      name_ar: appRecord.name_ar,
+    });
+    void broadcastRealtimeEvent('academic:updated', { kind: 'teacher' });
+    res.json({ ok: true, teacher_id: teacher.id, email: appRecord.email });
+    return;
+  }
+
+  await saveTeacherApplication(sb, {
+    ...appRecord,
+    status: 'rejected',
+    reviewed_by: req.user!.id,
+    reviewed_at: new Date().toISOString(),
+  });
+  await deletePendingAuthProfileIfSafe(sb, appRecord.profile_id);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'TEACHER_APP_REJECTED', 'teacher_application', id, {
+    email: appRecord.email,
+    name_ar: appRecord.name_ar,
+  });
+  res.json({ ok: true });
 }));
 
 app.post('/api/admin/announcements', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
@@ -4245,6 +4850,43 @@ app.patch('/api/admin/users/:id/role', authenticate, requireRole('admin'), async
     from: target.role,
     to: newRole,
     is_active: newActive,
+  });
+  res.json({ ok: true });
+}));
+
+app.post('/api/admin/users/:id/reset-password', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const id = String(req.params.id);
+  const parsed = z.object({ newPassword: z.string().min(8, 'Password must be at least 8 characters').max(128) }).safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'A new password of at least 8 characters is required.' });
+    return;
+  }
+
+  const sb = requireSupabaseAdmin();
+  const { data: target } = await sb
+    .from('profiles')
+    .select('id, email, full_name, role')
+    .eq('id', id)
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (!target) {
+    res.status(404).json({ error: 'User not found' });
+    return;
+  }
+
+  const { error: updErr } = await sb.auth.admin.updateUserById(id, {
+    password: parsed.data.newPassword,
+    email_confirm: true,
+  });
+  if (updErr) {
+    res.status(500).json({ error: updErr.message });
+    return;
+  }
+
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'ADMIN_RESET_USER_PASSWORD', 'profile', id, {
+    email: target.email,
+    role: target.role,
   });
   res.json({ ok: true });
 }));

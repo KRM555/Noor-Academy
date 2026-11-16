@@ -99,7 +99,7 @@ export function getSupabaseLaunchStatus() {
     supabaseHost,
     sessionSecretConfigured: Boolean(process.env.SESSION_SECRET && process.env.SESSION_SECRET.length >= 24),
     nodeEnv: process.env.NODE_ENV || 'development',
-    demoLoginEnabled: process.env.NODE_ENV !== 'production' && process.env.ALLOW_DEMO_LOGIN === 'true',
+    demoLoginEnabled: false,
     databaseEngine: 'supabase_postgresql' as const,
   };
 }
@@ -183,18 +183,39 @@ export async function pingSupabaseDatabase(): Promise<{
   }
 }
 
+export async function findSupabaseAuthUserByEmail(email: string) {
+  const client = requireSupabaseAdmin();
+  const normalizedEmail = email.trim().toLowerCase();
+  const { data: listed, error } = await client.auth.admin.listUsers({ page: 1, perPage: 1000 });
+  if (error) {
+    throw new Error(error.message);
+  }
+  return listed?.users?.find((u) => u.email?.toLowerCase() === normalizedEmail) || null;
+}
+
 export async function provisionSupabaseAuthUser(
   email: string,
   password: string,
   fullName: string,
-  role: 'student' | 'teacher' | 'admin' | 'guardian'
+  role: 'student' | 'teacher' | 'admin' | 'guardian',
+  options?: { updateExistingPassword?: boolean }
 ) {
   const client = requireSupabaseAdmin();
   const normalizedEmail = email.trim().toLowerCase();
 
-  const { data: listed } = await client.auth.admin.listUsers({ page: 1, perPage: 1000 });
-  const existing = listed?.users?.find((u) => u.email?.toLowerCase() === normalizedEmail);
+  const existing = await findSupabaseAuthUserByEmail(normalizedEmail);
   if (existing) {
+    if (options?.updateExistingPassword) {
+      const { data: updated, error: updErr } = await client.auth.admin.updateUserById(existing.id, {
+        password,
+        email_confirm: true,
+        user_metadata: { ...(existing.user_metadata || {}), full_name: fullName, role },
+      });
+      if (updErr || !updated.user) {
+        throw new Error(updErr?.message || 'Failed to update existing Supabase Auth user password');
+      }
+      return { user: updated.user, alreadyExisted: true };
+    }
     return { user: existing, alreadyExisted: true };
   }
 

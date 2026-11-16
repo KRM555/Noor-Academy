@@ -295,7 +295,10 @@ function RouterContent() {
     if (!user) {
       return (
         <PublicLayout currentPath="/login" onNavigate={navigate}>
-          <LoginPage onSuccess={() => navigate('/dashboard')} />
+          <LoginPage
+            onSuccess={() => navigate('/dashboard')}
+            onNavigateAdmission={(role) => navigate(role === 'teacher' ? '/apply-teacher' : '/apply')}
+          />
         </PublicLayout>
       );
     }
@@ -390,12 +393,13 @@ function RouterContent() {
         />
       )}
 
-      {path === '/apply' && (
+      {(path === '/apply' || path === '/admission' || path === '/apply-teacher') && (
         <AdmissionPage
           courses={overview?.courses || []}
           levels={overview?.levels || []}
           preselectedCourseId={preCourseId}
           preselectedLevelId={preLevelId}
+          initialMode={path === '/apply-teacher' ? 'teacher' : 'student'}
           onNavigate={navigate}
         />
       )}
@@ -429,6 +433,7 @@ function RouterContent() {
           onSuccess={() => {
             navigate('/dashboard');
           }}
+          onNavigateAdmission={(role) => navigate(role === 'teacher' ? '/apply-teacher' : '/apply')}
         />
       )}
     </PublicLayout>

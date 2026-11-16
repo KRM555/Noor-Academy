@@ -29,6 +29,9 @@ import {
   ExternalLink,
   Plus,
   FileSpreadsheet,
+  KeyRound,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { apiFetch } from '../../lib/api';
@@ -132,7 +135,30 @@ interface AdminData {
     link_type: 'zoom' | 'meet' | 'material' | 'recording';
   }>;
   enrollments: Array<{ id: number; student_id: number; course_id: number; student_name_ar: string; course_title_ar: string; status: string }>;
-  admissionRequests: Array<{ id: number; student_name: string; student_age: number; guardian_name: string; guardian_email: string; guardian_phone: string; course_title_ar: string; level_name_ar: string; status: string }>;
+  admissionRequests: Array<{
+    id: number;
+    student_name: string;
+    student_age: number;
+    student_email?: string | null;
+    guardian_name: string;
+    guardian_email: string;
+    guardian_phone: string;
+    course_title_ar: string;
+    level_name_ar: string;
+    status: string;
+  }>;
+  teacherApplications?: Array<{
+    id: number;
+    email: string;
+    name_ar: string;
+    name_en: string;
+    phone: string;
+    specialty_ar: string;
+    qualifications_ar: string;
+    bio_ar: string;
+    status: 'pending' | 'approved' | 'rejected';
+    created_at: string;
+  }>;
   announcements: Array<{ id: number; title_ar: string; body_ar: string; target_scope: string; course_title_ar: string | null; created_at: string }>;
   exams: ManagedExamItem[];
   certificates: Array<{ id: number; verification_code: string; student_id: number; student_name_ar: string; course_title_ar: string; title_ar: string; title_en: string; grade_label: string; issued_at: string; revoked_at: string | null }>;
@@ -240,6 +266,10 @@ export function AdminDashboard({
   });
   const [newCert, setNewCert] = useState({ student_id: '1', course_id: '1', title_ar: 'شهادة إتمام المستوى', title_en: 'Level Completion Certificate', grade_label: 'امتياز · 98%' });
   const [newPay, setNewPay] = useState({ teacher_id: '1', month_year: '2026-11', base_amount: '5400', bonus_amount: '250', deduction_amount: '0' });
+  const [resetTargetUser, setResetTargetUser] = useState<{ id: string | number; email: string; full_name: string } | null>(null);
+  const [adminNewPassword, setAdminNewPassword] = useState('');
+  const [showAdminNewPassword, setShowAdminNewPassword] = useState(false);
+  const [resettingUserPass, setResettingUserPass] = useState(false);
 
   const { data, isLoading, error } = useQuery({
     queryKey: queryKeys.adminDashboard(user?.id),
@@ -1486,22 +1516,51 @@ export function AdminDashboard({
 
   if (activeTab === 'admissions') {
     const decide = async (id: number, decision: 'approved' | 'rejected') => {
-      const res = await apiFetch<{ ok: boolean; temporary_password?: string }>(`/api/admin/admissions/${id}/decision`, { method: 'POST', body: JSON.stringify({ decision }) });
-      if (decision === 'approved') {
+      try {
+        const res = await apiFetch<{ ok: boolean; student_code?: string; temporary_password?: string }>(
+          `/api/admin/admissions/${id}/decision`,
+          { method: 'POST', body: JSON.stringify({ decision }) }
+        );
+        if (decision === 'approved') {
+          toast(
+            res.temporary_password
+              ? lang === 'ar'
+                ? `تم القبول وتفعيل الحساب (${res.student_code || ''}) — كلمة المرور المؤقتة: ${res.temporary_password}`
+                : `Approved & linked (${res.student_code || ''}) — Temp password: ${res.temporary_password}`
+              : lang === 'ar'
+              ? `تم القبول وتفعيل حساب الطالب بكلمة مروره (${res.student_code || ''})`
+              : `Approved & student account activated (${res.student_code || ''})`,
+            'success'
+          );
+        } else {
+          toast(lang === 'ar' ? 'تم رفض الطلب وإلغاء التفعيل' : 'Request rejected', 'success');
+        }
+        loadData();
+      } catch (err: unknown) {
+        toast(err instanceof Error ? err.message : 'Error', 'error');
+      }
+    };
+
+    const decideTeacherApp = async (id: number, decision: 'approved' | 'rejected') => {
+      try {
+        await apiFetch(`/api/admin/teacher-applications/${id}/decision`, {
+          method: 'POST',
+          body: JSON.stringify({ decision }),
+        });
         toast(
-          res.temporary_password
+          decision === 'approved'
             ? lang === 'ar'
-              ? `تم القبول وتفعيل الحساب — كلمة المرور المؤقتة: ${res.temporary_password}`
-              : `Approved & linked — Temp password: ${res.temporary_password}`
+              ? 'تم قبول المعلم وتفعيل حسابه بصلاحيات المعلم'
+              : 'Teacher approved and portal activated'
             : lang === 'ar'
-            ? 'تم القبول وربط حساب الطالب بالحلقة'
-            : 'Approved & student account linked',
+            ? 'تم رفض طلب المعلم'
+            : 'Teacher application rejected',
           'success'
         );
-      } else {
-        toast(lang === 'ar' ? 'تم رفض الطلب' : 'Request rejected', 'success');
+        loadData();
+      } catch (err: unknown) {
+        toast(err instanceof Error ? err.message : 'Error', 'error');
       }
-      loadData();
     };
 
     const filteredAdmissions = data.admissionRequests.filter((r) => {
@@ -1510,24 +1569,37 @@ export function AdminDashboard({
       if (!q) return true;
       return (
         r.student_name.toLowerCase().includes(q) ||
+        (r.student_email || '').toLowerCase().includes(q) ||
         r.guardian_name.toLowerCase().includes(q) ||
         r.guardian_email.toLowerCase().includes(q) ||
         r.guardian_phone.toLowerCase().includes(q)
       );
     });
 
+    const teacherApps = (data.teacherApplications || []).filter((t) => {
+      if (admissionFilter !== 'all' && t.status !== admissionFilter) return false;
+      const q = admissionSearch.trim().toLowerCase();
+      if (!q) return true;
+      return (
+        t.name_ar.toLowerCase().includes(q) ||
+        t.email.toLowerCase().includes(q) ||
+        t.specialty_ar.toLowerCase().includes(q) ||
+        t.phone.toLowerCase().includes(q)
+      );
+    });
+
     return (
-      <div className="space-y-4">
+      <div className="space-y-6">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-xl font-extrabold">{lang === 'ar' ? 'طلبات التقديم' : 'Admission Requests'}</h2>
+          <h2 className="text-xl font-extrabold">{lang === 'ar' ? 'طلبات التقديم (طلاب ومعلمون)' : 'Applications (Students & Teachers)'}</h2>
           <SecondaryButton
             type="button"
             className="text-xs"
             onClick={() =>
               exportCsv(
                 'admissions.csv',
-                ['Student', 'Age', 'Guardian', 'Guardian Email', 'Guardian Phone', 'Course', 'Status'],
-                filteredAdmissions.map((r) => [r.student_name, r.student_age, r.guardian_name, r.guardian_email, r.guardian_phone, r.course_title_ar, r.status])
+                ['Student', 'Age', 'Student Email', 'Guardian', 'Guardian Email', 'Guardian Phone', 'Course', 'Status'],
+                filteredAdmissions.map((r) => [r.student_name, r.student_age, r.student_email || '', r.guardian_name, r.guardian_email, r.guardian_phone, r.course_title_ar, r.status])
               )
             }
           >
@@ -1564,49 +1636,111 @@ export function AdminDashboard({
             <input
               value={admissionSearch}
               onChange={(e) => setAdmissionSearch(e.target.value)}
-              placeholder={lang === 'ar' ? 'بحث في الطلبات...' : 'Search admissions...'}
+              placeholder={lang === 'ar' ? 'بحث في الطلبات...' : 'Search applications...'}
               className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#0F213E] ps-9 pe-3 py-1.5 text-sm"
             />
           </div>
         </div>
 
-        <ResponsiveTable
-          data={filteredAdmissions}
-          emptyTitle={lang === 'ar' ? 'لا توجد طلبات تقديم' : 'No admission requests'}
-          columns={[
-            { key: 'student', header: lang === 'ar' ? 'الطالب' : 'Student', render: (r) => `${r.student_name} (${r.student_age})` },
-            {
-              key: 'guardian',
-              header: lang === 'ar' ? 'ولي الأمر' : 'Guardian',
-              render: (r) => (
-                <div className="text-xs">
-                  <div className="font-semibold">{r.guardian_name}</div>
-                  <div className="text-slate-500 font-mono-tabular">{r.guardian_phone} · {r.guardian_email}</div>
-                </div>
-              ),
-            },
-            { key: 'course', header: lang === 'ar' ? 'الحلقة' : 'Preferred Course', render: (r) => r.course_title_ar || '—' },
-            { key: 'status', header: lang === 'ar' ? 'الحالة' : 'Status', render: (r) => r.status },
-            {
-              key: 'act',
-              header: lang === 'ar' ? 'القرار' : 'Action',
-              align: 'end',
-              render: (r) =>
-                r.status === 'pending' ? (
-                  <div className="inline-flex gap-2">
-                    <button onClick={() => decide(r.id, 'approved')} className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-bold bg-[#0F766E] text-white cursor-pointer">
-                      <CheckCircle2 className="w-3.5 h-3.5" /> {lang === 'ar' ? 'قبول' : 'Approve'}
-                    </button>
-                    <button onClick={() => decide(r.id, 'rejected')} className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-bold bg-red-700 text-white cursor-pointer">
-                      <XCircle className="w-3.5 h-3.5" /> {lang === 'ar' ? 'رفض' : 'Reject'}
-                    </button>
+        <div className="space-y-3">
+          <h3 className="text-base font-extrabold">{lang === 'ar' ? 'طلبات التحاق الطلاب' : 'Student Admission Requests'}</h3>
+          <ResponsiveTable
+            data={filteredAdmissions}
+            emptyTitle={lang === 'ar' ? 'لا توجد طلبات طلاب' : 'No student requests'}
+            columns={[
+              {
+                key: 'student',
+                header: lang === 'ar' ? 'الطالب' : 'Student',
+                render: (r) => (
+                  <div className="text-xs">
+                    <div className="font-bold">{r.student_name} ({r.student_age})</div>
+                    {r.student_email && <div className="text-[#0F766E] dark:text-[#2DD4BF] font-mono-tabular">{r.student_email}</div>}
                   </div>
-                ) : (
-                  <span>—</span>
                 ),
-            },
-          ]}
-        />
+              },
+              {
+                key: 'guardian',
+                header: lang === 'ar' ? 'ولي الأمر' : 'Guardian',
+                render: (r) => (
+                  <div className="text-xs">
+                    <div className="font-semibold">{r.guardian_name}</div>
+                    <div className="text-slate-500 font-mono-tabular">{r.guardian_phone} · {r.guardian_email}</div>
+                  </div>
+                ),
+              },
+              { key: 'course', header: lang === 'ar' ? 'الحلقة' : 'Preferred Course', render: (r) => r.course_title_ar || '—' },
+              { key: 'status', header: lang === 'ar' ? 'الحالة' : 'Status', render: (r) => r.status },
+              {
+                key: 'act',
+                header: lang === 'ar' ? 'القرار' : 'Action',
+                align: 'end',
+                render: (r) =>
+                  r.status === 'pending' ? (
+                    <div className="inline-flex gap-2">
+                      <button onClick={() => decide(r.id, 'approved')} className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-bold bg-[#0F766E] text-white cursor-pointer">
+                        <CheckCircle2 className="w-3.5 h-3.5" /> {lang === 'ar' ? 'قبول' : 'Approve'}
+                      </button>
+                      <button onClick={() => decide(r.id, 'rejected')} className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-bold bg-red-700 text-white cursor-pointer">
+                        <XCircle className="w-3.5 h-3.5" /> {lang === 'ar' ? 'رفض' : 'Reject'}
+                      </button>
+                    </div>
+                  ) : (
+                    <span>—</span>
+                  ),
+              },
+            ]}
+          />
+        </div>
+
+        <div className="space-y-3 pt-2">
+          <h3 className="text-base font-extrabold">{lang === 'ar' ? 'طلبات انضمام المعلمين' : 'Teacher Faculty Applications'}</h3>
+          <ResponsiveTable
+            data={teacherApps}
+            emptyTitle={lang === 'ar' ? 'لا توجد طلبات معلمين' : 'No teacher applications'}
+            columns={[
+              {
+                key: 'teacher',
+                header: lang === 'ar' ? 'المعلم' : 'Applicant',
+                render: (r) => (
+                  <div className="text-xs">
+                    <div className="font-bold">{r.name_ar}</div>
+                    <div className="text-[#0F766E] dark:text-[#2DD4BF] font-mono-tabular">{r.email}</div>
+                    <div className="text-slate-500 font-mono-tabular">{r.phone}</div>
+                  </div>
+                ),
+              },
+              {
+                key: 'specialty',
+                header: lang === 'ar' ? 'التخصص والمؤهل' : 'Specialty & Qualifications',
+                render: (r) => (
+                  <div className="text-xs max-w-xs">
+                    <div className="font-semibold">{r.specialty_ar}</div>
+                    <div className="text-slate-500">{r.qualifications_ar}</div>
+                  </div>
+                ),
+              },
+              { key: 'status', header: lang === 'ar' ? 'الحالة' : 'Status', render: (r) => r.status },
+              {
+                key: 'act',
+                header: lang === 'ar' ? 'القرار' : 'Action',
+                align: 'end',
+                render: (r) =>
+                  r.status === 'pending' ? (
+                    <div className="inline-flex gap-2">
+                      <button onClick={() => decideTeacherApp(r.id, 'approved')} className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-bold bg-[#0F766E] text-white cursor-pointer">
+                        <CheckCircle2 className="w-3.5 h-3.5" /> {lang === 'ar' ? 'اعتماد معلم' : 'Approve'}
+                      </button>
+                      <button onClick={() => decideTeacherApp(r.id, 'rejected')} className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-bold bg-red-700 text-white cursor-pointer">
+                        <XCircle className="w-3.5 h-3.5" /> {lang === 'ar' ? 'رفض' : 'Reject'}
+                      </button>
+                    </div>
+                  ) : (
+                    <span>—</span>
+                  ),
+              },
+            ]}
+          />
+        </div>
       </div>
     );
   }
@@ -1945,8 +2079,107 @@ export function AdminDashboard({
               </select>
             ),
           },
+          {
+            key: 'actions',
+            header: lang === 'ar' ? 'كلمة المرور' : 'Password',
+            render: (r) => (
+              <button
+                type="button"
+                onClick={() => {
+                  setResetTargetUser({ id: r.id, email: r.email, full_name: r.full_name });
+                  setAdminNewPassword('');
+                  setShowAdminNewPassword(false);
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#13284A] hover:border-[#C98A1E] px-2.5 py-1 text-xs font-bold cursor-pointer"
+              >
+                <KeyRound className="w-3.5 h-3.5 text-[#C98A1E]" />
+                <span>{lang === 'ar' ? 'تعيين كلمة مرور' : 'Set Password'}</span>
+              </button>
+            ),
+          },
         ]}
       />
+
+      {resetTargetUser && (
+        <Card className="p-5 space-y-3 border-[#C98A1E]/50">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-sm font-extrabold">
+              <KeyRound className="w-4 h-4 text-[#C98A1E]" />
+              <span>
+                {lang === 'ar'
+                  ? `تعيين كلمة مرور جديدة للحساب: ${resetTargetUser.full_name} (${resetTargetUser.email})`
+                  : `Set New Password for ${resetTargetUser.full_name} (${resetTargetUser.email})`}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setResetTargetUser(null);
+                setAdminNewPassword('');
+              }}
+              className="text-xs text-slate-500 hover:underline cursor-pointer"
+            >
+              {lang === 'ar' ? 'إغلاق' : 'Close'}
+            </button>
+          </div>
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              if (adminNewPassword.length < 8) {
+                toast(lang === 'ar' ? 'كلمة المرور يجب أن تكون 8 أحرف على الأقل' : 'Password must be at least 8 characters', 'error');
+                return;
+              }
+              setResettingUserPass(true);
+              try {
+                await apiFetch(`/api/admin/users/${resetTargetUser.id}/reset-password`, {
+                  method: 'POST',
+                  body: JSON.stringify({ newPassword: adminNewPassword }),
+                });
+                toast(
+                  lang === 'ar'
+                    ? `تم تعيين كلمة المرور الجديدة لحساب ${resetTargetUser.email} بنجاح`
+                    : `Password updated for ${resetTargetUser.email}`,
+                  'success'
+                );
+                setResetTargetUser(null);
+                setAdminNewPassword('');
+              } catch (err: unknown) {
+                toast(err instanceof Error ? err.message : 'Reset failed', 'error');
+              } finally {
+                setResettingUserPass(false);
+              }
+            }}
+            className="flex flex-wrap items-center gap-3"
+          >
+            <div className="relative flex-1 min-w-[220px]">
+              <input
+                type={showAdminNewPassword ? 'text' : 'password'}
+                dir="ltr"
+                autoComplete="new-password"
+                required
+                minLength={8}
+                value={adminNewPassword}
+                onChange={(e) => setAdminNewPassword(e.target.value)}
+                placeholder={lang === 'ar' ? 'أدخل كلمة المرور الجديدة (8 أحرف فأكثر)' : 'Enter new password (8+ chars)'}
+                className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] pl-3.5 pr-10 py-2 text-sm"
+              />
+              <button
+                type="button"
+                onClick={() => setShowAdminNewPassword((v) => !v)}
+                aria-label={showAdminNewPassword ? 'Hide password' : 'Show password'}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-[#0F213E] dark:hover:text-[#F8F5EC] cursor-pointer"
+              >
+                {showAdminNewPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
+            <PrimaryButton type="submit" disabled={resettingUserPass} className="text-xs">
+              {resettingUserPass
+                ? lang === 'ar' ? 'جاري الحفظ...' : 'Saving...'
+                : lang === 'ar' ? 'حفظ كلمة المرور الجديدة' : 'Save New Password'}
+            </PrimaryButton>
+          </form>
+        </Card>
+      )}
 
       <ChangePasswordCard />
 

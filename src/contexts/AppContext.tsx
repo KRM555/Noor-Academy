@@ -20,7 +20,6 @@ interface AppContextValue {
   user: AuthUser | null;
   authLoading: boolean;
   loginWithCredentials: (email: string, password: string) => Promise<AuthUser>;
-  loginDemoRole: (demoRole: 'admin' | 'teacher1' | 'teacher2' | 'student' | 'guardian') => Promise<AuthUser>;
   setAuthSession: (token: string, user: AuthUser) => void;
   logout: () => void;
   notifications: NotificationItem[];
@@ -137,17 +136,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return res.user;
   };
 
-  const loginDemoRole = async (demoRole: 'admin' | 'teacher1' | 'teacher2' | 'student' | 'guardian') => {
-    const res = await apiFetch<{ token: string; user: AuthUser }>('/api/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ demoRole }),
-    });
-    setStoredToken(res.token);
-    setUser(res.user);
-    void qc.invalidateQueries({ queryKey: queryKeys.notifications(res.user.id) });
-    return res.user;
-  };
-
   const setAuthSession = useCallback(
     (token: string, nextUser: AuthUser) => {
       setStoredToken(token);
@@ -178,7 +166,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         user,
         authLoading,
         loginWithCredentials,
-        loginDemoRole,
         setAuthSession,
         logout,
         notifications,
