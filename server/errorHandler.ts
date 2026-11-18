@@ -57,13 +57,18 @@ export function globalErrorHandler(err: unknown, req: Request, res: Response, ne
     return;
   }
 
-  // 3. Malformed JSON body from express.json()
-  if (err instanceof SyntaxError && 'status' in err && (err as { status?: number }).status === 400) {
+  // 3. Malformed JSON or PayloadTooLargeError from express.json()
+  const bodyErr = err as { status?: number; statusCode?: number; type?: string; code?: string; message?: string } | undefined;
+  if (err instanceof SyntaxError && bodyErr?.status === 400) {
     res.status(400).json({ error: 'Invalid JSON request body' });
     return;
   }
+  if (bodyErr?.status === 413 || bodyErr?.statusCode === 413 || bodyErr?.type === 'entity.too.large') {
+    res.status(413).json({ error: 'Request payload is too large' });
+    return;
+  }
 
-  const errObj = err as { code?: string; message?: string } | undefined;
+  const errObj = bodyErr;
   const message = err instanceof Error ? err.message : String(errObj?.message || 'Internal server error');
   const code = errObj?.code;
 

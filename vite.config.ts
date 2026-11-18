@@ -23,7 +23,7 @@ export default defineConfig(() => {
           name: 'أكاديمية نور وبيان | Noor & Bayan Academy',
           short_name: 'نور وبيان',
           description:
-            'منصة تعليمية متكاملة لتحفيظ القرآن الكريم ونور البيان واللغة العربية للأطفال بمناهج تربوية وألعاب تفاعلية.',
+            'منصة تعليمية شاملة للقرآن الكريم والعلوم الإسلامية، اللغة العربية ونور البيان، اللغات، المناهج الدولية، الحساب الذهني وتنمية المهارات والنطق.',
           theme_color: '#0F213E',
           background_color: '#FAF8F3',
           display: 'standalone',
@@ -54,7 +54,8 @@ export default defineConfig(() => {
         },
         workbox: {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
-          maximumFileSizeToCacheInBytes: 12 * 1024 * 1024,
+          globIgnores: ['**/vendor-three*', '**/vendor-pdf*', '**/vendor-charts*'],
+          maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
           navigateFallbackDenylist: [/^\/api\//],
           runtimeCaching: [
             {

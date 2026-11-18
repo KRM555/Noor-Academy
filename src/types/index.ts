@@ -27,8 +27,13 @@ export interface Course {
   schedule_ar: string;
   schedule_en: string;
   price_monthly: number;
+  price_monthly_sar?: number | null;
   capacity: number;
   is_featured: number | boolean;
+  cover_url?: string | null;
+  co_teacher_ids?: number[];
+  co_teacher_names_ar?: string[];
+  co_teacher_names_en?: string[];
 }
 
 export interface Teacher {
@@ -123,3 +128,78 @@ export interface PublicOverview {
   testimonials: Testimonial[];
   legal: LegalDocument[];
 }
+
+export interface CommunityReply {
+  id: string;
+  author_name: string;
+  author_role: UserRole;
+  content: string;
+  created_at: string;
+  is_mine?: boolean;
+}
+
+export interface CommunityComment {
+  id: string;
+  author_name: string;
+  author_role: UserRole;
+  rating: number;
+  content: string;
+  is_visible: boolean;
+  is_mine?: boolean;
+  replies: CommunityReply[];
+  created_at: string;
+  updated_at: string;
+}
+
+export type SuggestionCategory = 'platform' | 'curriculum' | 'experience' | 'other';
+export type SuggestionStatus = 'pending' | 'reviewing' | 'planned' | 'implemented' | 'declined';
+
+export interface AcademySuggestion {
+  id: string;
+  author_name: string;
+  author_role: UserRole;
+  category: SuggestionCategory;
+  title: string;
+  description: string;
+  status: SuggestionStatus;
+  admin_reply: string;
+  replied_by_name: string | null;
+  replied_at: string | null;
+  votes_count: number;
+  has_voted: boolean;
+  is_mine?: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PlacementQuestionPublic {
+  id: string;
+  q_ar: string;
+  q_en: string;
+  opts_ar: string[];
+  opts_en: string[];
+}
+
+export interface PlacementQuestionAdmin extends PlacementQuestionPublic {
+  correct_index: number;
+}
+
+export interface PlacementTestPublicConfig {
+  intro_ar: string;
+  intro_en: string;
+  questions: PlacementQuestionPublic[];
+  updated_at: string;
+}
+
+export interface PlacementTestAdminConfig {
+  intro_ar: string;
+  intro_en: string;
+  questions: PlacementQuestionAdmin[];
+  thresholds: {
+    intermediate_min_score: number;
+    advanced_min_score: number;
+    advanced_min_age: number;
+  };
+  updated_at: string;
+}
+

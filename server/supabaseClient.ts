@@ -186,36 +186,54 @@ export async function pingSupabaseDatabase(): Promise<{
 export async function findSupabaseAuthUserByEmail(email: string) {
   const client = requireSupabaseAdmin();
   const normalizedEmail = email.trim().toLowerCase();
-  const { data: listed, error } = await client.auth.admin.listUsers({ page: 1, perPage: 1000 });
-  if (error) {
-    throw new Error(error.message);
+  const perPage = 1000;
+  for (let page = 1; page <= 50; page++) {
+    const { data: listed, error } = await client.auth.admin.listUsers({ page, perPage });
+    if (error) {
+      throw new Error(error.message);
+    }
+    const users = listed?.users || [];
+    const match = users.find((u) => u.email?.toLowerCase() === normalizedEmail);
+    if (match) return match;
+    if (users.length < perPage) break;
   }
-  return listed?.users?.find((u) => u.email?.toLowerCase() === normalizedEmail) || null;
+  return null;
+}
+
+export async function verifyVerifiedGoogleToken(sb: SupabaseClient, accessToken: string) {
+  const { data: authData, error: authErr } = await sb.auth.getUser(accessToken);
+  if (authErr || !authData?.user?.email) {
+    return null;
+  }
+  const sbUser = authData.user;
+  const appProviders = Array.isArray(sbUser.app_metadata?.providers)
+    ? (sbUser.app_metadata.providers as string[])
+    : [];
+  const identityProviders = Array.isArray(sbUser.identities)
+    ? sbUser.identities.map((id) => id.provider).filter((p): p is string => Boolean(p))
+    : [];
+  const allProviders = new Set([...appProviders, ...identityProviders]);
+  if (!sbUser.email_confirmed_at || !sbUser.email || !allProviders.has('google')) {
+    return null;
+  }
+  const cleanEmail = sbUser.email.trim().toLowerCase();
+  const fullName = String(
+    sbUser.user_metadata?.full_name || sbUser.user_metadata?.name || cleanEmail.split('@')[0]
+  ).trim();
+  return { user: sbUser, email: cleanEmail, fullName };
 }
 
 export async function provisionSupabaseAuthUser(
   email: string,
   password: string,
   fullName: string,
-  role: 'student' | 'teacher' | 'admin' | 'guardian',
-  options?: { updateExistingPassword?: boolean }
+  role: 'student' | 'teacher' | 'admin' | 'guardian'
 ) {
   const client = requireSupabaseAdmin();
   const normalizedEmail = email.trim().toLowerCase();
 
   const existing = await findSupabaseAuthUserByEmail(normalizedEmail);
   if (existing) {
-    if (options?.updateExistingPassword) {
-      const { data: updated, error: updErr } = await client.auth.admin.updateUserById(existing.id, {
-        password,
-        email_confirm: true,
-        user_metadata: { ...(existing.user_metadata || {}), full_name: fullName, role },
-      });
-      if (updErr || !updated.user) {
-        throw new Error(updErr?.message || 'Failed to update existing Supabase Auth user password');
-      }
-      return { user: updated.user, alreadyExisted: true };
-    }
     return { user: existing, alreadyExisted: true };
   }
 
@@ -236,12 +254,20 @@ export async function syncUsersToSupabaseAuth(
 ): Promise<{ created: number; existing: number; errors: string[] }> {
   const client = requireSupabaseAdmin();
 
-  const { data: listed, error: listErr } = await client.auth.admin.listUsers({ page: 1, perPage: 1000 });
-  if (listErr) {
-    throw new Error(listErr.message);
+  const existingEmails = new Set<string>();
+  const perPage = 1000;
+  for (let page = 1; page <= 50; page++) {
+    const { data: listed, error: listErr } = await client.auth.admin.listUsers({ page, perPage });
+    if (listErr) {
+      throw new Error(listErr.message);
+    }
+    const batch = listed?.users || [];
+    for (const u of batch) {
+      if (u.email) existingEmails.add(u.email.toLowerCase());
+    }
+    if (batch.length < perPage) break;
   }
 
-  const existingEmails = new Set((listed?.users || []).map((u) => (u.email || '').toLowerCase()));
   let created = 0;
   let existing = 0;
   const errors: string[] = [];

@@ -13,19 +13,19 @@ import {
   ClipboardList,
   Wallet,
   CreditCard,
-  Layers,
   UserPlus,
   Scale,
   History,
   Settings,
   GraduationCap,
   KeyRound,
+  MessageSquare,
 } from 'lucide-react';
 import { QueryClientProvider, useQuery } from '@tanstack/react-query';
 import { AppProvider, useApp } from './contexts/AppContext';
 import { apiFetch } from './lib/api';
 import { queryClient, queryKeys } from './lib/queryClient';
-import type { PublicOverview } from './types';
+import type { AcademySuggestion, PublicOverview } from './types';
 import { PublicLayout } from './components/public/PublicLayout';
 import { HomePage } from './pages/public/HomePage';
 import { PlacementTestPage } from './pages/public/PlacementTestPage';
@@ -43,6 +43,7 @@ import {
 import { LoginPage } from './pages/auth/LoginPage';
 import { DashboardShell, type NavTab } from './components/dashboard/DashboardShell';
 import { LoadingState } from './components/ui/CommonUI';
+import { ErrorBoundary } from './components/ui/ErrorBoundary';
 
 const StudentDashboard = lazy(() =>
   import('./pages/dashboard/StudentDashboard').then((m) => ({ default: m.StudentDashboard }))
@@ -71,7 +72,7 @@ import { useSupabaseRealtime } from './hooks/useSupabaseRealtime';
 const ALL_DASHBOARD_TABS: NavTab[] = [
   // Student & Guardian Tabs
   { id: 'home', label_ar: 'الرئيسية', label_en: 'Home', icon: Home, allowedRoles: ['student', 'teacher', 'guardian'] },
-  { id: 'lessons', label_ar: 'دروسي واللينكات', label_en: 'My Lessons', icon: BookOpen, allowedRoles: ['student', 'admin'] },
+  { id: 'lessons', label_ar: 'دروسي واللينكات', label_en: 'My Lessons', icon: BookOpen, allowedRoles: ['student'] },
   { id: 'schedule', label_ar: 'الجدول', label_en: 'Schedule', icon: Calendar, allowedRoles: ['student'] },
   { id: 'exams', label_ar: 'الامتحانات', label_en: 'Exams', icon: FileCheck, allowedRoles: ['student', 'admin'] },
   { id: 'recitations', label_ar: 'التسميع والتقييم', label_en: 'Recitations', icon: ClipboardList, allowedRoles: ['student'] },
@@ -92,12 +93,45 @@ const ALL_DASHBOARD_TABS: NavTab[] = [
   // Admin Tabs (strictly admin)
   { id: 'overview', label_ar: 'نظرة عامة', label_en: 'Overview', icon: Home, allowedRoles: ['admin'] },
   { id: 'teachers', label_ar: 'المعلمون', label_en: 'Teachers', icon: GraduationCap, allowedRoles: ['admin'] },
-  { id: 'levels', label_ar: 'المستويات والتسجيل', label_en: 'Levels & Enroll', icon: Layers, allowedRoles: ['admin'] },
   { id: 'admissions', label_ar: 'طلبات التقديم', label_en: 'Admissions', icon: UserPlus, allowedRoles: ['admin'] },
+  { id: 'community', label_ar: 'التعليقات والمقترحات', label_en: 'Reviews & Ideas', icon: MessageSquare, allowedRoles: ['admin'] },
   { id: 'legal', label_ar: 'الشروط والخصوصية', label_en: 'Legal Docs', icon: Scale, allowedRoles: ['admin'] },
   { id: 'audit', label_ar: 'سجل العمليات', label_en: 'Audit Logs', icon: History, allowedRoles: ['admin'] },
   { id: 'settings', label_ar: 'الإعدادات والأدوار', label_en: 'Settings & Roles', icon: Settings, allowedRoles: ['admin'] },
 ];
+
+const ADMIN_TAB_ORDER = [
+  'overview',
+  'admissions',
+  'courses',
+  'students',
+  'teachers',
+  'exams',
+  'certificates',
+  'announcements',
+  'community',
+  'payroll',
+  'games',
+  'settings',
+  'legal',
+  'audit',
+];
+
+function getDashboardTabsForRole(role?: string): NavTab[] {
+  if (role === 'admin') {
+    const adminTabs = ALL_DASHBOARD_TABS.filter((t) => t.allowedRoles.includes('admin')).map((t) => {
+      if (t.id === 'students') return { ...t, label_ar: 'الطلاب', label_en: 'Students' };
+      if (t.id === 'payroll') return { ...t, label_ar: 'الرواتب', label_en: 'Payroll' };
+      return t;
+    });
+    return adminTabs.sort((a, b) => {
+      const ia = ADMIN_TAB_ORDER.indexOf(a.id);
+      const ib = ADMIN_TAB_ORDER.indexOf(b.id);
+      return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
+    });
+  }
+  return ALL_DASHBOARD_TABS;
+}
 
 function getDefaultTabForRole(role?: string): string {
   if (role === 'admin') return 'overview';
@@ -116,6 +150,26 @@ function RouterContent() {
     queryKey: queryKeys.publicOverview,
     queryFn: () => apiFetch<PublicOverview>('/api/public/overview'),
     staleTime: 2 * 60 * 1000,
+  });
+
+  const { data: adminSummary } = useQuery({
+    queryKey: queryKeys.adminDashboard(user?.id),
+    queryFn: () =>
+      apiFetch<{
+        admissionRequests?: Array<{ status: string }>;
+        teacherApplications?: Array<{ status: string }>;
+        guardianRequests?: Array<{ status: string }>;
+        exams?: Array<{ pending_grading_count?: number }>;
+      }>('/api/admin/dashboard'),
+    enabled: user?.role === 'admin',
+    staleTime: 60 * 1000,
+  });
+
+  const { data: adminCommSummary } = useQuery({
+    queryKey: queryKeys.adminCommunity,
+    queryFn: () => apiFetch<{ suggestions?: AcademySuggestion[] }>('/api/admin/community'),
+    enabled: user?.role === 'admin',
+    staleTime: 60 * 1000,
   });
 
   const navigate = useCallback((nextPath: string) => {
@@ -142,22 +196,22 @@ function RouterContent() {
   useEffect(() => {
     const seoMap: Record<string, { titleAr: string; titleEn: string; descAr: string; descEn: string }> = {
       '/': {
-        titleAr: 'أكاديمية نور وبيان — تعليم القرآن واللغة العربية والمناهج الدولية أونلاين',
-        titleEn: 'Noor & Bayan Academy — Online Quran, Arabic & International Learning',
-        descAr: 'منصة تعليمية متكاملة لتحفيظ القرآن الكريم، تأسيس نور البيان، اللغة العربية، الحساب الذهني والمناهج الدولية لجميع المراحل.',
-        descEn: 'Comprehensive online academy for Quran memorization, Noor Al-Bayan reading foundation, languages, mental math, and international curricula.',
+        titleAr: 'أكاديمية نور وبيان — القرآن واللغات والمناهج الدولية وتنمية المهارات أونلاين',
+        titleEn: 'Noor & Bayan Academy — Quran, Languages, International Curricula & Skills',
+        descAr: 'أكاديمية تعليمية متكاملة أونلاين لتحفيظ القرآن والعلوم الإسلامية، تأسيس نور البيان والعربية، اللغات، جميع المواد الدراسية، المناهج الدولية، الحساب الذهني وتنمية المهارات والنطق.',
+        descEn: 'Comprehensive online academy for Quran & Islamic studies, Noor Al-Bayan & Arabic, world languages, all school subjects, international curricula, mental math, and speech development.',
       },
       '/courses': {
-        titleAr: 'الدورات والحلقات التعليمية | أكاديمية نور وبيان',
-        titleEn: 'Courses & Circles | Noor & Bayan Academy',
-        descAr: 'استعرض دورات القرآن الكريم، التأسيس بنور البيان، اللغات، الحساب الذهني، والمناهج البريطانية والأمريكية.',
-        descEn: 'Explore Quran circles, Arabic Noor Al-Bayan foundation, languages, mental math, and international curricula.',
+        titleAr: 'الدورات والمسارات التعليمية | أكاديمية نور وبيان',
+        titleEn: 'Courses & Tracks | Noor & Bayan Academy',
+        descAr: 'استعرض دورات القرآن والعلوم الإسلامية، نور البيان، اللغات، جميع المواد الدراسية، الحساب الذهني، تنمية المهارات، والمناهج الدولية.',
+        descEn: 'Explore Quran & Islamic studies, Noor Al-Bayan Arabic, world languages, school subjects, mental math, skill development, and international curricula.',
       },
       '/teachers': {
         titleAr: 'نخبة المعلمين والمعلمات | أكاديمية نور وبيان',
         titleEn: 'Certified Teachers & Mentors | Noor & Bayan Academy',
-        descAr: 'تعرّف على معلمي ومعلمات أكاديمية نور وبيان المجازين والمتخصصين في تعليم الأطفال والشباب أونلاين.',
-        descEn: 'Meet our qualified teachers specialized in Quran Tajweed, Arabic literacy, languages, and school support.',
+        descAr: 'تعرّف على معلمي ومعلمات أكاديمية نور وبيان المتخصصين في القرآن، اللغات، المناهج الدولية، الحساب الذهني، وتنمية المهارات.',
+        descEn: 'Meet our qualified teachers specialized in Quran, languages, international curricula, mental math, and skill building.',
       },
       '/levels': {
         titleAr: 'المستويات والمسارات التعليمية | أكاديمية نور وبيان',
@@ -178,10 +232,10 @@ function RouterContent() {
         descEn: 'Submit your child enrollment application to join Noor & Bayan Academy online circles.',
       },
       '/parents': {
-        titleAr: 'قسم الأمهات وأولياء الأمور | أكاديمية نور وبيان',
-        titleEn: 'Mothers & Guardians Corner | Noor & Bayan Academy',
-        descAr: 'شراكة تربوية حقيقية مع الأمهات وأولياء الأمور لمتابعة حضور وتقدم الأبناء لحظة بلحظة.',
-        descEn: 'Partnering with mothers and guardians through transparent attendance, evaluations, and progress reports.',
+        titleAr: 'قسم أولياء الأمور | أكاديمية نور وبيان',
+        titleEn: 'Parents & Guardians Corner | Noor & Bayan Academy',
+        descAr: 'شراكة تربوية حقيقية مع أولياء الأمور لمتابعة حضور وتقدم الأبناء لحظة بلحظة.',
+        descEn: 'Partnering with parents and guardians through transparent attendance, evaluations, and progress reports.',
       },
       '/games': {
         titleAr: 'الألعاب التعليمية التفاعلية | أكاديمية نور وبيان',
@@ -306,9 +360,29 @@ function RouterContent() {
     const parts = path.split('/').filter(Boolean); // ['dashboard', tab?]
     const requestedTab = parts[1] || getDefaultTabForRole(user.role);
 
+    const pendingAdmissionsCount =
+      (adminSummary?.admissionRequests || []).filter((r) => r.status === 'pending').length +
+      (adminSummary?.teacherApplications || []).filter((r) => r.status === 'pending').length +
+      (adminSummary?.guardianRequests || []).filter((r) => r.status === 'pending').length;
+    const pendingGradingCount = (adminSummary?.exams || []).reduce(
+      (sum, ex) => sum + Number(ex.pending_grading_count || 0),
+      0
+    );
+    const pendingSuggestionsCount = (adminCommSummary?.suggestions || []).filter(
+      (s) => s.status === 'pending'
+    ).length;
+
+    const resolvedTabs = getDashboardTabsForRole(user.role).map((t) => {
+      if (user.role !== 'admin') return t;
+      if (t.id === 'admissions') return { ...t, badgeCount: pendingAdmissionsCount };
+      if (t.id === 'exams') return { ...t, badgeCount: pendingGradingCount };
+      if (t.id === 'community') return { ...t, badgeCount: pendingSuggestionsCount };
+      return t;
+    });
+
     return (
       <DashboardShell
-        tabs={ALL_DASHBOARD_TABS}
+        tabs={resolvedTabs}
         activeTab={requestedTab}
         onSelectTab={(tabId) => navigate(`/dashboard/${tabId}`)}
         onNavigatePublic={navigate}
@@ -442,11 +516,13 @@ function RouterContent() {
 
 export default function App() {
   return (
-    <QueryClientProvider client={queryClient}>
-      <AppProvider>
-        <RouterContent />
-        <OfflineIndicator />
-      </AppProvider>
-    </QueryClientProvider>
+    <ErrorBoundary>
+      <QueryClientProvider client={queryClient}>
+        <AppProvider>
+          <RouterContent />
+          <OfflineIndicator />
+        </AppProvider>
+      </QueryClientProvider>
+    </ErrorBoundary>
   );
 }

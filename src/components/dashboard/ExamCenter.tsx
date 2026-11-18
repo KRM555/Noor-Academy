@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import {
   FileText,
   Upload,
@@ -45,6 +45,7 @@ export interface ManagedExamItem {
   instructions_en?: string;
   available_from?: string | null;
   due_at?: string | null;
+  time_limit_minutes?: number | null;
   allow_late_submission?: boolean;
   show_answers_after_submit?: boolean;
   has_question_file?: boolean;
@@ -66,6 +67,7 @@ interface SubmissionRow {
     status: string;
     submitted_at: string;
     is_late: boolean;
+    timed_out?: boolean;
     has_solution_file: boolean;
     solution_file_name: string | null;
     student_notes: string;
@@ -106,21 +108,25 @@ export function ExamCenter({
   courses,
   exams,
   onReload,
+  fixedCourseId,
 }: {
   courses: Array<{ id: number; title_ar: string; title_en?: string }>;
   exams: ManagedExamItem[];
   onReload: () => void;
+  fixedCourseId?: number;
 }) {
   const { lang, toast } = useApp();
 
+  const [courseFilter, setCourseFilter] = useState<string>('all');
   const [editingExamId, setEditingExamId] = useState<number | null>(null);
-  const [courseId, setCourseId] = useState<string>(String(courses[0]?.id || '1'));
+  const [courseId, setCourseId] = useState<string>(String(fixedCourseId ?? courses[0]?.id ?? '1'));
   const [titleAr, setTitleAr] = useState('');
   const [titleEn, setTitleEn] = useState('');
   const [examDate, setExamDate] = useState('2026-11-25');
   const [dueAt, setDueAt] = useState('2026-11-30');
   const [availableFrom, setAvailableFrom] = useState('');
   const [maxScore, setMaxScore] = useState('100');
+  const [timeLimitMinutes, setTimeLimitMinutes] = useState('');
   const [examMode, setExamMode] = useState<ExamMode>('file');
   const [instructionsAr, setInstructionsAr] = useState('');
   const [allowLate, setAllowLate] = useState(true);
@@ -137,15 +143,24 @@ export function ExamCenter({
   const [gradeInputs, setGradeInputs] = useState<Record<number, { score: string; feedback: string; file: File | null }>>({});
   const [savingGradeId, setSavingGradeId] = useState<number | null>(null);
 
+  useEffect(() => {
+    if (fixedCourseId) {
+      setCourseId(String(fixedCourseId));
+      setGradingExam(null);
+      setEditingExamId(null);
+    }
+  }, [fixedCourseId]);
+
   const resetForm = useCallback(() => {
     setEditingExamId(null);
-    setCourseId(String(courses[0]?.id || '1'));
+    setCourseId(String(fixedCourseId ?? courses[0]?.id ?? '1'));
     setTitleAr('');
     setTitleEn('');
     setExamDate('2026-11-25');
     setDueAt('2026-11-30');
     setAvailableFrom('');
     setMaxScore('100');
+    setTimeLimitMinutes('');
     setExamMode('file');
     setInstructionsAr('');
     setAllowLate(true);
@@ -153,7 +168,7 @@ export function ExamCenter({
     setNotifyStudents(true);
     setPendingQuestionFile(null);
     setQuestions([]);
-  }, [courses]);
+  }, [courses, fixedCourseId]);
 
   const startEditExam = (ex: ManagedExamItem) => {
     setEditingExamId(ex.id);
@@ -164,6 +179,7 @@ export function ExamCenter({
     setDueAt(ex.due_at ? String(ex.due_at).slice(0, 10) : '');
     setAvailableFrom(ex.available_from ? String(ex.available_from).slice(0, 10) : '');
     setMaxScore(String(ex.max_score || 100));
+    setTimeLimitMinutes(ex.time_limit_minutes && ex.time_limit_minutes > 0 ? String(ex.time_limit_minutes) : '');
     setExamMode(ex.exam_mode || 'file');
     setInstructionsAr(ex.instructions_ar || '');
     setAllowLate(ex.allow_late_submission ?? true);
@@ -244,6 +260,7 @@ export function ExamCenter({
             instructions_ar: instructionsAr.trim(),
             available_from: availableFrom || null,
             due_at: dueAt || null,
+            time_limit_minutes: Number(timeLimitMinutes || 0) > 0 ? Number(timeLimitMinutes) : 0,
             allow_late_submission: allowLate,
             show_answers_after_submit: showAnswers,
             questions: cleanedQuestions,
@@ -253,7 +270,7 @@ export function ExamCenter({
         const res = await apiFetch<{ id: number }>('/api/exams', {
           method: 'POST',
           body: JSON.stringify({
-            course_id: Number(courseId),
+            course_id: fixedCourseId || Number(courseId),
             title_ar: titleAr.trim(),
             title_en: titleEn.trim() || titleAr.trim(),
             exam_date: examDate,
@@ -262,6 +279,7 @@ export function ExamCenter({
             instructions_ar: instructionsAr.trim(),
             available_from: availableFrom || null,
             due_at: dueAt || null,
+            time_limit_minutes: Number(timeLimitMinutes || 0) > 0 ? Number(timeLimitMinutes) : 0,
             allow_late_submission: allowLate,
             show_answers_after_submit: showAnswers,
             notify_students: notifyStudents,
@@ -438,6 +456,13 @@ export function ExamCenter({
     return lang === 'ar' ? 'امتحان ملفات (PDF / صور)' : 'File Exam (PDF / Image)';
   };
 
+  const visibleExams = fixedCourseId
+    ? exams.filter((ex) => Number(ex.course_id) === Number(fixedCourseId))
+    : courseFilter === 'all'
+    ? exams
+    : exams.filter((ex) => String(ex.course_id) === courseFilter);
+  const fixedCourseObj = fixedCourseId ? courses.find((c) => c.id === fixedCourseId) : undefined;
+
   return (
     <div className="space-y-6">
       <Card className="p-6 space-y-5">
@@ -465,16 +490,22 @@ export function ExamCenter({
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
             <div className="space-y-1">
               <label className="text-xs font-bold">{lang === 'ar' ? 'الحلقة / الدورة' : 'Course'}</label>
-              <select
-                value={courseId}
-                disabled={Boolean(editingExamId)}
-                onChange={(e) => setCourseId(e.target.value)}
-                className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm disabled:opacity-60"
-              >
-                {courses.map((c) => (
-                  <option key={c.id} value={c.id}>{c.title_ar}</option>
-                ))}
-              </select>
+              {fixedCourseId ? (
+                <div className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#F2EFE6] dark:bg-[#091529] px-3 py-2 text-sm font-bold text-[#0F766E] dark:text-[#2DD4BF] truncate">
+                  {fixedCourseObj ? (lang === 'ar' ? fixedCourseObj.title_ar : fixedCourseObj.title_en || fixedCourseObj.title_ar) : `#${fixedCourseId}`}
+                </div>
+              ) : (
+                <select
+                  value={courseId}
+                  disabled={Boolean(editingExamId)}
+                  onChange={(e) => setCourseId(e.target.value)}
+                  className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm disabled:opacity-60"
+                >
+                  {courses.map((c) => (
+                    <option key={c.id} value={c.id}>{c.title_ar}</option>
+                  ))}
+                </select>
+              )}
             </div>
             <div className="space-y-1">
               <label className="text-xs font-bold">{lang === 'ar' ? 'عنوان الامتحان' : 'Exam Title'}</label>
@@ -512,7 +543,7 @@ export function ExamCenter({
             </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
             <div className="space-y-1">
               <label className="text-xs font-bold">{lang === 'ar' ? 'تاريخ الامتحان' : 'Exam Date'}</label>
               <input
@@ -538,6 +569,20 @@ export function ExamCenter({
                 type="date"
                 value={dueAt}
                 onChange={(e) => setDueAt(e.target.value)}
+                className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm font-mono-tabular"
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-bold">
+                {lang === 'ar' ? 'مؤقت الامتحان (بالدقائق — 0 بلا مؤقت)' : 'Exam Timer (min, 0 = none)'}
+              </label>
+              <input
+                type="number"
+                min={0}
+                max={300}
+                value={timeLimitMinutes}
+                onChange={(e) => setTimeLimitMinutes(e.target.value)}
+                placeholder={lang === 'ar' ? 'مثال: 30 دقيقة' : 'e.g. 30'}
                 className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm font-mono-tabular"
               />
             </div>
@@ -719,13 +764,38 @@ export function ExamCenter({
       </Card>
 
       {/* Published Exams List */}
-      {exams.length === 0 ? (
-        <EmptyState title={lang === 'ar' ? 'لا توجد امتحانات منشأة بعد' : 'No exams created yet'} />
-      ) : (
-        <div className="space-y-4">
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <h3 className="text-lg font-extrabold">{lang === 'ar' ? 'الامتحانات المنشأة وإدارة التصحيح' : 'Published Exams & Grading'}</h3>
+          {!fixedCourseId && courses.length > 0 && (
+            <select
+              value={courseFilter}
+              onChange={(e) => setCourseFilter(e.target.value)}
+              aria-label={lang === 'ar' ? 'تصفية الامتحانات حسب الكورس' : 'Filter exams by course'}
+              className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#0F213E] px-3 py-1.5 text-xs font-semibold"
+            >
+              <option value="all">
+                {lang === 'ar' ? `جميع الكورسات (${exams.length})` : `All Courses (${exams.length})`}
+              </option>
+              {courses.map((c) => (
+                <option key={c.id} value={String(c.id)}>
+                  {c.title_ar}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+        {visibleExams.length === 0 ? (
+          <EmptyState
+            title={
+              fixedCourseId
+                ? lang === 'ar' ? 'لا توجد امتحانات منشأة في هذا الكورس بعد' : 'No exams created in this course yet'
+                : lang === 'ar' ? 'لا توجد امتحانات مطابقة للفلتر الحالي' : 'No exams match this filter'
+            }
+          />
+        ) : (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            {exams.map((ex) => (
+            {visibleExams.map((ex) => (
               <Card key={ex.id} className="p-5 space-y-4 flex flex-col justify-between">
                 <div className="space-y-2">
                   <div className="flex items-start justify-between gap-3">
@@ -748,6 +818,14 @@ export function ExamCenter({
                         <span>{lang === 'ar' ? 'آخر تسليم:' : 'Due:'} {String(ex.due_at).slice(0, 10)}</span>
                       </>
                     )}
+                    {ex.time_limit_minutes && ex.time_limit_minutes > 0 ? (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="font-bold text-[#0F766E] dark:text-[#2DD4BF]">
+                          {lang === 'ar' ? `المؤقت: ${ex.time_limit_minutes} د` : `Timer: ${ex.time_limit_minutes}m`}
+                        </span>
+                      </>
+                    ) : null}
                     <span aria-hidden="true">·</span>
                     <span>
                       {lang === 'ar' ? 'التسليمات:' : 'Submissions:'} {ex.submission_count ?? 0} ({lang === 'ar' ? 'مصوّب:' : 'Graded:'} {ex.graded_count ?? 0})
@@ -815,8 +893,8 @@ export function ExamCenter({
               </Card>
             ))}
           </div>
-        </div>
-      )}
+        )}
+      </div>
 
       {/* Grading & Submissions Workspace */}
       {gradingExam && (
@@ -870,6 +948,9 @@ export function ExamCenter({
                           )}
                           {row.submission?.is_late && (
                             <span className="text-red-600 font-bold">· {lang === 'ar' ? 'تسليم متأخر' : 'Late'}</span>
+                          )}
+                          {row.submission?.timed_out && (
+                            <span className="text-[#C98A1E] font-bold">· {lang === 'ar' ? 'أُغلق تلقائياً بانتهاء الوقت' : 'Auto-closed (timeout)'}</span>
                           )}
                           {row.submission?.auto_score !== null && row.submission?.auto_score !== undefined && (
                             <span className="font-mono-tabular text-slate-600 dark:text-slate-300">

@@ -4,6 +4,13 @@ import { useApp } from '../../contexts/AppContext';
 import { dict } from '../../i18n/translations';
 import { AcademyLogo } from '../ui/CommonUI';
 import { PWAInstallButton } from '../ui/PWAComponents';
+import {
+  ACADEMY_CONTACTS,
+  FacebookBrandIcon,
+  GmailBrandIcon,
+  WhatsAppBrandIcon,
+  YouTubeBrandIcon,
+} from '../ui/SocialBrandIcons';
 
 interface PublicLayoutProps {
   currentPath: string;
@@ -20,8 +27,9 @@ export function PublicLayout({ currentPath, onNavigate, children }: PublicLayout
     { path: '/courses', label: t.navCourses },
     { path: '/teachers', label: t.navTeachers },
     { path: '/games', label: t.navGames },
-    { path: '/parents', label: lang === 'ar' ? 'قسم الأمهات' : 'Mothers' },
+    { path: '/parents', label: t.parentsCorner },
     { path: '/placement', label: t.navPlacement },
+    { path: '/contact', label: t.contactUs },
   ];
 
   const go = (path: string) => {
@@ -45,7 +53,7 @@ export function PublicLayout({ currentPath, onNavigate, children }: PublicLayout
           </button>
 
           {/* Zone 2: Concise Single-Line Nav Links */}
-          <nav className="hidden lg:flex items-center gap-6 text-sm font-semibold text-slate-700 dark:text-slate-200">
+          <nav className="hidden lg:flex items-center gap-4 xl:gap-6 text-sm font-semibold text-slate-700 dark:text-slate-200">
             {navItems.map((item) => {
               const active = currentPath === item.path;
               return (
@@ -177,8 +185,8 @@ export function PublicLayout({ currentPath, onNavigate, children }: PublicLayout
             </div>
             <p className="text-slate-600 dark:text-slate-300 leading-relaxed text-xs">
               {lang === 'ar'
-                ? 'بيئة تعليمية تربوية دافئة لتعليم القرآن الكريم ونور البيان واللغة العربية للأطفال بإشراف معلمين مجازين.'
-                : 'A warm, trustworthy online academy teaching Quran, Noor Al-Bayan, and Arabic to children with certified instructors.'}
+                ? 'منصة تعليمية إلكترونية متكاملة للقرآن الكريم والعلوم الإسلامية، التأسيس بنور البيان والعربية، اللغات، جميع المواد الدراسية، المناهج الدولية، الحساب الذهني، وتنمية المهارات والنطق.'
+                : 'A comprehensive online academy for Quran & Islamic studies, Noor Al-Bayan Arabic, world languages, all school subjects, international curricula, mental math, and skill development.'}
             </p>
           </div>
 
@@ -207,25 +215,51 @@ export function PublicLayout({ currentPath, onNavigate, children }: PublicLayout
             </ul>
           </div>
 
-          <div className="space-y-2">
+          <div className="space-y-3">
             <h4 className="font-bold text-xs text-slate-500 dark:text-slate-400">
               <button onClick={() => go('/contact')} className="hover:text-[#C98A1E] cursor-pointer">
                 {t.contactUs}
               </button>
             </h4>
-            <p className="text-xs text-slate-600 dark:text-slate-300 font-mono-tabular">
-              <a href="mailto:care@noorbayan.academy" className="hover:text-[#C98A1E]">
-                care@noorbayan.academy
+            <div className="space-y-2 text-xs text-slate-700 dark:text-slate-200">
+              <a
+                href={ACADEMY_CONTACTS.whatsappUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 hover:text-[#C98A1E] transition-colors"
+              >
+                <WhatsAppBrandIcon className="w-5 h-5 shrink-0" />
+                <span dir="ltr" className="font-mono-tabular">{ACADEMY_CONTACTS.whatsappDisplay}</span>
               </a>
-            </p>
-            <p className="text-xs text-slate-600 dark:text-slate-300 font-mono-tabular">
-              <a href="https://wa.me/201005550199" target="_blank" rel="noopener noreferrer" className="hover:text-[#C98A1E]">
-                WhatsApp: +20 100 555 0199
+              <a
+                href={ACADEMY_CONTACTS.mailtoUrl}
+                className="flex items-center gap-2 hover:text-[#C98A1E] transition-colors"
+              >
+                <GmailBrandIcon className="w-5 h-5 shrink-0" />
+                <span dir="ltr" className="font-mono-tabular truncate">{ACADEMY_CONTACTS.email}</span>
               </a>
-            </p>
+              <a
+                href={ACADEMY_CONTACTS.facebookUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 hover:text-[#C98A1E] transition-colors"
+              >
+                <FacebookBrandIcon className="w-5 h-5 shrink-0" />
+                <span>{lang === 'ar' ? 'صفحة فيسبوك الرسمية' : 'Official Facebook'}</span>
+              </a>
+              <a
+                href={ACADEMY_CONTACTS.youtubeUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 hover:text-[#C98A1E] transition-colors"
+              >
+                <YouTubeBrandIcon className="w-5 h-5 shrink-0" />
+                <span>{lang === 'ar' ? 'قناة يوتيوب الرسمية' : 'Official YouTube'}</span>
+              </a>
+            </div>
             <button
               onClick={() => go('/apply')}
-              className="mt-2 inline-flex items-center rounded-xl px-4 py-2 text-xs font-bold bg-[#0F213E] dark:bg-[#C98A1E] text-white cursor-pointer"
+              className="mt-1 inline-flex items-center rounded-xl px-4 py-2 text-xs font-bold bg-[#0F213E] dark:bg-[#C98A1E] text-white cursor-pointer"
             >
               {t.navApply}
             </button>

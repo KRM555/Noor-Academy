@@ -16,6 +16,7 @@ import { queryKeys } from '../../lib/queryClient';
 import { tField } from '../../i18n/translations';
 import { Card, LoadingState, EmptyState, ResponsiveTable, PrimaryButton } from '../../components/ui/CommonUI';
 import { ChangePasswordCard } from '../../components/dashboard/ChangePasswordCard';
+import { MyCommunityPanel } from '../../components/dashboard/MyCommunityPanel';
 
 interface GuardianChild {
   id: number;
@@ -45,11 +46,13 @@ interface GuardianPayload {
     course_title_ar: string;
     course_title_en: string;
     due_at: string | null;
+    time_limit_minutes?: number | null;
     has_question_file: boolean;
     submission: {
       status: 'submitted_pending' | 'graded';
       submitted_at: string;
       is_late: boolean;
+      timed_out?: boolean;
       has_solution_file: boolean;
       has_graded_file: boolean;
     } | null;
@@ -183,6 +186,7 @@ export function GuardianDashboard({ activeTab }: { activeTab: string }) {
           </form>
         </Card>
         <ChangePasswordCard />
+        <MyCommunityPanel />
       </div>
     );
   }
@@ -248,7 +252,7 @@ export function GuardianDashboard({ activeTab }: { activeTab: string }) {
         <div className="space-y-1">
           <div className="inline-flex items-center gap-1.5 text-xs font-bold text-[#C98A1E]">
             <Heart className="w-4 h-4" />
-            <span>{lang === 'ar' ? 'بوابة متابعة أولياء الأمور والأمهات' : 'Parents & Mothers Progress Portal'}</span>
+            <span>{lang === 'ar' ? 'بوابة متابعة أولياء الأمور' : 'Parents & Guardians Progress Portal'}</span>
           </div>
           <h2 className="text-2xl font-extrabold">
             {lang === 'ar' ? `أهلاً ${data.guardian.full_name}` : `Welcome, ${data.guardian.full_name}`}
@@ -420,9 +424,16 @@ export function GuardianDashboard({ activeTab }: { activeTab: string }) {
                         </div>
                         <div className="text-xs font-extrabold tabular-nums">
                           {ex.result ? (
-                            <span className="text-[#0F766E] dark:text-[#2DD4BF]">{ex.result.score} / {ex.max_score}</span>
+                            <span className="text-[#0F766E] dark:text-[#2DD4BF]">
+                              {ex.result.score} / {ex.max_score}
+                              {ex.submission?.timed_out ? (lang === 'ar' ? ' (انتهى المؤقت)' : ' (Timed out)') : ''}
+                            </span>
                           ) : ex.submission ? (
-                            <span className="text-[#C98A1E]">{lang === 'ar' ? 'تم التسليم — بانتظار التصحيح' : 'Submitted'}</span>
+                            <span className="text-[#C98A1E]">
+                              {ex.submission.timed_out
+                                ? lang === 'ar' ? 'أُغلق بانتهاء المؤقت — بانتظار التصحيح' : 'Auto-locked — Awaiting Grading'
+                                : lang === 'ar' ? 'تم التسليم — بانتظار التصحيح' : 'Submitted — Awaiting Grading'}
+                            </span>
                           ) : (
                             <span className="text-slate-500">{lang === 'ar' ? 'لم يُسلّم بعد' : 'Pending'}</span>
                           )}

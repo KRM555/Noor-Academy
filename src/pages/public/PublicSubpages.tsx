@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Award, Search, CheckCircle2, XCircle, Gamepad2, PhoneCall, Mail, BookOpen, Clock, ExternalLink } from 'lucide-react';
+import { Award, Search, CheckCircle2, XCircle, Gamepad2, BookOpen, Clock, ExternalLink } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { apiFetch } from '../../lib/api';
 import { queryKeys } from '../../lib/queryClient';
@@ -8,6 +8,14 @@ import { dict, tField } from '../../i18n/translations';
 import type { Course, LegalDocument, PublicOverview, Teacher } from '../../types';
 import { Card, PrimaryButton, SecondaryButton, ResilientImage, LoadingState } from '../../components/ui/CommonUI';
 import { getCourseImageUrl } from '../../lib/courseImages';
+import { formatCoursePriceSummary, resolveCoursePrices, type DisplayCurrency } from '../../lib/currency';
+import {
+  ACADEMY_CONTACTS,
+  WhatsAppBrandIcon,
+  GmailBrandIcon,
+  FacebookBrandIcon,
+  YouTubeBrandIcon,
+} from '../../components/ui/SocialBrandIcons';
 
 export function CoursesPage({
   courses,
@@ -18,15 +26,40 @@ export function CoursesPage({
   onSelectCourse: (id: number) => void;
   onApplyCourse: (id: number) => void;
 }) {
-  const { lang } = useApp();
+  const { lang, currency, setCurrency } = useApp();
   const t = dict[lang];
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-12 space-y-8">
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-center">
-        <div className="lg:col-span-7 space-y-2">
+        <div className="lg:col-span-7 space-y-3">
           <h1 className="text-3xl font-extrabold">{t.coursesTitle}</h1>
           <p className="text-slate-600 dark:text-slate-300">{t.coursesSubtitle}</p>
+          <div className="inline-flex items-center gap-2 pt-1">
+            <span className="text-xs font-bold text-slate-500">{lang === 'ar' ? 'عملة العرض:' : 'Currency:'}</span>
+            <div className="inline-flex rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] p-1 text-xs font-bold">
+              {(
+                [
+                  { id: 'BOTH', ar: 'ج.م + ر.س', en: 'EGP + SAR' },
+                  { id: 'EGP', ar: 'الجنيه المصري', en: 'EGP' },
+                  { id: 'SAR', ar: 'الريال السعودي', en: 'SAR' },
+                ] as Array<{ id: DisplayCurrency; ar: string; en: string }>
+              ).map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => setCurrency(opt.id)}
+                  className={`px-3 py-1 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    currency === opt.id
+                      ? 'bg-[#0F213E] text-white dark:bg-[#C98A1E]'
+                      : 'text-slate-600 dark:text-slate-300 hover:text-[#0F213E]'
+                  }`}
+                >
+                  {lang === 'ar' ? opt.ar : opt.en}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
         <div className="lg:col-span-5 rounded-2xl overflow-hidden border border-[#E5DEC9] dark:border-[#233C63] bg-[#FAF8F3] dark:bg-[#091529] shadow-sm">
           <ResilientImage
@@ -43,7 +76,7 @@ export function CoursesPage({
             <div>
               <div className="aspect-[16/10] bg-[#F2EFE6] dark:bg-[#13284A]">
                 <ResilientImage
-                  src={getCourseImageUrl(c.title_ar)}
+                  src={getCourseImageUrl(c.title_ar, c.cover_url)}
                   alt={tField(c as unknown as Record<string, unknown>, 'title', lang)}
                   className="w-full h-full object-cover"
                 />
@@ -51,6 +84,7 @@ export function CoursesPage({
               <div className="p-6 pb-2 space-y-2.5">
                 <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
                   {tField(c as unknown as Record<string, unknown>, 'level_name', lang)} · {tField(c as unknown as Record<string, unknown>, 'teacher_name', lang)}
+                  {c.co_teacher_names_ar && c.co_teacher_names_ar.length > 0 && ` (+${c.co_teacher_names_ar.length})`}
                 </div>
                 <h2 className="text-lg font-bold">{tField(c as unknown as Record<string, unknown>, 'title', lang)}</h2>
                 <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
@@ -59,10 +93,10 @@ export function CoursesPage({
               </div>
             </div>
             <div className="p-6 pt-4 border-t border-[#EFEAD8] dark:border-[#1D355B] space-y-3 mt-4">
-              <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
                 <span>{tField(c as unknown as Record<string, unknown>, 'schedule', lang)}</span>
-                <span className="text-base font-extrabold text-[#0F213E] dark:text-[#F8F5EC] tabular-nums">
-                  {c.price_monthly} {t.monthlyCurrency}
+                <span className="text-sm sm:text-base font-extrabold text-[#0F213E] dark:text-[#F8F5EC] tabular-nums">
+                  {formatCoursePriceSummary(c, lang, currency)}
                 </span>
               </div>
               <div className="flex gap-2">
@@ -114,7 +148,7 @@ export function CourseDetailPage({
         <div className="grid grid-cols-1 md:grid-cols-12">
           <div className="md:col-span-5 aspect-[16/10] md:aspect-auto bg-[#F2EFE6] dark:bg-[#13284A]">
             <ResilientImage
-              src={getCourseImageUrl(course.title_ar)}
+              src={getCourseImageUrl(course.title_ar, course.cover_url)}
               alt={tField(course as unknown as Record<string, unknown>, 'title', lang)}
               className="w-full h-full object-cover"
             />
@@ -134,8 +168,15 @@ export function CourseDetailPage({
 
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-4 border-t border-[#EFEAD8] dark:border-[#1D355B] text-sm">
               <div>
-                <div className="text-xs text-slate-500">{lang === 'ar' ? 'المعلم' : 'Instructor'}</div>
-                <div className="font-bold">{tField(course as unknown as Record<string, unknown>, 'teacher_name', lang)}</div>
+                <div className="text-xs text-slate-500">{lang === 'ar' ? 'المعلمون المسؤولون' : 'Instructors'}</div>
+                <div className="font-bold">
+                  {tField(course as unknown as Record<string, unknown>, 'teacher_name', lang)}
+                  {course.co_teacher_names_ar && course.co_teacher_names_ar.length > 0 && (
+                    <span className="block text-xs font-normal text-slate-500 mt-0.5">
+                      {(lang === 'ar' ? course.co_teacher_names_ar : course.co_teacher_names_en || course.co_teacher_names_ar).join(' · ')}
+                    </span>
+                  )}
+                </div>
               </div>
               <div>
                 <div className="text-xs text-slate-500">{lang === 'ar' ? 'المواعيد' : 'Schedule'}</div>
@@ -143,7 +184,14 @@ export function CourseDetailPage({
               </div>
               <div>
                 <div className="text-xs text-slate-500">{lang === 'ar' ? 'الرسوم الشهرية' : 'Monthly Fee'}</div>
-                <div className="font-extrabold tabular-nums">{course.price_monthly} {dict[lang].monthlyCurrency}</div>
+                <div className="font-extrabold tabular-nums">
+                  {(() => {
+                    const p = resolveCoursePrices(course.price_monthly, course.price_monthly_sar);
+                    return lang === 'ar'
+                      ? `${p.egp} ج.م · ${p.sar} ر.س / شهرياً`
+                      : `${p.egp} EGP · ${p.sar} SAR / mo`;
+                  })()}
+                </div>
               </div>
             </div>
 
@@ -542,15 +590,15 @@ export function InfoStaticPage({
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
           <div className="lg:col-span-7 space-y-3">
             <div className="text-xs font-bold text-[#C98A1E]">
-              {lang === 'ar' ? 'قسم خاص بالأمهات وأولياء الأمور' : 'Mothers & Parents Corner'}
+              {lang === 'ar' ? 'قسم خاص بأولياء الأمور' : 'Parents & Guardians Corner'}
             </div>
             <h1 className="text-3xl font-extrabold">
-              {lang === 'ar' ? 'أنتِ شريكة في رحلة نجاح طفلك' : 'You Are a Partner in Your Child’s Success'}
+              {lang === 'ar' ? 'ولي الأمر شريك في رحلة نجاح طفلك' : 'Parents Are True Partners in Your Child’s Success'}
             </h1>
             <p className="text-base text-slate-600 dark:text-slate-300 leading-relaxed">
               {lang === 'ar'
-                ? 'مجتمع يجمع الأمهات لتبادل الخبرات، والاستفادة من النصائح التربوية والتعليمية، ومناقشة كل ما يساعد في تربية أطفالنا وتنمية مهاراتهم.'
-                : 'A welcoming community uniting mothers to exchange experiences, gain educational and parenting advice, and nurture children’s skills.'}
+                ? 'مساحة تجمع أولياء الأمور لتبادل الخبرات، والاستفادة من النصائح التربوية والتعليمية، ومتابعة كل ما يساعد في تربية أبنائنا وتنمية مهاراتهم.'
+                : 'A welcoming community uniting parents and guardians to exchange experiences, gain educational advice, and nurture children’s skills.'}
             </p>
           </div>
           <div className="lg:col-span-5 rounded-2xl overflow-hidden border border-[#E5DEC9] dark:border-[#233C63]">
@@ -566,11 +614,11 @@ export function InfoStaticPage({
           <Card className="p-6 space-y-3">
             <BookOpen className="w-6 h-6 text-[#C98A1E]" />
             <h2 className="text-lg font-bold">
-              {lang === 'ar' ? 'كيف تشجعين طفلك على الحفظ والمذاكرة الهادئة؟' : 'Building a Calm Daily Study & Quran Habit'}
+              {lang === 'ar' ? 'كيف تشجع طفلك على الحفظ والمذاكرة الهادئة؟' : 'Building a Calm Daily Study & Quran Habit'}
             </h2>
             <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
               {lang === 'ar'
-                ? 'خصصي 10 دقائق ثابتة يومياً قبل النوم أو بعد العصر للمراجعة السمعية مع الطفل دون ضغط أو مقارنة بغيره، مع مكافأة الجهد بالثناء الهادئ.'
+                ? 'خصص 10 دقائق ثابتة يومياً في وقت هادئ للمراجعة السمعية مع الطفل دون ضغط أو مقارنة بغيره، مع مكافأة الجهد بالثناء الهادئ.'
                 : 'Dedicate 10 consistent minutes daily at a calm hour for gentle listening and review without comparison.'}
             </p>
           </Card>
@@ -581,7 +629,7 @@ export function InfoStaticPage({
             </h2>
             <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
               {lang === 'ar'
-                ? 'نركز في تقييماتنا على جودة النطق والانضباط السلوكي والمشاركة وتنمية المهارات العقلية واللغوية، مع متابعة مستمرة مع الأم.'
+                ? 'نركز في تقييماتنا على جودة النطق والانضباط السلوكي والمشاركة وتنمية المهارات العقلية واللغوية، مع متابعة مستمرة مع ولي الأمر.'
                 : 'Our evaluations measure pronunciation clarity, respectful conduct, active participation, and steady skill development.'}
             </p>
           </Card>
@@ -624,25 +672,29 @@ export function InfoStaticPage({
           <h1 className="text-3xl font-extrabold">{dict[lang].contactUs}</h1>
           <p className="text-slate-600 dark:text-slate-300">
             {lang === 'ar'
-              ? 'فريق الإشراف الأكاديمي وخدمة أولياء الأمور جاهز للرد على استفساراتكم ومساعدتكم في اختيار الحلقة الأنسب.'
-              : 'Our academic care team is ready to answer your questions and help choose the right circle for your child.'}
+              ? 'فريق الإشراف الأكاديمي وخدمة أولياء الأمور جاهز للرد على استفساراتكم ومساعدتكم في اختيار المسار التعليمي الأنسب.'
+              : 'Our academic care team is ready to answer your questions and help choose the right learning track.'}
           </p>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           <Card className="p-6 space-y-4">
-            <div className="flex items-center gap-3 text-[#0F766E] dark:text-[#2DD4BF]">
-              <PhoneCall className="w-6 h-6" />
-              <h2 className="text-lg font-bold">{lang === 'ar' ? 'التواصل السريع عبر واتساب' : 'Direct WhatsApp Support'}</h2>
+            <div className="flex items-center gap-3">
+              <WhatsAppBrandIcon className="w-8 h-8 shrink-0" />
+              <h2 className="text-lg font-bold text-[#0F213E] dark:text-[#F8F5EC]">
+                {lang === 'ar' ? 'التواصل السريع عبر واتساب' : 'Direct WhatsApp Support'}
+              </h2>
             </div>
             <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
               {lang === 'ar'
-                ? 'استفسر مباشرة عن المواعيد المتاحة، خطط الرسوم، وتحديد المستوى للأطفال.'
-                : 'Ask directly about available schedules, tuition plans, and child placement.'}
+                ? 'استفسر مباشرة عن المواعيد المتاحة، برامج القرآن واللغات والمناهج وتنمية المهارات وتحديد المستوى.'
+                : 'Ask directly about schedules, Quran, languages, curricula, skill tracks, and placement.'}
             </p>
-            <div className="font-mono-tabular text-sm font-bold">+20 100 555 0199</div>
+            <div dir="ltr" className="font-mono-tabular text-sm font-bold text-[#0F213E] dark:text-[#F8F5EC]">
+              {ACADEMY_CONTACTS.whatsappDisplay}
+            </div>
             <a
-              href="https://wa.me/201005550199"
+              href={ACADEMY_CONTACTS.whatsappUrl}
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-bold bg-[#0F766E] hover:bg-[#0D625B] text-white transition-colors"
@@ -653,22 +705,72 @@ export function InfoStaticPage({
           </Card>
 
           <Card className="p-6 space-y-4">
-            <div className="flex items-center gap-3 text-[#C98A1E]">
-              <Mail className="w-6 h-6" />
-              <h2 className="text-lg font-bold">{lang === 'ar' ? 'البريد الإلكتروني الرسمي' : 'Official Email'}</h2>
+            <div className="flex items-center gap-3">
+              <GmailBrandIcon className="w-8 h-8 shrink-0" />
+              <h2 className="text-lg font-bold text-[#0F213E] dark:text-[#F8F5EC]">
+                {lang === 'ar' ? 'البريد الإلكتروني الرسمي (Gmail)' : 'Official Email (Gmail)'}
+              </h2>
             </div>
             <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
               {lang === 'ar'
-                ? 'للمراسلات الإدارية، متابعة الشهادات المعتمدة، أو استفسارات المعلمين.'
+                ? 'للمراسلات الإدارية، متابعة الشهادات المعتمدة، أو طلبات انضمام المعلمين.'
                 : 'For administrative inquiries, certificate support, or teaching applications.'}
             </p>
-            <div className="font-mono-tabular text-sm font-bold">care@noorbayan.academy</div>
+            <div dir="ltr" className="font-mono-tabular text-sm font-bold text-[#0F213E] dark:text-[#F8F5EC]">
+              {ACADEMY_CONTACTS.email}
+            </div>
             <a
-              href="mailto:care@noorbayan.academy"
+              href={ACADEMY_CONTACTS.mailtoUrl}
               className="inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-bold bg-[#EFEAD8] hover:bg-[#E5DEC9] dark:bg-[#162C4E] dark:hover:bg-[#1F3A66] text-[#0F213E] dark:text-white transition-colors"
             >
               <span>{lang === 'ar' ? 'إرسال رسالة بريدية' : 'Send Email'}</span>
-              <Mail className="w-4 h-4" />
+              <ExternalLink className="w-4 h-4" />
+            </a>
+          </Card>
+
+          <Card className="p-6 space-y-4">
+            <div className="flex items-center gap-3">
+              <FacebookBrandIcon className="w-8 h-8 shrink-0" />
+              <h2 className="text-lg font-bold text-[#0F213E] dark:text-[#F8F5EC]">
+                {lang === 'ar' ? 'صفحة فيسبوك الرسمية' : 'Official Facebook Page'}
+              </h2>
+            </div>
+            <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+              {lang === 'ar'
+                ? 'تابع أحدث إعلانات الدورات واللغات والمناهج الدولية وأنشطة وتكريمات طلابنا.'
+                : 'Follow our latest course announcements, student spotlights, and parent tips.'}
+            </p>
+            <a
+              href={ACADEMY_CONTACTS.facebookUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-bold bg-[#1877F2] hover:bg-[#1465D1] text-white transition-colors"
+            >
+              <span>{lang === 'ar' ? 'زيارة صفحة فيسبوك' : 'Visit Facebook Page'}</span>
+              <ExternalLink className="w-4 h-4" />
+            </a>
+          </Card>
+
+          <Card className="p-6 space-y-4">
+            <div className="flex items-center gap-3">
+              <YouTubeBrandIcon className="w-8 h-8 shrink-0" />
+              <h2 className="text-lg font-bold text-[#0F213E] dark:text-[#F8F5EC]">
+                {lang === 'ar' ? 'قناة يوتيوب الرسمية' : 'Official YouTube Channel'}
+              </h2>
+            </div>
+            <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+              {lang === 'ar'
+                ? 'شاهد نماذج من الحصص التفاعلية، شروحات اللغات والحساب الذهني والنطق والتلاوة.'
+                : 'Watch interactive class previews, language tips, mental math, and recitation videos.'}
+            </p>
+            <a
+              href={ACADEMY_CONTACTS.youtubeUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-bold bg-[#DC2626] hover:bg-[#B91C1C] text-white transition-colors"
+            >
+              <span>{lang === 'ar' ? 'مشاهدة قناة يوتيوب' : 'Watch on YouTube'}</span>
+              <ExternalLink className="w-4 h-4" />
             </a>
           </Card>
         </div>
@@ -702,10 +804,10 @@ export function InfoStaticPage({
 
   const faqItems = [
     {
-      qAr: 'ما الفئات العمرية المناسبة للالتحاق بأكاديمية نور وبيان؟',
-      aAr: 'تستقبل الأكاديمية الأطفال والناشئة من عمر ٤ سنوات وحتى ١٨ عاماً عبر مسارات متدرجة تبدأ بتأسيس نور البيان وصولاً إلى حفظ القرآن الكريم والتجويد والمناهج الدولية.',
-      qEn: 'Which age groups can enroll at Noor & Bayan Academy?',
-      aEn: 'We welcome learners from ages 4 to 18 across structured tracks from Noor Al-Bayan reading foundations to Quran memorization, Tajweed, and school support.',
+      qAr: 'ما البرامج والفئات العمرية المناسبة للالتحاق بأكاديمية نور وبيان؟',
+      aAr: 'تستقبل الأكاديمية الطلاب من عمر ٤ سنوات وحتى ١٨ عاماً عبر مسارات شاملة تشمل القرآن الكريم والعلوم الإسلامية، وتأسيس نور البيان واللغة العربية، واللغات، وجميع المواد الدراسية والمناهج الدولية، إلى جانب الحساب الذهني وتنمية المهارات وتعديل النطق.',
+      qEn: 'Which programs and age groups can enroll at Noor & Bayan Academy?',
+      aEn: 'We welcome learners aged 4 to 18 across comprehensive tracks: Quran & Islamic studies, Noor Al-Bayan & Arabic, world languages, school subjects & international curricula, mental math, and speech/skill development.',
     },
     {
       qAr: 'كيف يتم تحديد المستوى المناسب لطفلي قبل بدء الحصص؟',
@@ -756,8 +858,8 @@ export function InfoStaticPage({
           <div className="font-bold text-sm">
             {lang === 'ar' ? 'لديك استفسار آخر؟' : 'Have another question?'}
           </div>
-          <div className="text-xs text-slate-500">
-            care@noorbayan.academy · +20 100 555 0199
+          <div dir="ltr" className="text-xs text-slate-500 font-mono-tabular">
+            {ACADEMY_CONTACTS.email} · {ACADEMY_CONTACTS.whatsappDisplay}
           </div>
         </div>
         <PrimaryButton onClick={() => onNavigate('/contact')}>

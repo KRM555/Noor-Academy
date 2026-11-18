@@ -29,4 +29,10 @@ export const queryKeys = {
   adminDashboard: (userId?: string | number) => ['dashboard', 'admin', userId ?? 'anon'] as const,
   adminLaunchStatus: ['admin', 'launch-status'] as const,
   adminSchema: ['admin', 'supabase-schema'] as const,
+  publicComments: ['public', 'comments'] as const,
+  publicSuggestions: ['public', 'suggestions'] as const,
+  publicPlacementTest: ['public', 'placement-test'] as const,
+  myCommunity: (userId?: string | number) => ['my', 'community', userId ?? 'anon'] as const,
+  adminCommunity: ['admin', 'community'] as const,
+  adminPlacementTest: ['admin', 'placement-test'] as const,
 };

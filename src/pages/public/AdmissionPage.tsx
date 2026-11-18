@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { useForm } from 'react-hook-form';
+import { Controller, useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { CheckCircle2, ExternalLink, GraduationCap, UserCheck, ShieldCheck, Eye, EyeOff } from 'lucide-react';
@@ -9,6 +9,7 @@ import { buildGoogleOAuthPopupRequest, isBrowserSupabaseConfigured, waitForGoogl
 import { tField } from '../../i18n/translations';
 import type { Course, Level } from '../../types';
 import { Card, PrimaryButton, SecondaryButton } from '../../components/ui/CommonUI';
+import { PhoneInputWithCode } from '../../components/ui/PhoneInputWithCode';
 
 const studentAdmissionSchema = z
   .object({
@@ -83,6 +84,7 @@ export function AdmissionPage({
   });
   const [submittedInfo, setSubmittedInfo] = useState<{ id: number; role: 'student' | 'teacher'; email: string } | null>(null);
   const [googlePrefillLoading, setGooglePrefillLoading] = useState(false);
+  const [googleAccessToken, setGoogleAccessToken] = useState<string | null>(null);
   const [blockedOAuthUrl, setBlockedOAuthUrl] = useState<string | null>(null);
   const [showStudentPass, setShowStudentPass] = useState(false);
   const [showStudentConfirm, setShowStudentConfirm] = useState(false);
@@ -152,6 +154,7 @@ export function AdmissionPage({
       }
       const accessToken = await waitForGoogleOAuthToken(state, popup);
       setBlockedOAuthUrl(null);
+      setGoogleAccessToken(accessToken);
       const res = await apiFetch<{ status: string; googleProfile: { email: string; full_name: string } }>(
         '/api/auth/google',
         {
@@ -197,6 +200,7 @@ export function AdmissionPage({
           recommended_level_id: values.recommended_level_id ? Number(values.recommended_level_id) : null,
           notes: values.notes,
           consent_accepted: values.consent_accepted,
+          ...(googleAccessToken ? { google_access_token: googleAccessToken } : {}),
         }),
       });
       setSubmittedInfo({ id: res.id, role: 'student', email: res.student_email || values.student_email });
@@ -220,6 +224,7 @@ export function AdmissionPage({
           bio_ar: values.bio_ar,
           password: values.password,
           consent_accepted: values.consent_accepted,
+          ...(googleAccessToken ? { google_access_token: googleAccessToken } : {}),
         }),
       });
       setSubmittedInfo({ id: res.id, role: 'teacher', email: res.email || values.email });
@@ -464,10 +469,19 @@ export function AdmissionPage({
 
               <div className="space-y-1.5">
                 <label className="text-xs font-bold">{lang === 'ar' ? 'رقم الواتساب / الهاتف *' : 'WhatsApp / Phone *'}</label>
-                <input
-                  {...studentForm.register('guardian_phone')}
-                  placeholder="+2010..."
-                  className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3.5 py-2.5 text-sm font-mono-tabular"
+                <Controller
+                  name="guardian_phone"
+                  control={studentForm.control}
+                  render={({ field }) => (
+                    <PhoneInputWithCode
+                      value={field.value}
+                      onChange={field.onChange}
+                      onBlur={field.onBlur}
+                      name={field.name}
+                      required
+                      placeholder="1012345678"
+                    />
+                  )}
                 />
                 {studentForm.formState.errors.guardian_phone && (
                   <p className="text-xs text-red-600">{lang === 'ar' ? 'يرجى إدخال رقم هاتف صحيح' : 'Valid phone required'}</p>
@@ -578,11 +592,19 @@ export function AdmissionPage({
 
               <div className="space-y-1.5">
                 <label className="text-xs font-bold">{lang === 'ar' ? 'رقم الواتساب / الهاتف *' : 'WhatsApp / Phone *'}</label>
-                <input
-                  dir="ltr"
-                  {...teacherForm.register('phone')}
-                  placeholder="+2010..."
-                  className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3.5 py-2.5 text-sm font-mono-tabular"
+                <Controller
+                  name="phone"
+                  control={teacherForm.control}
+                  render={({ field }) => (
+                    <PhoneInputWithCode
+                      value={field.value}
+                      onChange={field.onChange}
+                      onBlur={field.onBlur}
+                      name={field.name}
+                      required
+                      placeholder="1012345678"
+                    />
+                  )}
                 />
                 {teacherForm.formState.errors.phone && (
                   <p className="text-xs text-red-600">{lang === 'ar' ? 'يرجى إدخال رقم الهاتف' : 'Phone is required'}</p>

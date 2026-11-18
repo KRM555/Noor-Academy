@@ -34,6 +34,7 @@ export interface ExamVaultConfig {
   instructions_en: string;
   available_from: string | null;
   due_at: string | null;
+  time_limit_minutes?: number | null;
   allow_late_submission: boolean;
   show_answers_after_submit: boolean;
   question_file: StoredFileMeta | null;
@@ -52,12 +53,20 @@ export interface ExamSubmissionRecord {
   status: 'submitted_pending' | 'graded';
   submitted_at: string;
   is_late: boolean;
+  timed_out?: boolean;
   solution_file: StoredFileMeta | null;
   student_notes: string;
   quiz_answers: QuizAnswerEntry[];
   auto_score: number | null;
   graded_file: StoredFileMeta | null;
   graded_at: string | null;
+}
+
+export interface ExamAttemptRecord {
+  exam_id: number;
+  student_id: number;
+  started_at: string;
+  expires_at: string;
 }
 
 const DISALLOWED_EXTENSIONS = new Set([
@@ -228,6 +237,7 @@ export function defaultExamConfig(examId: number): ExamVaultConfig {
     instructions_en: '',
     available_from: null,
     due_at: null,
+    time_limit_minutes: null,
     allow_late_submission: true,
     show_answers_after_submit: true,
     question_file: null,
@@ -279,13 +289,28 @@ export async function saveExamSubmission(sb: SupabaseClient, record: ExamSubmiss
   });
 }
 
+export async function getExamAttempt(
+  sb: SupabaseClient,
+  examId: number,
+  studentId: number
+): Promise<ExamAttemptRecord | null> {
+  return readJsonFromVault<ExamAttemptRecord>(sb, `meta/attempt/${examId}/${studentId}.json`);
+}
+
+export async function saveExamAttempt(sb: SupabaseClient, record: ExamAttemptRecord): Promise<void> {
+  await writeJsonToVault(sb, `meta/attempt/${record.exam_id}/${record.student_id}.json`, record);
+}
+
 export async function deleteExamSubmissionRecord(
   sb: SupabaseClient,
   examId: number,
   studentId: number
 ): Promise<void> {
   const existing = await getExamSubmission(sb, examId, studentId);
-  const pathsToRemove = [`meta/sub/${examId}/${studentId}.json`];
+  const pathsToRemove = [
+    `meta/sub/${examId}/${studentId}.json`,
+    `meta/attempt/${examId}/${studentId}.json`,
+  ];
   if (existing?.solution_file?.path) pathsToRemove.push(existing.solution_file.path);
   if (existing?.graded_file?.path) pathsToRemove.push(existing.graded_file.path);
   await sb.storage.from(EXAM_VAULT_BUCKET).remove(pathsToRemove).catch(() => {});
@@ -405,6 +430,7 @@ export function sanitizeExamConfigForViewer(
     instructions_en: cfg.instructions_en,
     available_from: cfg.available_from,
     due_at: cfg.due_at,
+    time_limit_minutes: cfg.time_limit_minutes ?? null,
     allow_late_submission: cfg.allow_late_submission,
     show_answers_after_submit: cfg.show_answers_after_submit,
     is_open: nowAvailable,
@@ -425,6 +451,7 @@ export function sanitizeSubmissionForViewer(sub: ExamSubmissionRecord | null) {
     status: sub.status,
     submitted_at: sub.submitted_at,
     is_late: sub.is_late,
+    timed_out: Boolean(sub.timed_out),
     has_solution_file: Boolean(sub.solution_file),
     solution_file_name: sub.solution_file?.name ?? null,
     solution_file_mime: sub.solution_file?.mime ?? null,

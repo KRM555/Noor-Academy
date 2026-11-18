@@ -23,6 +23,7 @@ import {
   isBrowserSupabaseConfigured,
   waitForGoogleOAuthToken,
 } from '../../lib/supabase';
+import { PhoneInputWithCode } from '../../components/ui/PhoneInputWithCode';
 import type { AuthUser } from '../../types';
 import { Card, PrimaryButton, SecondaryButton, AcademyLogo } from '../../components/ui/CommonUI';
 
@@ -55,6 +56,9 @@ export function LoginPage({
   const [showGuardianPassword, setShowGuardianPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
+  const [guardianGoogleLoading, setGuardianGoogleLoading] = useState(false);
+  const [guardianGoogleToken, setGuardianGoogleToken] = useState<string | null>(null);
+  const [guardianPendingInfo, setGuardianPendingInfo] = useState<{ student_code: string; email: string } | null>(null);
   const [googleEnabled, setGoogleEnabled] = useState(() => isBrowserSupabaseConfigured());
   const [blockedOAuthUrl, setBlockedOAuthUrl] = useState<string | null>(null);
   const [unregisteredGoogle, setUnregisteredGoogle] = useState<{ email: string; full_name: string } | null>(null);
@@ -180,22 +184,72 @@ export function LoginPage({
     e.preventDefault();
     setLoading(true);
     try {
-      const res = await apiFetch<{ token: string; user: AuthUser; student_code: string }>('/api/auth/register-guardian', {
-        method: 'POST',
-        body: JSON.stringify(guardianForm),
-      });
-      setAuthSession(res.token, res.user);
+      const res = await apiFetch<{ status: string; request_id: number; student_code: string; email: string }>(
+        '/api/auth/register-guardian',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            ...guardianForm,
+            ...(guardianGoogleToken ? { google_access_token: guardianGoogleToken } : {}),
+          }),
+        }
+      );
+      setGuardianPendingInfo({ student_code: res.student_code, email: res.email });
+      setGuardianForm((prev) => ({ ...prev, password: '' }));
+      setGuardianGoogleToken(null);
       toast(
         lang === 'ar'
-          ? `تم تفعيل حساب ولي الأمر وربطه بالطالب (${res.student_code}) بنجاح`
-          : `Guardian account linked to student ${res.student_code}`,
+          ? `تم إرسال طلب تفعيل ولي الأمر للطالب (${res.student_code}) وهو الآن بانتظار موافقة الإدارة`
+          : `Guardian activation request submitted for ${res.student_code} and awaiting admin approval`,
         'success'
       );
-      onSuccess();
     } catch (err: unknown) {
       toast(err instanceof Error ? err.message : 'Registration failed', 'error');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleGuardianGooglePrefill = async () => {
+    setGuardianGoogleLoading(true);
+    setBlockedOAuthUrl(null);
+    const popup = window.open('about:blank', 'nb_google_oauth', 'width=520,height=680');
+    try {
+      const { state, url } = await buildGoogleOAuthPopupRequest();
+      if (popup && !popup.closed) {
+        popup.location.href = url;
+      } else {
+        setBlockedOAuthUrl(url);
+      }
+      const accessToken = await waitForGoogleOAuthToken(state, popup);
+      setBlockedOAuthUrl(null);
+      setGuardianGoogleToken(accessToken);
+      const res = await apiFetch<{ status: string; googleProfile: { email: string; full_name: string } }>(
+        '/api/auth/google',
+        {
+          method: 'POST',
+          body: JSON.stringify({ access_token: accessToken, intent: 'prefill' }),
+        }
+      );
+      if (res.googleProfile?.email) {
+        setGuardianForm((prev) => ({
+          ...prev,
+          email: res.googleProfile.email,
+          full_name: prev.full_name || res.googleProfile.full_name || prev.full_name,
+        }));
+      }
+      toast(lang === 'ar' ? 'تم التحقق من البريد عبر Google' : 'Email verified with Google', 'success');
+    } catch (err: unknown) {
+      if (popup && !popup.closed) {
+        try {
+          popup.close();
+        } catch {
+          // ignore
+        }
+      }
+      toast(err instanceof Error ? err.message : 'Unable to verify Google account', 'error');
+    } finally {
+      setGuardianGoogleLoading(false);
     }
   };
 
@@ -451,6 +505,7 @@ export function LoginPage({
                     setSelectedPortal(opt.id);
                     setUnregisteredGoogle(null);
                     setPendingNotice(false);
+                    setGuardianPendingInfo(null);
                   }}
                   className={`p-3 rounded-xl border text-start transition-colors cursor-pointer space-y-1.5 ${
                     active
@@ -480,7 +535,10 @@ export function LoginPage({
           <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-[#F2EFE6] dark:bg-[#13284A]">
             <button
               type="button"
-              onClick={() => setGuardianMode('login')}
+              onClick={() => {
+                setGuardianMode('login');
+                setGuardianPendingInfo(null);
+              }}
               className={`py-2 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer transition-colors ${
                 guardianMode === 'login' ? 'bg-white dark:bg-[#0F213E] shadow-sm text-[#0F213E] dark:text-[#F8F5EC]' : 'text-slate-600 dark:text-slate-300'
               }`}
@@ -490,7 +548,10 @@ export function LoginPage({
             </button>
             <button
               type="button"
-              onClick={() => setGuardianMode('register')}
+              onClick={() => {
+                setGuardianMode('register');
+                setGuardianPendingInfo(null);
+              }}
               className={`py-2 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer transition-colors ${
                 guardianMode === 'register'
                   ? 'bg-white dark:bg-[#0F213E] shadow-sm text-[#0F766E] dark:text-[#2DD4BF]'
@@ -756,12 +817,62 @@ export function LoginPage({
               </div>
             )}
           </>
+        ) : guardianPendingInfo ? (
+          <div className="p-5 rounded-xl border border-[#0F766E]/40 bg-[#0F766E]/8 space-y-4 text-center">
+            <CheckCircle2 className="w-10 h-10 text-[#0F766E] dark:text-[#2DD4BF] mx-auto" />
+            <div className="space-y-1.5">
+              <h2 className="text-lg font-extrabold text-[#0F213E] dark:text-[#F8F5EC]">
+                {lang === 'ar' ? 'تم استلام طلب تفعيل حساب ولي الأمر' : 'Guardian Activation Request Received'}
+              </h2>
+              <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                {lang === 'ar'
+                  ? `تم تسجيل بياناتك وربطها مؤقتاً بالطالب (${guardianPendingInfo.student_code}) بالبريد (${guardianPendingInfo.email}). يلزم الآن موافقة إدارة الأكاديمية على الطلب قبل التمكن من تسجيل الدخول.`
+                  : `Your activation request for student (${guardianPendingInfo.student_code}) with email (${guardianPendingInfo.email}) has been recorded. Academy administration approval is required before signing in.`}
+              </p>
+            </div>
+            <SecondaryButton
+              type="button"
+              onClick={() => {
+                setEmail(guardianPendingInfo.email);
+                setGuardianPendingInfo(null);
+                setGuardianMode('login');
+              }}
+              className="mx-auto"
+            >
+              <LogIn className="w-4 h-4" />
+              <span>{lang === 'ar' ? 'العودة لصفحة تسجيل الدخول' : 'Back to Sign In'}</span>
+            </SecondaryButton>
+          </div>
         ) : (
           <form onSubmit={handleGuardianRegister} className="space-y-3.5">
-            <div className="rounded-xl p-3 bg-[#F2EFE6] dark:bg-[#13284A] border border-[#E5DEC9] dark:border-[#233C63] text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-              {lang === 'ar'
-                ? 'أدخل كود الطالب الخاص بابنك مع البريد الإلكتروني المسجل لولي الأمر في طلب التقديم وكلمة المرور التي تريدها.'
-                : 'Enter your child Student Code alongside the registered Guardian Email and your new password.'}
+            <div className="rounded-xl p-3 bg-[#F2EFE6] dark:bg-[#13284A] border border-[#E5DEC9] dark:border-[#233C63] text-xs text-slate-600 dark:text-slate-300 leading-relaxed space-y-2">
+              <p>
+                {lang === 'ar'
+                  ? 'أدخل كود الطالب الخاص بابنك مع البريد الإلكتروني المسجل لولي الأمر وكلمة المرور التي تريدها. سيتم مراجعة الطلب واعتماده من إدارة الأكاديمية لتفعيل الحساب.'
+                  : 'Enter your child Student Code alongside the registered Guardian Email and your new password. Academy administration approval activates your account.'}
+              </p>
+              {googleEnabled && (
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-[#E5DEC9] dark:border-[#233C63]">
+                  <span>
+                    {lang === 'ar' ? 'تريد ربط بريد Google والتحقق منه مباشرة؟' : 'Want to verify via Google first?'}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={guardianGoogleLoading}
+                    onClick={handleGuardianGooglePrefill}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#0F213E] px-2.5 py-1 text-[11px] font-bold hover:bg-[#FAF8F3] cursor-pointer disabled:opacity-60"
+                  >
+                    <GoogleMark />
+                    <span>
+                      {guardianGoogleLoading
+                        ? lang === 'ar' ? 'بانتظار Google...' : 'Waiting...'
+                        : guardianGoogleToken
+                        ? lang === 'ar' ? 'تم التحقق عبر Google' : 'Verified via Google'
+                        : lang === 'ar' ? 'التحقق من البريد عبر Google' : 'Verify Email with Google'}
+                    </span>
+                  </button>
+                </div>
+              )}
             </div>
             <div className="space-y-1">
               <label className="text-xs font-bold">{lang === 'ar' ? 'اسم ولي الأمر الكامل *' : 'Guardian Full Name *'}</label>
@@ -787,15 +898,12 @@ export function LoginPage({
                   className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3.5 py-2.5 text-sm font-mono-tabular uppercase"
                 />
               </div>
-              <div className="space-y-1">
+              <div className="space-y-1 sm:col-span-2">
                 <label className="text-xs font-bold">{lang === 'ar' ? 'رقم الهاتف (اختياري)' : 'Phone (optional)'}</label>
-                <input
-                  type="tel"
-                  dir="ltr"
+                <PhoneInputWithCode
                   value={guardianForm.phone}
-                  onChange={(e) => setGuardianForm({ ...guardianForm, phone: e.target.value })}
-                  placeholder="+20 10..."
-                  className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3.5 py-2.5 text-sm font-mono-tabular"
+                  onChange={(nextPhone) => setGuardianForm({ ...guardianForm, phone: nextPhone })}
+                  placeholder="1012345678"
                 />
               </div>
             </div>

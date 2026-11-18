@@ -12,6 +12,8 @@ import {
   insertRowSafe,
   getSupabaseLiveHealth,
   pingSupabaseDatabase,
+  findSupabaseAuthUserByEmail,
+  verifyVerifiedGoogleToken,
   provisionSupabaseAuthUser,
   syncUsersToSupabaseAuth,
   requestSupabasePasswordReset,
@@ -26,13 +28,28 @@ import {
   saveTeacherApplication,
   getTeacherApplication,
   listTeacherApplications,
+  saveGuardianRequest,
+  getGuardianRequest,
+  listGuardianRequests,
   deletePendingAuthProfileIfSafe,
+  saveCourseMeta,
+  getCourseMeta,
+  listCourseMetas,
+  uploadCourseCoverFile,
+  removeCourseCoverFile,
+  readCourseCoverFile,
+  saveLessonMeta,
+  getLessonMeta,
+  listLessonMetas,
+  type LessonMetaRecord,
 } from './server/applicationVault.ts';
 import {
   getExamVaultConfig,
   saveExamVaultConfig,
   getExamSubmission,
   saveExamSubmission,
+  getExamAttempt,
+  saveExamAttempt,
   deleteExamSubmissionRecord,
   listExamSubmissionsForExam,
   uploadExamBinaryFile,
@@ -47,6 +64,22 @@ import {
   type ExamSubmissionRecord,
   type QuizQuestionConfig,
 } from './server/examVault.ts';
+import {
+  listAllComments,
+  getCommentById,
+  saveComment,
+  deleteCommentRecord,
+  sanitizeCommentForPublic,
+  listAllSuggestions,
+  getSuggestionById,
+  saveSuggestion,
+  deleteSuggestionRecord,
+  sanitizeSuggestionForPublic,
+  getPlacementTestConfig,
+  savePlacementTestConfig,
+  sanitizePlacementConfigForPublic,
+  generateRecordId,
+} from './server/communityVault.ts';
 
 dotenv.config();
 
@@ -68,7 +101,15 @@ requireSupabaseAdmin();
 const app = express();
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
-app.use(express.json({ limit: '2mb' }));
+const UPLOAD_JSON_SUFFIXES = ['/upload-material', '/question-file', '/submit-file', '/grade', '/cover'];
+const defaultJsonParser = express.json({ limit: '256kb' });
+app.use((req, res, next) => {
+  if (UPLOAD_JSON_SUFFIXES.some((suffix) => req.path.endsWith(suffix))) {
+    next();
+    return;
+  }
+  defaultJsonParser(req, res, next);
+});
 
 let isShuttingDown = false;
 app.use((req, res, next) => {
@@ -115,15 +156,18 @@ app.use((req, res, next) => {
     IS_PRODUCTION && process.env.ALLOW_IFRAME_EMBED !== 'true'
       ? "'self'"
       : "'self' https://aistudio.google.com https://*.google.com";
+  const connectSrc = IS_PRODUCTION
+    ? "connect-src 'self' https://*.supabase.co wss://*.supabase.co"
+    : "connect-src 'self' https://*.supabase.co wss://*.supabase.co ws: wss:";
   res.setHeader(
     'Content-Security-Policy',
     [
       "default-src 'self'",
-      "script-src 'self' 'unsafe-inline'",
+      "script-src 'self'",
       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
       "font-src 'self' https://fonts.gstatic.com data:",
       "img-src 'self' data: blob: https:",
-      "connect-src 'self' https://*.supabase.co wss://*.supabase.co ws: wss:",
+      connectSrc,
       "worker-src 'self' blob:",
       "manifest-src 'self'",
       "object-src 'none'",
@@ -204,6 +248,7 @@ const publicSubmitLimiter = createRateLimiter(15 * 60 * 1000, 15);
 const verifyLimiter = createRateLimiter(15 * 60 * 1000, 40);
 const guardianVerifyLimiter = createRateLimiter(15 * 60 * 1000, 6);
 const examUploadLimiter = createRateLimiter(15 * 60 * 1000, 25);
+const communityWriteLimiter = createRateLimiter(15 * 60 * 1000, 20);
 
 function generateTempPassword(): string {
   return `NB-${crypto.randomBytes(6).toString('base64url')}`;
@@ -229,7 +274,7 @@ const placementSchema = z.object({
   child_name: z.string().trim().min(2).max(120),
   age: z.coerce.number().int().min(3).max(22),
   parent_email: z.string().trim().email().optional().or(z.literal('')),
-  answers: z.array(z.number().int().min(0).max(5)).min(1).max(10),
+  answers: z.array(z.number().int().min(0).max(5)).min(1).max(20),
 });
 
 const admissionSchema = z.object({
@@ -244,6 +289,7 @@ const admissionSchema = z.object({
   recommended_level_id: z.coerce.number().int().positive().nullable().optional(),
   notes: z.string().trim().max(1000).optional(),
   consent_accepted: z.literal(true).or(z.literal(1)).or(z.boolean().refine((v) => v === true)),
+  google_access_token: z.string().max(8192).optional(),
 });
 
 const teacherApplicationSchema = z.object({
@@ -256,6 +302,7 @@ const teacherApplicationSchema = z.object({
   qualifications_ar: z.string().trim().min(2).max(400),
   bio_ar: z.string().trim().max(1500).optional(),
   consent_accepted: z.literal(true).or(z.literal(1)).or(z.boolean().refine((v) => v === true)),
+  google_access_token: z.string().max(8192).optional(),
 });
 
 interface AuthUser {
@@ -449,6 +496,26 @@ function requireRole(...roles: Array<'student' | 'teacher' | 'admin' | 'guardian
   };
 }
 
+async function tryAuthenticateOptional(req: Request): Promise<AuthUser | null> {
+  try {
+    const token = extractRequestToken(req);
+    if (!token) return null;
+    const decoded = verifyToken(token);
+    if (!decoded) return null;
+    const sb = requireSupabaseAdmin();
+    const { data: profile } = await sb
+      .from('profiles')
+      .select('id, email, full_name, role, is_active, preferred_lang')
+      .eq('id', String(decoded.id))
+      .is('deleted_at', null)
+      .maybeSingle();
+    if (!profile || !profile.is_active) return null;
+    return profile as AuthUser;
+  } catch {
+    return null;
+  }
+}
+
 // ============================================================================
 // HEALTH CHECK (Liveness & Supabase Readiness for Hosting Probes)
 // ============================================================================
@@ -471,7 +538,18 @@ app.get('/api/health', asyncHandler(async (_req, res) => {
 // ============================================================================
 // PUBLIC ROUTES (No Auth Required)
 // ============================================================================
+let overviewCache: { payload: unknown; expiresAt: number } | null = null;
+function invalidateOverviewCache(): void {
+  overviewCache = null;
+}
+
 app.get('/api/public/overview', asyncHandler(async (_req, res) => {
+  if (overviewCache && Date.now() < overviewCache.expiresAt) {
+    res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
+    res.json(overviewCache.payload);
+    return;
+  }
+
   const sb = requireSupabaseAdmin();
   const [
     studentsRes,
@@ -480,8 +558,8 @@ app.get('/api/public/overview', asyncHandler(async (_req, res) => {
     lessonsRes,
     levelsRes,
     gamesRes,
-    testimonialsRes,
     legalRes,
+    courseMetasMap,
   ] = await Promise.all([
     sb.from('students').select('id', { count: 'exact', head: true }).is('deleted_at', null),
     sb
@@ -499,14 +577,25 @@ app.get('/api/public/overview', asyncHandler(async (_req, res) => {
     sb.from('lessons').select('id', { count: 'exact', head: true }).is('deleted_at', null),
     sb.from('levels').select('*').order('order_index', { ascending: true }),
     sb.from('games').select('*').eq('is_active', true).order('id', { ascending: true }),
-    sb.from('testimonials').select('*').eq('is_approved', true).order('id', { ascending: true }),
     sb.from('legal_documents').select('doc_type, version, title_ar, title_en, content_ar, content_en, updated_at').order('id', { ascending: true }),
+    listCourseMetas(sb),
   ]);
+
+  const publicTeacherById = new Map<number, { name_ar: string; name_en: string }>();
+  for (const t of teachersRes.data || []) {
+    publicTeacherById.set(Number((t as { id: number }).id), {
+      name_ar: String((t as { name_ar?: string }).name_ar || ''),
+      name_en: String((t as { name_en?: string }).name_en || ''),
+    });
+  }
 
   const courses = (coursesRes.data || []).map((c: Record<string, unknown>) => {
     const lvl = c.levels as { name_ar?: string; name_en?: string; code?: string } | null;
     const tch = c.teachers as { name_ar?: string; name_en?: string; avatar_url?: string } | null;
     const { levels: _l, teachers: _t, ...rest } = c;
+    const cid = Number(rest.id);
+    const meta = courseMetasMap.get(cid);
+    const coIds = (meta?.co_teacher_ids || []).filter((id) => id !== Number(rest.teacher_id));
     return {
       ...rest,
       level_name_ar: lvl?.name_ar ?? null,
@@ -515,10 +604,15 @@ app.get('/api/public/overview', asyncHandler(async (_req, res) => {
       teacher_name_ar: tch?.name_ar ?? null,
       teacher_name_en: tch?.name_en ?? null,
       teacher_avatar: tch?.avatar_url ?? null,
+      cover_url: meta?.cover_url ?? null,
+      price_monthly_sar: meta?.price_monthly_sar ?? null,
+      co_teacher_ids: coIds,
+      co_teacher_names_ar: coIds.map((id) => publicTeacherById.get(id)?.name_ar).filter(Boolean),
+      co_teacher_names_en: coIds.map((id) => publicTeacherById.get(id)?.name_en).filter(Boolean),
     };
   });
 
-  res.json({
+  const payload = {
     stats: {
       students: studentsRes.count || 0,
       teachers: teachersRes.data?.length || 0,
@@ -529,9 +623,38 @@ app.get('/api/public/overview', asyncHandler(async (_req, res) => {
     teachers: teachersRes.data || [],
     levels: levelsRes.data || [],
     games: gamesRes.data || [],
-    testimonials: testimonialsRes.data || [],
+    testimonials: [],
     legal: legalRes.data || [],
-  });
+  };
+  overviewCache = { payload, expiresAt: Date.now() + 60_000 };
+  res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
+  res.json(payload);
+}));
+
+app.get('/api/public/course-covers/:id', asyncHandler(async (req, res) => {
+  const courseId = Number(req.params.id);
+  if (!Number.isInteger(courseId) || courseId <= 0) {
+    res.status(404).end();
+    return;
+  }
+  const sb = requireSupabaseAdmin();
+  const meta = await getCourseMeta(sb, courseId);
+  if (!meta?.cover_storage_path) {
+    res.status(404).end();
+    return;
+  }
+  const buf = await readCourseCoverFile(sb, meta.cover_storage_path);
+  if (!buf) {
+    res.status(404).end();
+    return;
+  }
+  const mime = meta.cover_mime && ['image/png', 'image/jpeg', 'image/webp'].includes(meta.cover_mime)
+    ? meta.cover_mime
+    : 'image/jpeg';
+  res.setHeader('Content-Type', mime);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  res.send(buf);
 }));
 
 app.get('/api/public/courses/:id', asyncHandler(async (req, res) => {
@@ -560,6 +683,12 @@ app.get('/api/public/courses/:id', asyncHandler(async (req, res) => {
   } | null;
   const { levels: _l, teachers: _t, ...rest } = c as Record<string, unknown>;
 
+  const courseMeta = await getCourseMeta(sb, courseId);
+  const coIds = (courseMeta?.co_teacher_ids || []).filter((id) => id !== Number(tch?.id ?? rest.teacher_id));
+  const coTeachers = coIds.length
+    ? ((await sb.from('teachers').select('id, name_ar, name_en').in('id', coIds).is('deleted_at', null)).data || [])
+    : [];
+
   const course = {
     ...rest,
     level_name_ar: lvl?.name_ar ?? null,
@@ -571,16 +700,35 @@ app.get('/api/public/courses/:id', asyncHandler(async (req, res) => {
     teacher_qualifications_ar: tch?.qualifications_ar ?? null,
     teacher_qualifications_en: tch?.qualifications_en ?? null,
     teacher_avatar: tch?.avatar_url ?? null,
+    cover_url: courseMeta?.cover_url ?? null,
+    price_monthly_sar: courseMeta?.price_monthly_sar ?? null,
+    co_teacher_ids: coIds,
+    co_teacher_names_ar: coTeachers.map((t: { name_ar: string }) => t.name_ar),
+    co_teacher_names_en: coTeachers.map((t: { name_en: string }) => t.name_en),
   };
 
-  const { data: lessons } = await sb
-    .from('lessons')
-    .select('id, title_ar, title_en, lesson_date, duration_min, objectives_ar, objectives_en')
-    .eq('course_id', courseId)
-    .is('deleted_at', null)
-    .order('lesson_date', { ascending: true });
+  const [{ data: lessons }, lessonMetasMap] = await Promise.all([
+    sb
+      .from('lessons')
+      .select('id, title_ar, title_en, lesson_date, start_time, duration_min, objectives_ar, objectives_en')
+      .eq('course_id', courseId)
+      .is('deleted_at', null)
+      .order('lesson_date', { ascending: true }),
+    listLessonMetas(sb),
+  ]);
 
-  res.json({ course, lessons: lessons || [] });
+  const publishedLessons = (lessons || [])
+    .map((l: Record<string, unknown>) => {
+      const lm = lessonMetasMap.get(Number(l.id));
+      return {
+        ...l,
+        weekday_ar: lm?.weekday_ar ?? '',
+        is_published: lm ? lm.is_published : true,
+      };
+    })
+    .filter((l) => l.is_published);
+
+  res.json({ course, lessons: publishedLessons });
 }));
 
 app.get('/api/public/teachers/:id', asyncHandler(async (req, res) => {
@@ -631,6 +779,13 @@ app.get('/api/public/certificates/verify/:code', verifyLimiter, asyncHandler(asy
   res.json({ valid: !cert.revoked_at, certificate: cert });
 }));
 
+app.get('/api/public/placement-test', asyncHandler(async (_req, res) => {
+  const sb = requireSupabaseAdmin();
+  const cfg = await getPlacementTestConfig(sb);
+  res.setHeader('Cache-Control', 'no-cache');
+  res.json(sanitizePlacementConfigForPublic(cfg));
+}));
+
 app.post('/api/public/placement-test', publicSubmitLimiter, asyncHandler(async (req, res) => {
   const parsed = placementSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -638,16 +793,26 @@ app.post('/api/public/placement-test', publicSubmitLimiter, asyncHandler(async (
     return;
   }
   const { child_name, age, parent_email, answers } = parsed.data;
-
-  // Score calculation: 5 questions, correct indices [1, 2, 0, 2, 1]
-  const key = [1, 2, 0, 2, 1];
-  let correctCount = 0;
-  answers.forEach((ans, idx) => {
-    if (ans === key[idx]) correctCount += 1;
-  });
-  const score = Math.round((correctCount / key.length) * 100);
-
   const sb = requireSupabaseAdmin();
+  const cfg = await getPlacementTestConfig(sb);
+
+  if (answers.length !== cfg.questions.length) {
+    res.status(400).json({ error: `Please answer all ${cfg.questions.length} questions.` });
+    return;
+  }
+
+  let correctCount = 0;
+  for (let i = 0; i < cfg.questions.length; i += 1) {
+    const q = cfg.questions[i];
+    const chosen = answers[i];
+    if (chosen < 0 || chosen >= q.opts_ar.length) {
+      res.status(400).json({ error: 'Invalid option index submitted.' });
+      return;
+    }
+    if (chosen === q.correct_index) correctCount += 1;
+  }
+
+  const score = Math.round((correctCount / cfg.questions.length) * 100);
   const { data: levels } = await sb.from('levels').select('*').order('order_index', { ascending: true });
   const levelList = (levels || []) as Array<{
     id: number;
@@ -659,9 +824,9 @@ app.post('/api/public/placement-test', publicSubmitLimiter, asyncHandler(async (
   }>;
 
   let recommended = levelList[0];
-  if (score >= 80 && age >= 9) {
+  if (score >= cfg.thresholds.advanced_min_score && age >= cfg.thresholds.advanced_min_age) {
     recommended = levelList[2] || levelList[levelList.length - 1];
-  } else if (score >= 50) {
+  } else if (score >= cfg.thresholds.intermediate_min_score) {
     recommended = levelList[1] || levelList[0];
   }
 
@@ -674,7 +839,7 @@ app.post('/api/public/placement-test', publicSubmitLimiter, asyncHandler(async (
     answers_json: answers,
   });
 
-  res.json({ score, correctCount, total: key.length, recommendedLevel: recommended });
+  res.json({ score, correctCount, total: cfg.questions.length, recommendedLevel: recommended });
 }));
 
 app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req, res) => {
@@ -694,6 +859,7 @@ app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req,
     preferred_course_id,
     recommended_level_id,
     notes,
+    google_access_token,
   } = parsed.data;
 
   const cleanStudentEmail = student_email.toLowerCase();
@@ -715,16 +881,38 @@ app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req,
     return;
   }
 
-  const { user: authUser, alreadyExisted } = await provisionSupabaseAuthUser(
-    cleanStudentEmail,
-    student_password,
-    student_name,
-    'student',
-    { updateExistingPassword: true }
-  );
+  const existingAuth = await findSupabaseAuthUserByEmail(cleanStudentEmail);
+  let authUserId: string;
+  let alreadyExisted = false;
+
+  if (existingAuth) {
+    const verifiedGoogle = google_access_token ? await verifyVerifiedGoogleToken(sb, google_access_token) : null;
+    if (!verifiedGoogle || verifiedGoogle.email !== cleanStudentEmail) {
+      res.status(409).json({
+        error: 'An authentication account already exists for this email. Verify ownership using Fill with Google or use another email.',
+      });
+      return;
+    }
+    const { data: upd, error: updErr } = await sb.auth.admin.updateUserById(existingAuth.id, {
+      password: student_password,
+      email_confirm: true,
+      user_metadata: { ...(existingAuth.user_metadata || {}), full_name: student_name, role: 'student' },
+    });
+    if (updErr || !upd.user) {
+      res.status(500).json({ error: updErr?.message || 'Failed to prepare student account' });
+      return;
+    }
+    authUserId = upd.user.id;
+    alreadyExisted = true;
+  } else {
+    const provisioned = await provisionSupabaseAuthUser(cleanStudentEmail, student_password, student_name, 'student');
+    authUserId = provisioned.user.id;
+    alreadyExisted = provisioned.alreadyExisted;
+  }
+
   const { error: profErr } = await sb.from('profiles').upsert(
     {
-      id: authUser.id,
+      id: authUserId,
       email: cleanStudentEmail,
       full_name: student_name,
       role: 'student',
@@ -735,7 +923,7 @@ app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req,
   );
   if (profErr) {
     if (!alreadyExisted) {
-      await sb.auth.admin.deleteUser(authUser.id).catch(() => {});
+      await sb.auth.admin.deleteUser(authUserId).catch(() => {});
     }
     res.status(500).json({ error: profErr.message });
     return;
@@ -759,11 +947,11 @@ app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req,
     await saveAdmissionMeta(sb, {
       admission_id: inserted.id,
       student_email: cleanStudentEmail,
-      pending_profile_id: authUser.id,
+      pending_profile_id: authUserId,
       created_at: new Date().toISOString(),
     });
   } catch (err) {
-    await deletePendingAuthProfileIfSafe(sb, authUser.id);
+    await deletePendingAuthProfileIfSafe(sb, authUserId);
     throw err;
   }
 
@@ -784,7 +972,7 @@ app.post('/api/public/teacher-applications', publicSubmitLimiter, asyncHandler(a
     return;
   }
 
-  const { name_ar, name_en, email, password, phone, specialty_ar, qualifications_ar, bio_ar } = parsed.data;
+  const { name_ar, name_en, email, password, phone, specialty_ar, qualifications_ar, bio_ar, google_access_token } = parsed.data;
   const cleanEmail = email.toLowerCase();
   const sb = requireSupabaseAdmin();
 
@@ -799,16 +987,38 @@ app.post('/api/public/teacher-applications', publicSubmitLimiter, asyncHandler(a
     return;
   }
 
-  const { user: authUser, alreadyExisted } = await provisionSupabaseAuthUser(
-    cleanEmail,
-    password,
-    name_ar,
-    'teacher',
-    { updateExistingPassword: true }
-  );
+  const existingAuth = await findSupabaseAuthUserByEmail(cleanEmail);
+  let authUserId: string;
+  let alreadyExisted = false;
+
+  if (existingAuth) {
+    const verifiedGoogle = google_access_token ? await verifyVerifiedGoogleToken(sb, google_access_token) : null;
+    if (!verifiedGoogle || verifiedGoogle.email !== cleanEmail) {
+      res.status(409).json({
+        error: 'An authentication account already exists for this email. Verify ownership using Fill with Google or use another email.',
+      });
+      return;
+    }
+    const { data: upd, error: updErr } = await sb.auth.admin.updateUserById(existingAuth.id, {
+      password,
+      email_confirm: true,
+      user_metadata: { ...(existingAuth.user_metadata || {}), full_name: name_ar, role: 'teacher' },
+    });
+    if (updErr || !upd.user) {
+      res.status(500).json({ error: updErr?.message || 'Failed to prepare teacher account' });
+      return;
+    }
+    authUserId = upd.user.id;
+    alreadyExisted = true;
+  } else {
+    const provisioned = await provisionSupabaseAuthUser(cleanEmail, password, name_ar, 'teacher');
+    authUserId = provisioned.user.id;
+    alreadyExisted = provisioned.alreadyExisted;
+  }
+
   const { error: profErr } = await sb.from('profiles').upsert(
     {
-      id: authUser.id,
+      id: authUserId,
       email: cleanEmail,
       full_name: name_ar,
       role: 'teacher',
@@ -819,7 +1029,7 @@ app.post('/api/public/teacher-applications', publicSubmitLimiter, asyncHandler(a
   );
   if (profErr) {
     if (!alreadyExisted) {
-      await sb.auth.admin.deleteUser(authUser.id).catch(() => {});
+      await sb.auth.admin.deleteUser(authUserId).catch(() => {});
     }
     res.status(500).json({ error: profErr.message });
     return;
@@ -829,7 +1039,7 @@ app.post('/api/public/teacher-applications', publicSubmitLimiter, asyncHandler(a
   try {
     await saveTeacherApplication(sb, {
       id: appId,
-      profile_id: authUser.id,
+      profile_id: authUserId,
       email: cleanEmail,
       name_ar,
       name_en: (name_en || name_ar).trim(),
@@ -841,7 +1051,7 @@ app.post('/api/public/teacher-applications', publicSubmitLimiter, asyncHandler(a
       created_at: new Date().toISOString(),
     });
   } catch (err) {
-    await deletePendingAuthProfileIfSafe(sb, authUser.id);
+    await deletePendingAuthProfileIfSafe(sb, authUserId);
     throw err;
   }
 
@@ -943,8 +1153,9 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
   }
 
   if (!profile.is_active) {
-    if (profile.role === 'student' || profile.role === 'teacher') {
-      const table = profile.role === 'student' ? 'students' : 'teachers';
+    if (profile.role === 'student' || profile.role === 'teacher' || profile.role === 'guardian') {
+      const table =
+        profile.role === 'student' ? 'students' : profile.role === 'teacher' ? 'teachers' : 'guardians';
       const { data: linked } = await sb.from(table).select('id').eq('profile_id', profile.id).maybeSingle();
       if (!linked) {
         res.status(403).json({
@@ -1053,15 +1264,21 @@ app.post('/api/auth/forgot-password', loginLimiter, asyncHandler(async (req, res
     res.status(400).json({ error: 'Valid email is required.' });
     return;
   }
-  const rawOrigin = String(req.headers.origin || process.env.APP_URL || '').trim().replace(/\/+$/, '');
-  const safeOrigin = /^https?:\/\/[a-zA-Z0-9.-]+(:\d+)?$/.test(rawOrigin) ? rawOrigin : undefined;
-  const redirectTo = safeOrigin ? `${safeOrigin}/login?mode=reset-password` : undefined;
+  const baseUrl = IS_PRODUCTION
+    ? resolvePublicBaseUrl(req)
+    : (() => {
+        const rawOrigin = String(req.headers.origin || process.env.APP_URL || '').trim().replace(/\/+$/, '');
+        return /^https?:\/\/[a-zA-Z0-9.-]+(:\d+)?$/.test(rawOrigin) ? rawOrigin : resolvePublicBaseUrl(req);
+      })();
+  const redirectTo = `${baseUrl}/login?mode=reset-password`;
   const result = await requestSupabasePasswordReset(parsed.data.email.toLowerCase(), redirectTo);
+  if (!result.sent && result.reason) {
+    console.warn('[auth] forgot-password reset delivery fallback:', result.reason);
+  }
   res.json({
     ok: true,
     emailSentViaSupabase: result.sent,
     mode: result.sent ? 'supabase_email' : 'admin_assisted',
-    ...(result.sent ? {} : { reason: result.reason }),
   });
 }));
 
@@ -1117,6 +1334,7 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
     student_code: z.string().trim().min(4).max(40),
     phone: z.string().trim().max(32).optional(),
     relation: z.string().trim().max(40).optional(),
+    google_access_token: z.string().max(8192).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -1166,6 +1384,16 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
     return;
   }
 
+  const existingPending = (await listGuardianRequests(sb)).find(
+    (r) => r.status === 'pending' && (r.student_code.toUpperCase() === cleanCode || r.email.toLowerCase() === cleanEmail)
+  );
+  if (existingPending) {
+    res.status(409).json({
+      error: 'A guardian activation request for this student code or email is already pending administrator approval.',
+    });
+    return;
+  }
+
   const { data: existingProfile } = await sb
     .from('profiles')
     .select('id, role')
@@ -1177,63 +1405,95 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
     res.status(409).json({
       error:
         existingProfile.role === 'guardian'
-          ? 'A guardian account with this email already exists. Please sign in and link additional children from your dashboard.'
+          ? 'A guardian account with this email already exists or is awaiting review.'
           : 'This email is already registered under another academy account role.',
     });
     return;
   }
 
-  const { user } = await provisionSupabaseAuthUser(
-    cleanEmail,
-    parsed.data.password,
-    parsed.data.full_name,
-    'guardian',
-    { updateExistingPassword: true }
-  );
+  const existingAuth = await findSupabaseAuthUserByEmail(cleanEmail);
+  let userId: string;
+  let alreadyExisted = false;
+
+  if (existingAuth) {
+    const verifiedGoogle = parsed.data.google_access_token
+      ? await verifyVerifiedGoogleToken(sb, parsed.data.google_access_token)
+      : null;
+    if (!verifiedGoogle || verifiedGoogle.email !== cleanEmail) {
+      res.status(409).json({
+        error: 'An authentication account already exists for this email. Verify with Google Sign-In or contact Academy administration.',
+      });
+      return;
+    }
+    const { data: upd, error: updErr } = await sb.auth.admin.updateUserById(existingAuth.id, {
+      password: parsed.data.password,
+      email_confirm: true,
+      user_metadata: { ...(existingAuth.user_metadata || {}), full_name: parsed.data.full_name, role: 'guardian' },
+    });
+    if (updErr || !upd.user) {
+      res.status(500).json({ error: updErr?.message || 'Failed to prepare guardian account' });
+      return;
+    }
+    userId = upd.user.id;
+    alreadyExisted = true;
+  } else {
+    const provisioned = await provisionSupabaseAuthUser(cleanEmail, parsed.data.password, parsed.data.full_name, 'guardian');
+    userId = provisioned.user.id;
+    alreadyExisted = provisioned.alreadyExisted;
+  }
+
   const { error: profErr } = await sb.from('profiles').upsert(
     {
-      id: user.id,
+      id: userId,
       email: cleanEmail,
       full_name: parsed.data.full_name,
       role: 'guardian',
-      is_active: true,
+      is_active: false,
       preferred_lang: 'ar',
     },
     { onConflict: 'id' }
   );
   if (profErr) {
+    if (!alreadyExisted) {
+      await sb.auth.admin.deleteUser(userId).catch(() => {});
+    }
     res.status(500).json({ error: profErr.message });
     return;
   }
 
-  await sb
-    .from('guardians')
-    .update({
-      profile_id: user.id,
+  const reqId = generateApplicationId();
+  try {
+    await saveGuardianRequest(sb, {
+      id: reqId,
+      profile_id: userId,
+      guardian_id: guardianRecord.id,
+      student_id: Number(studentRow.id),
+      student_code: studentRow.student_code,
+      student_name: String(studentRow.full_name_ar || ''),
       full_name: parsed.data.full_name,
       email: cleanEmail,
-      ...(parsed.data.phone ? { phone: parsed.data.phone } : {}),
-      ...(parsed.data.relation ? { relation: parsed.data.relation } : {}),
-    })
-    .eq('id', guardianRecord.id);
+      phone: parsed.data.phone || guardianRecord.phone || '',
+      relation: parsed.data.relation || 'ولي أمر',
+      status: 'pending',
+      created_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    await deletePendingAuthProfileIfSafe(sb, userId);
+    throw err;
+  }
 
-  await writeAuditLog(user.id, parsed.data.full_name, 'REGISTER_GUARDIAN_LINK', 'guardian', guardianRecord.id, {
+  await writeAuditLog(userId, parsed.data.full_name, 'REGISTER_GUARDIAN_REQUEST', 'guardian', guardianRecord.id, {
+    request_id: reqId,
     student_id: studentRow.id,
     student_code: studentRow.student_code,
   });
+  void broadcastRealtimeEvent('admission:created', { kind: 'guardian_request' });
 
-  const token = signToken({ id: user.id, role: 'guardian', exp: Date.now() + 1000 * 60 * 60 * 24 * 7 });
-  setSessionCookie(req, res, token);
   res.status(201).json({
-    token,
-    user: {
-      id: user.id,
-      email: cleanEmail,
-      full_name: parsed.data.full_name,
-      role: 'guardian',
-      preferred_lang: 'ar',
-    },
+    status: 'pending_approval',
+    request_id: reqId,
     student_code: studentRow.student_code,
+    email: cleanEmail,
   });
 }));
 
@@ -1295,6 +1555,66 @@ app.get('/api/auth/oauth-handoff/:state', oauthHandoffReadLimiter, (req, res) =>
   });
 });
 
+app.get('/auth/google-callback.js', (_req, res) => {
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(`(function(){
+  var closeBtn = document.getElementById('close-btn');
+  if (closeBtn) {
+    closeBtn.addEventListener('click', function(){ try { window.close(); } catch(e){} });
+  }
+  var hashParams = new URLSearchParams((window.location.hash || '').replace(/^#/, ''));
+  var queryParams = new URLSearchParams(window.location.search || '');
+  var state = queryParams.get('oauth_state') || '';
+  var accessToken = hashParams.get('access_token') || '';
+  var errorMsg = queryParams.get('error_description') || queryParams.get('error') || hashParams.get('error_description') || hashParams.get('error') || '';
+  var payload = { type: 'NB_GOOGLE_OAUTH', state: state, access_token: accessToken, error: errorMsg };
+
+  var titleEl = document.getElementById('title');
+  var msgEl = document.getElementById('msg');
+  if (errorMsg) {
+    if (titleEl) titleEl.textContent = 'تعذر إتمام تسجيل الدخول عبر Google';
+    if (msgEl) msgEl.textContent = errorMsg;
+  } else if (accessToken) {
+    if (titleEl) titleEl.textContent = 'تم التحقق من حساب Google بنجاح';
+    if (msgEl) msgEl.textContent = 'يمكنك العودة إلى نافذة المنصة أو إغلاق هذه النافذة.';
+  } else {
+    if (titleEl) titleEl.textContent = 'لم يتم استلام رمز التحقق';
+    if (msgEl) msgEl.textContent = 'يرجى إغلاق النافذة والمحاولة مرة أخرى.';
+    payload.error = 'Missing access token from Google OAuth callback.';
+  }
+
+  try {
+    if (window.opener && !window.opener.closed) {
+      window.opener.postMessage(payload, window.location.origin);
+    }
+  } catch (e) {}
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      var ch = new BroadcastChannel('nb_google_oauth');
+      ch.postMessage(payload);
+      ch.close();
+    }
+  } catch (e) {}
+  try {
+    localStorage.setItem('nb_google_oauth_result', JSON.stringify({ state: state, access_token: accessToken, error: payload.error, ts: Date.now() }));
+  } catch (e) {}
+
+  if (state && /^[a-zA-Z0-9_-]{16,96}$/.test(state)) {
+    fetch('/api/auth/oauth-handoff', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ state: state, access_token: accessToken || undefined, error: payload.error || undefined }),
+      keepalive: true
+    }).catch(function(){}).finally(function(){
+      setTimeout(function(){ try { window.close(); } catch(e){} }, 350);
+    });
+  } else {
+    setTimeout(function(){ try { window.close(); } catch(e){} }, 350);
+  }
+})();`);
+});
+
 app.get(['/auth/google-callback', '/auth/google-callback/'], (_req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store');
@@ -1316,61 +1636,9 @@ app.get(['/auth/google-callback', '/auth/google-callback/'], (_req, res) => {
   <div class="box">
     <h1 id="title">جاري إتمام التحقق من حساب Google...</h1>
     <p id="msg">سيتم إرجاعك تلقائياً إلى المنصة خلال لحظات.</p>
-    <button type="button" onclick="window.close()">إغلاق النافذة</button>
+    <button id="close-btn" type="button">إغلاق النافذة</button>
   </div>
-  <script>
-    (function(){
-      var hashParams = new URLSearchParams((window.location.hash || '').replace(/^#/, ''));
-      var queryParams = new URLSearchParams(window.location.search || '');
-      var state = queryParams.get('oauth_state') || '';
-      var accessToken = hashParams.get('access_token') || '';
-      var errorMsg = queryParams.get('error_description') || queryParams.get('error') || hashParams.get('error_description') || hashParams.get('error') || '';
-      var payload = { type: 'NB_GOOGLE_OAUTH', state: state, access_token: accessToken, error: errorMsg };
-
-      var titleEl = document.getElementById('title');
-      var msgEl = document.getElementById('msg');
-      if (errorMsg) {
-        if (titleEl) titleEl.textContent = 'تعذر إتمام تسجيل الدخول عبر Google';
-        if (msgEl) msgEl.textContent = errorMsg;
-      } else if (accessToken) {
-        if (titleEl) titleEl.textContent = 'تم التحقق من حساب Google بنجاح';
-        if (msgEl) msgEl.textContent = 'يمكنك العودة إلى نافذة المنصة أو إغلاق هذه النافذة.';
-      } else {
-        if (titleEl) titleEl.textContent = 'لم يتم استلام رمز التحقق';
-        if (msgEl) msgEl.textContent = 'يرجى إغلاق النافذة والمحاولة مرة أخرى.';
-        payload.error = 'Missing access token from Google OAuth callback.';
-      }
-
-      try {
-        if (window.opener && !window.opener.closed) {
-          window.opener.postMessage(payload, window.location.origin);
-        }
-      } catch (e) {}
-      try {
-        if (typeof BroadcastChannel !== 'undefined') {
-          var ch = new BroadcastChannel('nb_google_oauth');
-          ch.postMessage(payload);
-          ch.close();
-        }
-      } catch (e) {}
-      try {
-        localStorage.setItem('nb_google_oauth_result', JSON.stringify({ state: state, access_token: accessToken, error: payload.error, ts: Date.now() }));
-      } catch (e) {}
-
-      if (state && /^[a-zA-Z0-9_-]{16,96}$/.test(state)) {
-        fetch('/api/auth/oauth-handoff', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ state: state, access_token: accessToken || undefined, error: payload.error || undefined }),
-          keepalive: true
-        }).catch(function(){}).finally(function(){
-          setTimeout(function(){ try { window.close(); } catch(e){} }, 350);
-        });
-      } else {
-        setTimeout(function(){ try { window.close(); } catch(e){} }, 350);
-      }
-    })();
-  </script>
+  <script src="/auth/google-callback.js"></script>
 </body>
 </html>`);
 });
@@ -1387,28 +1655,14 @@ app.post('/api/auth/google', loginLimiter, asyncHandler(async (req, res) => {
   }
 
   const sb = requireSupabaseAdmin();
-  const { data: authData, error: authErr } = await sb.auth.getUser(parsed.data.access_token);
-  if (authErr || !authData?.user?.email) {
-    res.status(401).json({ error: 'Invalid or expired Google session token.' });
+  const verified = await verifyVerifiedGoogleToken(sb, parsed.data.access_token);
+  if (!verified) {
+    res.status(401).json({ error: 'Invalid, unverified, or non-Google session token.' });
     return;
   }
 
-  const sbUser = authData.user;
-  const rawEmail = sbUser.email;
-  if (!rawEmail) {
-    res.status(401).json({ error: 'Invalid or expired Google session token.' });
-    return;
-  }
-  const emailVerified = Boolean(sbUser.email_confirmed_at || sbUser.user_metadata?.email_verified);
-  if (!emailVerified) {
-    res.status(403).json({ error: 'Your Google email must be verified to continue.' });
-    return;
-  }
-
-  const cleanEmail = rawEmail.trim().toLowerCase();
-  const googleName = String(
-    sbUser.user_metadata?.full_name || sbUser.user_metadata?.name || cleanEmail.split('@')[0]
-  ).trim();
+  const cleanEmail = verified.email;
+  const googleName = verified.fullName;
 
   if (parsed.data.intent === 'prefill') {
     res.json({
@@ -1440,8 +1694,9 @@ app.post('/api/auth/google', loginLimiter, asyncHandler(async (req, res) => {
   }
 
   if (!profile.is_active) {
-    if (profile.role === 'student' || profile.role === 'teacher') {
-      const table = profile.role === 'student' ? 'students' : 'teachers';
+    if (profile.role === 'student' || profile.role === 'teacher' || profile.role === 'guardian') {
+      const table =
+        profile.role === 'student' ? 'students' : profile.role === 'teacher' ? 'teachers' : 'guardians';
       const { data: linked } = await sb.from(table).select('id').eq('profile_id', profile.id).maybeSingle();
       if (!linked) {
         res.status(403).json({
@@ -1566,6 +1821,7 @@ app.get('/api/student/dashboard', authenticate, requireRole('student'), asyncHan
     certificatesRes,
     gamesRes,
     gameProgressRes,
+    lessonMetasMap,
   ] = await Promise.all([
     courseIds.length
       ? sb
@@ -1609,18 +1865,26 @@ app.get('/api/student/dashboard', authenticate, requireRole('student'), asyncHan
       .order('issued_at', { ascending: false }),
     sb.from('games').select('*').eq('is_active', true).order('id', { ascending: true }),
     sb.from('game_progress').select('*').eq('student_id', student.id),
+    listLessonMetas(sb),
   ]);
 
-  const lessons = (lessonsRes.data || []).map((l: Record<string, unknown>) => {
-    const c = l.courses as { title_ar?: string; title_en?: string } | null;
-    const { courses: _c, ...rest } = l;
-    return {
-      ...rest,
-      id: Number(rest.id),
-      course_title_ar: c?.title_ar ?? null,
-      course_title_en: c?.title_en ?? null,
-    };
-  });
+  const lessons = (lessonsRes.data || [])
+    .map((l: Record<string, unknown>) => {
+      const c = l.courses as { title_ar?: string; title_en?: string } | null;
+      const { courses: _c, ...rest } = l;
+      const lid = Number(rest.id);
+      const lm = lessonMetasMap.get(lid);
+      return {
+        ...rest,
+        id: lid,
+        course_title_ar: c?.title_ar ?? null,
+        course_title_en: c?.title_en ?? null,
+        weekday_ar: lm?.weekday_ar ?? '',
+        is_published: lm ? lm.is_published : true,
+        published_at: lm?.published_at ?? null,
+      };
+    })
+    .filter((l) => l.is_published);
 
   const lessonIds = lessons.map((l) => l.id);
   const lessonLinks = lessonIds.length
@@ -1713,19 +1977,38 @@ app.get('/api/student/dashboard', authenticate, requireRole('student'), asyncHan
       const c = ex.courses as { title_ar?: string; title_en?: string } | null;
       const { courses: _c, ...rest } = ex;
       const eid = Number(rest.id);
-      const [cfg, sub] = await Promise.all([
+      const [cfg, sub, attempt] = await Promise.all([
         getExamVaultConfig(sb, eid),
         getExamSubmission(sb, eid, student.id),
+        getExamAttempt(sb, eid, student.id),
       ]);
       const resultRow = resultByExamId.get(eid) || null;
       const hasSubmittedOrGraded = Boolean(sub || resultRow);
       const canRevealAnswers = Boolean(hasSubmittedOrGraded && cfg.show_answers_after_submit);
+      const nowMs = Date.now();
+      const limitMin = Number(cfg.time_limit_minutes || 0);
+      const remainingSeconds =
+        attempt && limitMin > 0
+          ? Math.max(0, Math.floor((new Date(attempt.expires_at).getTime() - nowMs) / 1000))
+          : limitMin > 0
+          ? limitMin * 60
+          : null;
+      const isExpired = Boolean(attempt && limitMin > 0 && new Date(attempt.expires_at).getTime() <= nowMs);
       return {
         ...rest,
         id: eid,
         course_title_ar: c?.title_ar ?? null,
         course_title_en: c?.title_en ?? null,
         ...sanitizeExamConfigForViewer(cfg, { isPrivileged: false, canRevealAnswers }),
+        attempt: attempt
+          ? {
+              started_at: attempt.started_at,
+              expires_at: attempt.expires_at,
+              remaining_seconds: remainingSeconds,
+              is_expired: isExpired,
+            }
+          : null,
+        server_now: new Date(nowMs).toISOString(),
         submission: sanitizeSubmissionForViewer(sub),
         result: resultRow
           ? {
@@ -2135,37 +2418,53 @@ async function getTeacherByProfile(profileId: string) {
 
 async function assertTeacherOwnsCourse(teacherId: number, courseId: number): Promise<boolean> {
   const sb = requireSupabaseAdmin();
-  const { data } = await sb
-    .from('courses')
-    .select('id')
-    .eq('id', courseId)
-    .eq('teacher_id', teacherId)
-    .is('deleted_at', null)
-    .maybeSingle();
-  return Boolean(data);
+  const [{ data }, courseMeta] = await Promise.all([
+    sb
+      .from('courses')
+      .select('id, teacher_id')
+      .eq('id', courseId)
+      .is('deleted_at', null)
+      .maybeSingle(),
+    getCourseMeta(sb, courseId),
+  ]);
+  if (!data) return false;
+  if (Number(data.teacher_id) === teacherId) return true;
+  return Boolean(courseMeta?.co_teacher_ids?.includes(teacherId));
+}
+
+async function getCourseIdsForTeacher(sb: ReturnType<typeof requireSupabaseAdmin>, teacherId: number): Promise<number[]> {
+  const [{ data: primaryRows }, courseMetasMap] = await Promise.all([
+    sb.from('courses').select('id').eq('teacher_id', teacherId).is('deleted_at', null),
+    listCourseMetas(sb),
+  ]);
+  const ids = new Set<number>((primaryRows || []).map((r: { id: number }) => Number(r.id)));
+  for (const [cid, meta] of courseMetasMap.entries()) {
+    if (meta.co_teacher_ids?.includes(teacherId)) ids.add(cid);
+  }
+  return Array.from(ids);
 }
 
 async function assertTeacherTeachesStudent(teacherId: number, studentId: number, courseId?: number): Promise<boolean> {
   const sb = requireSupabaseAdmin();
+  const teacherCourseIds = await getCourseIdsForTeacher(sb, teacherId);
+  if (!teacherCourseIds.length) return false;
   if (courseId) {
+    if (!teacherCourseIds.includes(courseId)) return false;
     const { data } = await sb
       .from('enrollments')
-      .select('id, courses!inner(teacher_id, deleted_at)')
+      .select('id')
       .eq('course_id', courseId)
       .eq('student_id', studentId)
-      .eq('courses.teacher_id', teacherId)
       .is('deleted_at', null)
-      .is('courses.deleted_at', null)
       .limit(1);
     return Boolean(data && data.length > 0);
   }
   const { data } = await sb
     .from('enrollments')
-    .select('id, courses!inner(teacher_id, deleted_at)')
+    .select('id')
     .eq('student_id', studentId)
-    .eq('courses.teacher_id', teacherId)
+    .in('course_id', teacherCourseIds)
     .is('deleted_at', null)
-    .is('courses.deleted_at', null)
     .limit(1);
   return Boolean(data && data.length > 0);
 }
@@ -2178,17 +2477,33 @@ app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), asyncHan
   }
 
   const sb = requireSupabaseAdmin();
-  const { data: courseRows } = await sb
-    .from('courses')
-    .select('*, levels(name_ar, name_en)')
-    .eq('teacher_id', teacher.id)
-    .is('deleted_at', null)
-    .order('id', { ascending: true });
+  const assignedCourseIds = await getCourseIdsForTeacher(sb, teacher.id);
+  const [{ data: courseRows }, courseMetasMap, lessonMetasMap] = await Promise.all([
+    assignedCourseIds.length
+      ? sb
+          .from('courses')
+          .select('*, levels(name_ar, name_en)')
+          .in('id', assignedCourseIds)
+          .is('deleted_at', null)
+          .order('id', { ascending: true })
+      : Promise.resolve({ data: [] }),
+    listCourseMetas(sb),
+    listLessonMetas(sb),
+  ]);
 
   const courses = (courseRows || []).map((c: Record<string, unknown>) => {
     const l = c.levels as { name_ar?: string; name_en?: string } | null;
     const { levels: _l, ...rest } = c;
-    return { ...rest, id: Number(rest.id), level_name_ar: l?.name_ar ?? null, level_name_en: l?.name_en ?? null };
+    const cid = Number(rest.id);
+    const meta = courseMetasMap.get(cid);
+    return {
+      ...rest,
+      id: cid,
+      level_name_ar: l?.name_ar ?? null,
+      level_name_en: l?.name_en ?? null,
+      cover_url: meta?.cover_url ?? null,
+      price_monthly_sar: meta?.price_monthly_sar ?? null,
+    };
   });
 
   const courseIds = courses.map((c) => c.id);
@@ -2271,7 +2586,17 @@ app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), asyncHan
   const lessons = (lessonsRes.data || []).map((l: Record<string, unknown>) => {
     const c = l.courses as { title_ar?: string; title_en?: string } | null;
     const { courses: _c, ...rest } = l;
-    return { ...rest, id: Number(rest.id), course_title_ar: c?.title_ar ?? null, course_title_en: c?.title_en ?? null };
+    const lid = Number(rest.id);
+    const lm = lessonMetasMap.get(lid);
+    return {
+      ...rest,
+      id: lid,
+      course_title_ar: c?.title_ar ?? null,
+      course_title_en: c?.title_en ?? null,
+      weekday_ar: lm?.weekday_ar ?? '',
+      is_published: lm ? lm.is_published : true,
+      published_at: lm?.published_at ?? null,
+    };
   });
 
   const lessonIds = lessons.map((l) => l.id);
@@ -2395,13 +2720,24 @@ app.get('/api/teacher/students/:studentId', authenticate, requireRole('teacher')
 }));
 
 app.post('/api/teacher/attendance', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+  const schema = z.object({
+    lesson_id: z.coerce.number().int().positive(),
+    student_id: z.coerce.number().int().positive(),
+    status: z.enum(['present', 'absent', 'late', 'excused']),
+    notes: z.string().trim().max(500).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid attendance payload.' });
+    return;
+  }
   const teacher = await getTeacherByProfile(req.user!.id);
-  const { lesson_id, student_id, status, notes } = req.body;
+  const { lesson_id, student_id, status, notes } = parsed.data;
   const sb = requireSupabaseAdmin();
   const { data: lesson } = await sb
     .from('lessons')
     .select('id, course_id')
-    .eq('id', Number(lesson_id))
+    .eq('id', lesson_id)
     .is('deleted_at', null)
     .maybeSingle();
 
@@ -2409,7 +2745,7 @@ app.post('/api/teacher/attendance', authenticate, requireRole('teacher'), asyncH
     !teacher ||
     !lesson ||
     !(await assertTeacherOwnsCourse(teacher.id, lesson.course_id)) ||
-    !(await assertTeacherTeachesStudent(teacher.id, Number(student_id), lesson.course_id))
+    !(await assertTeacherTeachesStudent(teacher.id, student_id, lesson.course_id))
   ) {
     res.status(403).json({ error: 'Forbidden: cannot record attendance outside your courses' });
     return;
@@ -2419,7 +2755,7 @@ app.post('/api/teacher/attendance', authenticate, requireRole('teacher'), asyncH
     .from('attendance')
     .select('id')
     .eq('lesson_id', lesson.id)
-    .eq('student_id', Number(student_id))
+    .eq('student_id', student_id)
     .maybeSingle();
 
   if (existing) {
@@ -2435,7 +2771,7 @@ app.post('/api/teacher/attendance', authenticate, requireRole('teacher'), asyncH
   } else {
     await insertRowSafe('attendance', {
       lesson_id: lesson.id,
-      student_id: Number(student_id),
+      student_id,
       status,
       notes: notes || '',
       recorded_by: req.user!.id,
@@ -2449,13 +2785,25 @@ app.post('/api/teacher/attendance', authenticate, requireRole('teacher'), asyncH
 }));
 
 app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+  const schema = z.object({
+    exam_id: z.coerce.number().int().positive(),
+    student_id: z.coerce.number().int().positive(),
+    score: z.coerce.number().min(0),
+    feedback_ar: z.string().trim().max(1000).optional(),
+    feedback_en: z.string().trim().max(1000).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid exam result payload.' });
+    return;
+  }
   const teacher = await getTeacherByProfile(req.user!.id);
-  const { exam_id, student_id, score, feedback_ar, feedback_en } = req.body;
+  const { exam_id, student_id, score, feedback_ar, feedback_en } = parsed.data;
   const sb = requireSupabaseAdmin();
   const { data: exam } = await sb
     .from('exams')
     .select('id, course_id, title_ar, title_en, max_score')
-    .eq('id', Number(exam_id))
+    .eq('id', exam_id)
     .is('deleted_at', null)
     .maybeSingle();
 
@@ -2463,15 +2811,14 @@ app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyn
     !teacher ||
     !exam ||
     !(await assertTeacherOwnsCourse(teacher.id, exam.course_id)) ||
-    !(await assertTeacherTeachesStudent(teacher.id, Number(student_id), exam.course_id))
+    !(await assertTeacherTeachesStudent(teacher.id, student_id, exam.course_id))
   ) {
     res.status(403).json({ error: 'Forbidden: cannot grade outside your courses' });
     return;
   }
 
-  const numericScore = Number(score);
   const maxScore = Number(exam.max_score || 100);
-  if (!Number.isFinite(numericScore) || numericScore < 0 || numericScore > maxScore) {
+  if (!Number.isFinite(score) || score < 0 || score > maxScore) {
     res.status(400).json({ error: `Score must be between 0 and ${maxScore}` });
     return;
   }
@@ -2480,7 +2827,7 @@ app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyn
     .from('exam_results')
     .select('id')
     .eq('exam_id', exam.id)
-    .eq('student_id', Number(student_id))
+    .eq('student_id', student_id)
     .maybeSingle();
 
   const gradedAt = new Date().toISOString();
@@ -2488,7 +2835,7 @@ app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyn
     await sb
       .from('exam_results')
       .update({
-        score: numericScore,
+        score,
         feedback_ar: feedback_ar || '',
         feedback_en: feedback_en || '',
         graded_by: req.user!.id,
@@ -2498,8 +2845,8 @@ app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyn
   } else {
     await insertRowSafe('exam_results', {
       exam_id: exam.id,
-      student_id: Number(student_id),
-      score: numericScore,
+      student_id,
+      score,
       feedback_ar: feedback_ar || '',
       feedback_en: feedback_en || '',
       graded_by: req.user!.id,
@@ -2507,7 +2854,7 @@ app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyn
     });
   }
 
-  const existingSub = await getExamSubmission(sb, exam.id, Number(student_id));
+  const existingSub = await getExamSubmission(sb, exam.id, student_id);
   if (existingSub) {
     await saveExamSubmission(sb, {
       ...existingSub,
@@ -2518,15 +2865,15 @@ app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyn
 
   await notifyStudentAndGuardian(
     sb,
-    Number(student_id),
+    student_id,
     `تم رصد درجة: ${exam.title_ar}`,
     `Exam Graded: ${exam.title_en}`,
-    `درجتك: ${numericScore} / ${maxScore}`,
-    `Score: ${numericScore} / ${maxScore}`
+    `درجتك: ${score} / ${maxScore}`,
+    `Score: ${score} / ${maxScore}`
   );
   await writeAuditLog(req.user!.id, req.user!.full_name, 'GRADE_EXAM', 'exam', exam.id, {
-    student_id: Number(student_id),
-    score: numericScore,
+    student_id,
+    score,
   });
   void broadcastRealtimeEvent('academic:updated', { kind: 'exam_result' });
 
@@ -2534,26 +2881,41 @@ app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyn
 }));
 
 app.post('/api/teacher/recitations', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+  const schema = z.object({
+    student_id: z.coerce.number().int().positive(),
+    course_id: z.coerce.number().int().positive(),
+    surah_name: z.string().trim().min(1).max(100),
+    ayah_from: z.coerce.number().int().min(1).max(300),
+    ayah_to: z.coerce.number().int().min(1).max(300),
+    tajweed_score: z.coerce.number().min(0).max(100),
+    memorization_score: z.coerce.number().min(0).max(100),
+    notes_ar: z.string().trim().max(500).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid recitation record payload.' });
+    return;
+  }
   const teacher = await getTeacherByProfile(req.user!.id);
-  const { student_id, course_id, surah_name, ayah_from, ayah_to, tajweed_score, memorization_score, notes_ar } = req.body;
+  const { student_id, course_id, surah_name, ayah_from, ayah_to, tajweed_score, memorization_score, notes_ar } = parsed.data;
 
   if (
     !teacher ||
-    !(await assertTeacherOwnsCourse(teacher.id, Number(course_id))) ||
-    !(await assertTeacherTeachesStudent(teacher.id, Number(student_id), Number(course_id)))
+    !(await assertTeacherOwnsCourse(teacher.id, course_id)) ||
+    !(await assertTeacherTeachesStudent(teacher.id, student_id, course_id))
   ) {
     res.status(403).json({ error: 'Forbidden: student not in your course' });
     return;
   }
 
   const inserted = await insertRowSafe<{ id: number }>('recitations', {
-    student_id: Number(student_id),
-    course_id: Number(course_id),
+    student_id,
+    course_id,
     surah_name,
-    ayah_from: Number(ayah_from),
-    ayah_to: Number(ayah_to),
-    tajweed_score: Number(tajweed_score),
-    memorization_score: Number(memorization_score),
+    ayah_from,
+    ayah_to,
+    tajweed_score,
+    memorization_score,
     notes_ar: notes_ar || '',
     recorded_by: req.user!.id,
   });
@@ -2564,24 +2926,38 @@ app.post('/api/teacher/recitations', authenticate, requireRole('teacher'), async
 }));
 
 app.post('/api/teacher/evaluations', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+  const schema = z.object({
+    student_id: z.coerce.number().int().positive(),
+    course_id: z.coerce.number().int().positive(),
+    period: z.string().trim().min(1).max(60),
+    behavior_score: z.coerce.number().min(0).max(100),
+    participation_score: z.coerce.number().min(0).max(100),
+    summary_ar: z.string().trim().min(1).max(1000),
+    summary_en: z.string().trim().max(1000).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid evaluation payload.' });
+    return;
+  }
   const teacher = await getTeacherByProfile(req.user!.id);
-  const { student_id, course_id, period, behavior_score, participation_score, summary_ar, summary_en } = req.body;
+  const { student_id, course_id, period, behavior_score, participation_score, summary_ar, summary_en } = parsed.data;
 
   if (
     !teacher ||
-    !(await assertTeacherOwnsCourse(teacher.id, Number(course_id))) ||
-    !(await assertTeacherTeachesStudent(teacher.id, Number(student_id), Number(course_id)))
+    !(await assertTeacherOwnsCourse(teacher.id, course_id)) ||
+    !(await assertTeacherTeachesStudent(teacher.id, student_id, course_id))
   ) {
     res.status(403).json({ error: 'Forbidden: student not in your course' });
     return;
   }
 
   const inserted = await insertRowSafe<{ id: number }>('evaluations', {
-    student_id: Number(student_id),
-    course_id: Number(course_id),
+    student_id,
+    course_id,
     period,
-    behavior_score: Number(behavior_score),
-    participation_score: Number(participation_score),
+    behavior_score,
+    participation_score,
     summary_ar,
     summary_en: summary_en || summary_ar,
     evaluated_by: req.user!.id,
@@ -2678,8 +3054,7 @@ async function assertCanManageLesson(user: AuthUser, lessonId: number) {
 
   if (user.role === 'teacher') {
     const teacher = await getTeacherByProfile(user.id);
-    const course = lesson.courses as { teacher_id?: number | null } | null;
-    if (teacher && course?.teacher_id === teacher.id) {
+    if (teacher && (await assertTeacherOwnsCourse(teacher.id, Number(lesson.course_id)))) {
       return { sb, lesson };
     }
   }
@@ -2704,8 +3079,7 @@ async function assertCanAccessLesson(user: AuthUser, lessonId: number) {
 
   if (user.role === 'teacher') {
     const teacher = await getTeacherByProfile(user.id);
-    const course = lesson.courses as { teacher_id?: number | null } | null;
-    if (teacher && course?.teacher_id === teacher.id) return { sb, lesson };
+    if (teacher && (await assertTeacherOwnsCourse(teacher.id, Number(lesson.course_id)))) return { sb, lesson };
   }
 
   if (user.role === 'student') {
@@ -2991,6 +3365,38 @@ async function notifyCourseExamPublished(
   void broadcastRealtimeEvent('notification:created', { kind: 'exam' });
 }
 
+async function notifyCourseLessonPublished(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  courseId: number,
+  courseTitleAr: string,
+  courseTitleEn: string,
+  lessonTitleAr: string,
+  lessonTitleEn: string,
+  scheduleHint: string
+): Promise<number> {
+  const { data: enrolls } = await sb
+    .from('enrollments')
+    .select('student_id')
+    .eq('course_id', courseId)
+    .eq('status', 'active')
+    .is('deleted_at', null);
+
+  let count = 0;
+  for (const row of enrolls || []) {
+    await notifyStudentAndGuardian(
+      sb,
+      Number((row as { student_id: number }).student_id),
+      `تم نشر درس جديد: ${lessonTitleAr}`,
+      `New Lesson Published: ${lessonTitleEn}`,
+      `تم نشر درس جديد في كورس "${courseTitleAr}" (${scheduleHint}). يمكنك الآن فتح المرفقات وملف الـ PDF ورابط الحصة من تبويب الدروس.`,
+      `A new lesson in "${courseTitleEn}" (${scheduleHint}) has been published with its links and PDF materials.`
+    );
+    count += 1;
+  }
+  void broadcastRealtimeEvent('notification:created', { kind: 'lesson' });
+  return count;
+}
+
 async function assertCanManageExam(user: AuthUser, examId: number) {
   const sb = requireSupabaseAdmin();
   const { data: exam } = await sb
@@ -3008,9 +3414,7 @@ async function assertCanManageExam(user: AuthUser, examId: number) {
 
   if (user.role === 'teacher') {
     const teacher = await getTeacherByProfile(user.id);
-    const rawC = Array.isArray(exam.courses) ? exam.courses[0] : exam.courses;
-    const course = rawC as { teacher_id?: number | null } | null;
-    if (teacher && course?.teacher_id === teacher.id) {
+    if (teacher && (await assertTeacherOwnsCourse(teacher.id, Number(exam.course_id)))) {
       return { sb, exam };
     }
   }
@@ -3033,9 +3437,7 @@ async function assertCanAccessExam(user: AuthUser, examId: number) {
 
   if (user.role === 'teacher') {
     const teacher = await getTeacherByProfile(user.id);
-    const rawC = Array.isArray(exam.courses) ? exam.courses[0] : exam.courses;
-    const course = rawC as { teacher_id?: number | null } | null;
-    if (teacher && course?.teacher_id === teacher.id) {
+    if (teacher && (await assertTeacherOwnsCourse(teacher.id, Number(exam.course_id)))) {
       return { sb, exam, studentId: null as number | null };
     }
   }
@@ -3113,6 +3515,7 @@ const examCreateOrUpdateSchema = z.object({
   instructions_en: z.string().trim().max(2000).optional(),
   available_from: z.string().trim().max(40).nullable().optional(),
   due_at: z.string().trim().max(40).nullable().optional(),
+  time_limit_minutes: z.coerce.number().int().min(0).max(300).nullable().optional(),
   allow_late_submission: z.boolean().default(true),
   show_answers_after_submit: z.boolean().default(true),
   notify_students: z.boolean().default(true),
@@ -3176,6 +3579,10 @@ app.post('/api/exams', authenticate, requireRole('admin', 'teacher'), asyncHandl
     instructions_en: parsed.data.instructions_en || parsed.data.instructions_ar || '',
     available_from: parsed.data.available_from || null,
     due_at: parsed.data.due_at || null,
+    time_limit_minutes:
+      parsed.data.time_limit_minutes && parsed.data.time_limit_minutes > 0
+        ? parsed.data.time_limit_minutes
+        : null,
     allow_late_submission: parsed.data.allow_late_submission,
     show_answers_after_submit: parsed.data.show_answers_after_submit,
     question_file: null,
@@ -3237,6 +3644,12 @@ app.patch('/api/exams/:examId', authenticate, requireRole('admin', 'teacher'), a
     instructions_en: parsed.data.instructions_en ?? existingCfg.instructions_en,
     available_from: parsed.data.available_from !== undefined ? parsed.data.available_from : existingCfg.available_from,
     due_at: parsed.data.due_at !== undefined ? parsed.data.due_at : existingCfg.due_at,
+    time_limit_minutes:
+      parsed.data.time_limit_minutes !== undefined
+        ? parsed.data.time_limit_minutes && parsed.data.time_limit_minutes > 0
+          ? parsed.data.time_limit_minutes
+          : null
+        : existingCfg.time_limit_minutes ?? null,
     allow_late_submission: parsed.data.allow_late_submission ?? existingCfg.allow_late_submission,
     show_answers_after_submit: parsed.data.show_answers_after_submit ?? existingCfg.show_answers_after_submit,
     questions: nextQuestions,
@@ -3425,6 +3838,14 @@ app.post(
       return;
     }
 
+    if (cfg.time_limit_minutes && cfg.time_limit_minutes > 0) {
+      const attempt = await getExamAttempt(sb, examId, studentId);
+      if (attempt && Date.now() > new Date(attempt.expires_at).getTime() + 45_000) {
+        res.status(403).json({ error: 'Exam time limit has expired and the exam is locked.' });
+        return;
+      }
+    }
+
     const [{ data: existingResult }, existingSub] = await Promise.all([
       sb.from('exam_results').select('id').eq('exam_id', examId).eq('student_id', studentId).maybeSingle(),
       getExamSubmission(sb, examId, studentId),
@@ -3489,6 +3910,77 @@ app.post(
 );
 
 app.post(
+  '/api/exams/:examId/start',
+  authenticate,
+  requireRole('student'),
+  asyncHandler<AuthRequest>(async (req, res) => {
+    const examId = Number(req.params.examId);
+    const { sb, studentId } = await assertCanAccessExam(req.user!, examId);
+    if (!studentId) {
+      res.status(403).json({ error: 'Student profile is not linked.' });
+      return;
+    }
+
+    const cfg = await getExamVaultConfig(sb, examId);
+    if (!isExamAvailableYet(cfg)) {
+      res.status(403).json({ error: 'Exam is not open yet.' });
+      return;
+    }
+    const pastDeadline = isExamPastDeadline(cfg);
+    if (pastDeadline && !cfg.allow_late_submission) {
+      res.status(403).json({ error: 'Submission deadline has passed for this exam.' });
+      return;
+    }
+
+    const [{ data: existingResult }, existingSub, existingAttempt] = await Promise.all([
+      sb.from('exam_results').select('id').eq('exam_id', examId).eq('student_id', studentId).maybeSingle(),
+      getExamSubmission(sb, examId, studentId),
+      getExamAttempt(sb, examId, studentId),
+    ]);
+    if (existingResult || existingSub?.status === 'graded' || (existingSub && existingSub.quiz_answers.length > 0)) {
+      res.status(409).json({ error: 'Exam answers have already been submitted.' });
+      return;
+    }
+
+    const nowMs = Date.now();
+    const limitMin = Number(cfg.time_limit_minutes || 0);
+    if (existingAttempt) {
+      const expiresMs = new Date(existingAttempt.expires_at).getTime();
+      const remainingSeconds = limitMin > 0 ? Math.max(0, Math.floor((expiresMs - nowMs) / 1000)) : null;
+      res.json({
+        attempt: {
+          ...existingAttempt,
+          remaining_seconds: remainingSeconds,
+          is_expired: Boolean(limitMin > 0 && expiresMs <= nowMs),
+        },
+        server_now: new Date(nowMs).toISOString(),
+      });
+      return;
+    }
+
+    const startedAt = new Date(nowMs);
+    const durationMs = limitMin > 0 ? limitMin * 60_000 : 24 * 60 * 60_000;
+    const expiresAt = new Date(nowMs + durationMs);
+    const attempt = {
+      exam_id: examId,
+      student_id: studentId,
+      started_at: startedAt.toISOString(),
+      expires_at: expiresAt.toISOString(),
+    };
+    await saveExamAttempt(sb, attempt);
+
+    res.status(201).json({
+      attempt: {
+        ...attempt,
+        remaining_seconds: limitMin > 0 ? limitMin * 60 : null,
+        is_expired: false,
+      },
+      server_now: startedAt.toISOString(),
+    });
+  })
+);
+
+app.post(
   '/api/exams/:examId/submit-quiz',
   authenticate,
   requireRole('student'),
@@ -3507,11 +3999,16 @@ app.post(
           question_id: z.string().trim().min(1).max(64),
           selected_index: z.coerce.number().int().min(0).max(5),
         })
-      ).min(1).max(60),
+      ).min(0).max(60),
+      timed_out: z.boolean().optional(),
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'Invalid quiz answers payload.' });
+      return;
+    }
+    if (!parsed.data.timed_out && parsed.data.answers.length === 0) {
+      res.status(400).json({ error: 'Please answer at least one question before submitting.' });
       return;
     }
 
@@ -3530,9 +4027,10 @@ app.post(
       return;
     }
 
-    const [{ data: existingResult }, existingSub] = await Promise.all([
+    const [{ data: existingResult }, existingSub, attempt] = await Promise.all([
       sb.from('exam_results').select('id').eq('exam_id', examId).eq('student_id', studentId).maybeSingle(),
       getExamSubmission(sb, examId, studentId),
+      getExamAttempt(sb, examId, studentId),
     ]);
     if (existingResult || existingSub?.status === 'graded') {
       res.status(409).json({ error: 'This exam has already been graded.' });
@@ -3541,6 +4039,20 @@ app.post(
     if (existingSub && existingSub.quiz_answers.length > 0) {
       res.status(409).json({ error: 'Quiz answers have already been submitted for this exam.' });
       return;
+    }
+
+    let isTimedOutSubmission = Boolean(parsed.data.timed_out);
+    if (cfg.time_limit_minutes && cfg.time_limit_minutes > 0 && attempt) {
+      const expiresMs = new Date(attempt.expires_at).getTime();
+      const nowMs = Date.now();
+      if (nowMs >= expiresMs) {
+        isTimedOutSubmission = true;
+      }
+      const allowedGraceMs = parsed.data.timed_out ? 180_000 : 45_000;
+      if (nowMs > expiresMs + allowedGraceMs) {
+        res.status(403).json({ error: 'Exam countdown expired and submissions are locked.' });
+        return;
+      }
     }
 
     // 100% Server-side authoritative grading
@@ -3574,6 +4086,7 @@ app.post(
       status: isPureQuiz ? 'graded' : 'submitted_pending',
       submitted_at: existingSub?.submitted_at || nowIso,
       is_late: pastDeadline,
+      timed_out: isTimedOutSubmission,
       solution_file: existingSub?.solution_file || null,
       student_notes: existingSub?.student_notes || '',
       quiz_answers: parsed.data.answers,
@@ -3583,16 +4096,20 @@ app.post(
     });
 
     if (isPureQuiz) {
-      const feedbackAr = `تم التصحيح التلقائي (${earnedPoints} من ${totalPoints} نقطة).`;
-      const feedbackEn = `Auto-graded (${earnedPoints} / ${totalPoints} pts).`;
-      const { data: existingResult } = await sb
+      const feedbackAr = isTimedOutSubmission
+        ? `تم إغلاق الامتحان تلقائياً بانتهاء العداد واعتماد الإجابات المسجلة (${earnedPoints} من ${totalPoints} نقطة).`
+        : `تم التصحيح التلقائي (${earnedPoints} من ${totalPoints} نقطة).`;
+      const feedbackEn = isTimedOutSubmission
+        ? `Auto-locked on timer expiry with saved answers (${earnedPoints} / ${totalPoints} pts).`
+        : `Auto-graded (${earnedPoints} / ${totalPoints} pts).`;
+      const { data: existingResultRow } = await sb
         .from('exam_results')
         .select('id')
         .eq('exam_id', examId)
         .eq('student_id', studentId)
         .maybeSingle();
 
-      if (existingResult) {
+      if (existingResultRow) {
         await sb
           .from('exam_results')
           .update({
@@ -3601,7 +4118,7 @@ app.post(
             feedback_en: feedbackEn,
             graded_at: nowIso,
           })
-          .eq('id', existingResult.id);
+          .eq('id', existingResultRow.id);
       } else {
         await insertRowSafe('exam_results', {
           exam_id: examId,
@@ -3616,10 +4133,23 @@ app.post(
       await notifyStudentAndGuardian(
         sb,
         studentId,
-        `نتيجة الاختبار: ${exam.title_ar}`,
-        `Quiz Result: ${exam.title_en}`,
-        `درجتك التلقائية: ${computedScore} / ${maxScore}`,
-        `Auto-graded score: ${computedScore} / ${maxScore}`
+        isTimedOutSubmission ? `انتهى مؤقت الاختبار: ${exam.title_ar}` : `نتيجة الاختبار: ${exam.title_ar}`,
+        isTimedOutSubmission ? `Exam Timer Expired: ${exam.title_en}` : `Quiz Result: ${exam.title_en}`,
+        isTimedOutSubmission
+          ? `انتهى مؤقت الامتحان وأُغلق تلقائياً مع اعتماد إجاباتك: ${computedScore} / ${maxScore}`
+          : `درجتك التلقائية: ${computedScore} / ${maxScore}`,
+        isTimedOutSubmission
+          ? `Exam countdown expired; auto-submitted with score: ${computedScore} / ${maxScore}`
+          : `Auto-graded score: ${computedScore} / ${maxScore}`
+      );
+    } else if (isTimedOutSubmission) {
+      await notifyStudentAndGuardian(
+        sb,
+        studentId,
+        `إغلاق تلقائي للامتحان بانتهاء المؤقت: ${exam.title_ar}`,
+        `Exam Auto-Locked on Timeout: ${exam.title_en}`,
+        `انتهى مؤقت الامتحان الهجين وأُغلقت الإجابات التفاعلية تلقائياً وبانتظار التصحيح النهائي (${computedScore} / ${maxScore} تلقائياً).`,
+        `Exam countdown expired and quiz answers were auto-locked pending final grading.`
       );
     }
 
@@ -3627,6 +4157,7 @@ app.post(
       student_id: studentId,
       auto_score: computedScore,
       pure_quiz: isPureQuiz,
+      timed_out: isTimedOutSubmission,
     });
     void broadcastRealtimeEvent('academic:updated', { kind: 'exam_result' });
 
@@ -3937,17 +4468,52 @@ app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler
     };
   });
 
+  const [admissionMetaMap, teacherApplications, guardianRequests, courseMetasMap, lessonMetasMap] = await Promise.all([
+    listAdmissionMetas(sb),
+    listTeacherApplications(sb),
+    listGuardianRequests(sb),
+    listCourseMetas(sb),
+    listLessonMetas(sb),
+  ]);
+
+  const adminTeacherById = new Map<number, { name_ar: string; name_en: string }>();
+  for (const t of teachersRes.data || []) {
+    adminTeacherById.set(Number((t as { id: number }).id), {
+      name_ar: String((t as { name_ar?: string }).name_ar || ''),
+      name_en: String((t as { name_en?: string }).name_en || ''),
+    });
+  }
+
   const courses = (coursesRes.data || []).map((c: Record<string, unknown>) => {
     const l = c.levels as { name_ar?: string } | null;
     const t = c.teachers as { name_ar?: string } | null;
     const { levels: _l, teachers: _t, ...rest } = c;
-    return { ...rest, level_name_ar: l?.name_ar ?? null, teacher_name_ar: t?.name_ar ?? null };
+    const cid = Number(rest.id);
+    const meta = courseMetasMap.get(cid);
+    const coIds = (meta?.co_teacher_ids || []).filter((id) => id !== Number(rest.teacher_id));
+    return {
+      ...rest,
+      level_name_ar: l?.name_ar ?? null,
+      teacher_name_ar: t?.name_ar ?? null,
+      cover_url: meta?.cover_url ?? null,
+      price_monthly_sar: meta?.price_monthly_sar ?? null,
+      co_teacher_ids: coIds,
+      co_teacher_names_ar: coIds.map((id) => adminTeacherById.get(id)?.name_ar).filter(Boolean),
+    };
   });
 
   const lessons = (lessonsRes.data || []).map((l: Record<string, unknown>) => {
     const c = l.courses as { title_ar?: string } | null;
     const { courses: _c, ...rest } = l;
-    return { ...rest, course_title_ar: c?.title_ar ?? null };
+    const lid = Number(rest.id);
+    const lm = lessonMetasMap.get(lid);
+    return {
+      ...rest,
+      course_title_ar: c?.title_ar ?? null,
+      weekday_ar: lm?.weekday_ar ?? '',
+      is_published: lm ? lm.is_published : true,
+      published_at: lm?.published_at ?? null,
+    };
   });
 
   const enrollments = (enrollmentsRes.data || []).map((e: Record<string, unknown>) => {
@@ -3956,11 +4522,6 @@ app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler
     const { students: _s, courses: _c, ...rest } = e;
     return { ...rest, student_name_ar: s?.full_name_ar ?? null, course_title_ar: c?.title_ar ?? null };
   });
-
-  const [admissionMetaMap, teacherApplications] = await Promise.all([
-    listAdmissionMetas(sb),
-    listTeacherApplications(sb),
-  ]);
 
   const admissionRequests = (admissionsRes.data || []).map((ar: Record<string, unknown>) => {
     const c = ar.courses as { title_ar?: string } | null;
@@ -4044,6 +4605,7 @@ app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler
     enrollments,
     admissionRequests,
     teacherApplications,
+    guardianRequests,
     announcements,
     exams,
     certificates,
@@ -4054,8 +4616,36 @@ app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler
   });
 }));
 
+function sanitizeCourseCoverUrlInput(raw?: string | null): string | null {
+  const val = String(raw || '').trim();
+  if (!val) return null;
+  if (val.startsWith('/assets/') || val.startsWith('/api/public/course-covers/')) return val;
+  if (/^https:\/\//i.test(val)) return val;
+  return null;
+}
+
 app.post('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const { title_ar, title_en, description_ar, description_en, level_id, teacher_id, schedule_ar, schedule_en, price_monthly, capacity } = req.body;
+  const {
+    title_ar,
+    title_en,
+    description_ar,
+    description_en,
+    level_id,
+    teacher_id,
+    schedule_ar,
+    schedule_en,
+    price_monthly,
+    price_monthly_sar,
+    capacity,
+    cover_url,
+    co_teacher_ids,
+  } = req.body;
+  const parsedSar =
+    price_monthly_sar !== undefined && price_monthly_sar !== null && price_monthly_sar !== ''
+      ? Number(price_monthly_sar)
+      : null;
+  const cleanSar = parsedSar !== null && Number.isFinite(parsedSar) && parsedSar >= 0 ? parsedSar : null;
+
   const inserted = await insertRowSafe<{ id: number }>('courses', {
     title_ar,
     title_en: title_en || title_ar,
@@ -4070,6 +4660,22 @@ app.post('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler<
     is_featured: true,
   });
 
+  const sb = requireSupabaseAdmin();
+  const cleanCover = sanitizeCourseCoverUrlInput(cover_url);
+  const cleanCoTeachers = Array.isArray(co_teacher_ids)
+    ? co_teacher_ids.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0 && id !== Number(teacher_id))
+    : [];
+  if (cleanCover || cleanCoTeachers.length > 0 || cleanSar !== null) {
+    await saveCourseMeta(sb, {
+      course_id: inserted.id,
+      cover_url: cleanCover,
+      co_teacher_ids: cleanCoTeachers,
+      price_monthly_sar: cleanSar,
+      updated_at: new Date().toISOString(),
+    });
+  }
+
+  invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_COURSE', 'course', inserted.id, { title_ar });
   res.status(201).json({ id: inserted.id });
 }));
@@ -4086,8 +4692,11 @@ app.patch('/api/admin/courses/:id', authenticate, requireRole('admin'), asyncHan
     schedule_ar: z.string().trim().min(1).max(180).optional(),
     schedule_en: z.string().trim().min(1).max(180).optional(),
     price_monthly: z.coerce.number().min(0).max(100000).optional(),
+    price_monthly_sar: z.coerce.number().min(0).max(100000).nullable().optional(),
     capacity: z.coerce.number().int().min(1).max(200).optional(),
     is_featured: z.boolean().optional(),
+    cover_url: z.string().trim().max(600).nullable().optional(),
+    co_teacher_ids: z.array(z.coerce.number().int().positive()).max(20).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -4095,27 +4704,170 @@ app.patch('/api/admin/courses/:id', authenticate, requireRole('admin'), asyncHan
     return;
   }
   const sb = requireSupabaseAdmin();
-  const { error } = await sb.from('courses').update(parsed.data).eq('id', id).is('deleted_at', null);
-  if (error) {
-    res.status(500).json({ error: error.message });
-    return;
+  const { cover_url, co_teacher_ids, price_monthly_sar, ...courseUpdates } = parsed.data;
+  if (Object.keys(courseUpdates).length > 0) {
+    const { error } = await sb.from('courses').update(courseUpdates).eq('id', id).is('deleted_at', null);
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
   }
+
+  if (cover_url !== undefined || co_teacher_ids !== undefined || price_monthly_sar !== undefined) {
+    const existingMeta = await getCourseMeta(sb, id);
+    const { data: curCourse } = await sb.from('courses').select('teacher_id').eq('id', id).maybeSingle();
+    const mainTeacherId = courseUpdates.teacher_id ?? Number(curCourse?.teacher_id || 0);
+    const nextCoIds =
+      co_teacher_ids !== undefined
+        ? Array.from(new Set(co_teacher_ids.filter((tid) => tid !== mainTeacherId)))
+        : existingMeta?.co_teacher_ids || [];
+    const nextCoverUrl =
+      cover_url !== undefined ? sanitizeCourseCoverUrlInput(cover_url) : existingMeta?.cover_url ?? null;
+    const nextSar =
+      price_monthly_sar !== undefined ? price_monthly_sar : existingMeta?.price_monthly_sar ?? null;
+    const keepStorage =
+      nextCoverUrl && nextCoverUrl.startsWith('/api/public/course-covers/')
+        ? existingMeta?.cover_storage_path ?? null
+        : null;
+    if (!keepStorage && existingMeta?.cover_storage_path && cover_url !== undefined) {
+      await removeCourseCoverFile(sb, existingMeta.cover_storage_path);
+    }
+    await saveCourseMeta(sb, {
+      course_id: id,
+      cover_url: nextCoverUrl,
+      cover_storage_path: keepStorage,
+      cover_mime: keepStorage ? existingMeta?.cover_mime ?? null : null,
+      co_teacher_ids: nextCoIds,
+      price_monthly_sar: nextSar,
+      updated_at: new Date().toISOString(),
+    });
+  }
+
+  invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_COURSE', 'course', id, parsed.data);
   res.json({ ok: true });
 }));
+
+function detectImageMagicMime(buffer: Buffer): { mime: 'image/png' | 'image/jpeg' | 'image/webp'; ext: 'png' | 'jpg' | 'webp' } | null {
+  if (buffer.length < 12) return null;
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) {
+    return { mime: 'image/png', ext: 'png' };
+  }
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return { mime: 'image/jpeg', ext: 'jpg' };
+  }
+  if (buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') {
+    return { mime: 'image/webp', ext: 'webp' };
+  }
+  return null;
+}
+
+app.post(
+  '/api/admin/courses/:id/cover',
+  express.json({ limit: '8mb' }),
+  authenticate,
+  requireRole('admin'),
+  asyncHandler<AuthRequest>(async (req, res) => {
+    const id = Number(req.params.id);
+    const sb = requireSupabaseAdmin();
+    const { data: course } = await sb.from('courses').select('id').eq('id', id).is('deleted_at', null).maybeSingle();
+    if (!course) {
+      res.status(404).json({ error: 'Course not found' });
+      return;
+    }
+
+    const { presetUrl, base64Data } = req.body as { presetUrl?: string; base64Data?: string };
+    const existingMeta = await getCourseMeta(sb, id);
+
+    if (presetUrl) {
+      const cleanPreset = sanitizeCourseCoverUrlInput(presetUrl);
+      if (!cleanPreset) {
+        res.status(400).json({ error: 'Invalid cover image URL.' });
+        return;
+      }
+      if (existingMeta?.cover_storage_path) {
+        await removeCourseCoverFile(sb, existingMeta.cover_storage_path);
+      }
+      await saveCourseMeta(sb, {
+        course_id: id,
+        cover_url: cleanPreset,
+        cover_storage_path: null,
+        cover_mime: null,
+        co_teacher_ids: existingMeta?.co_teacher_ids || [],
+        price_monthly_sar: existingMeta?.price_monthly_sar ?? null,
+        updated_at: new Date().toISOString(),
+      });
+      invalidateOverviewCache();
+      res.json({ cover_url: cleanPreset });
+      return;
+    }
+
+    if (!base64Data || typeof base64Data !== 'string') {
+      res.status(400).json({ error: 'Please select an image file (PNG, JPG, or WEBP).' });
+      return;
+    }
+
+    const base64Clean = base64Data.includes(',') ? base64Data.split(',').pop() || '' : base64Data;
+    const buffer = Buffer.from(base64Clean, 'base64');
+    if (!buffer.length || buffer.length > 5 * 1024 * 1024) {
+      res.status(400).json({ error: 'Image file must be under 5 MB.' });
+      return;
+    }
+
+    const detected = detectImageMagicMime(buffer);
+    if (!detected) {
+      res.status(400).json({ error: 'Unsupported image format. Only valid PNG, JPEG, or WEBP images are allowed.' });
+      return;
+    }
+
+    const storagePath = await uploadCourseCoverFile(sb, id, buffer, detected.mime, detected.ext);
+    if (existingMeta?.cover_storage_path) {
+      await removeCourseCoverFile(sb, existingMeta.cover_storage_path);
+    }
+    const coverUrl = `/api/public/course-covers/${id}?v=${Date.now()}`;
+    await saveCourseMeta(sb, {
+      course_id: id,
+      cover_url: coverUrl,
+      cover_storage_path: storagePath,
+      cover_mime: detected.mime,
+      co_teacher_ids: existingMeta?.co_teacher_ids || [],
+      price_monthly_sar: existingMeta?.price_monthly_sar ?? null,
+      updated_at: new Date().toISOString(),
+    });
+
+    invalidateOverviewCache();
+    await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_COURSE_COVER', 'course', id, { bytes: buffer.length });
+    res.json({ cover_url: coverUrl });
+  })
+);
 
 app.delete('/api/admin/courses/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = Number(req.params.id);
   const sb = requireSupabaseAdmin();
   await sb.from('courses').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+  invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'SOFT_DELETE_COURSE', 'course', id, {});
   res.json({ ok: true });
 }));
 
 app.post('/api/admin/lessons', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const { course_id, title_ar, title_en, lesson_date, start_time, duration_min, objectives_ar, objectives_en, live_url } = req.body;
+  const {
+    course_id,
+    title_ar,
+    title_en,
+    lesson_date,
+    start_time,
+    duration_min,
+    objectives_ar,
+    objectives_en,
+    live_url,
+    weekday_ar,
+    is_published,
+    publish_and_notify,
+  } = req.body;
+  const courseIdNum = Number(course_id);
   const lesson = await insertRowSafe<{ id: number }>('lessons', {
-    course_id: Number(course_id),
+    course_id: courseIdNum,
     title_ar,
     title_en: title_en || title_ar,
     lesson_date,
@@ -4125,16 +4877,90 @@ app.post('/api/admin/lessons', authenticate, requireRole('admin'), asyncHandler<
     objectives_en: objectives_en || '',
   });
 
-  if (live_url) {
+  if (live_url && /^https?:\/\//i.test(String(live_url).trim())) {
     await insertRowSafe('lesson_links', {
       lesson_id: lesson.id,
       title_ar: 'رابط الحصة المباشرة',
       title_en: 'Live Session Link',
-      url: live_url,
-      link_type: 'zoom',
+      url: String(live_url).trim(),
+      link_type: String(live_url).includes('meet.google') ? 'meet' : 'zoom',
     });
   }
-  res.status(201).json({ id: lesson.id });
+
+  const sb = requireSupabaseAdmin();
+  const shouldPublish = publish_and_notify !== undefined ? Boolean(publish_and_notify) : is_published !== undefined ? Boolean(is_published) : true;
+  const cleanWeekday = String(weekday_ar || '').trim();
+  await saveLessonMeta(sb, {
+    lesson_id: lesson.id,
+    weekday_ar: cleanWeekday,
+    is_published: shouldPublish,
+    published_at: shouldPublish ? new Date().toISOString() : null,
+  });
+
+  let notifiedStudents = 0;
+  if (publish_and_notify === true) {
+    const { data: courseRow } = await sb.from('courses').select('title_ar, title_en').eq('id', courseIdNum).maybeSingle();
+    const scheduleHint = [cleanWeekday, lesson_date, start_time].filter(Boolean).join(' · ');
+    notifiedStudents = await notifyCourseLessonPublished(
+      sb,
+      courseIdNum,
+      String(courseRow?.title_ar || ''),
+      String(courseRow?.title_en || courseRow?.title_ar || ''),
+      String(title_ar || ''),
+      String(title_en || title_ar || ''),
+      scheduleHint
+    );
+  }
+
+  invalidateOverviewCache();
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_LESSON', 'lesson', lesson.id, {
+    course_id: courseIdNum,
+    is_published: shouldPublish,
+    notifiedStudents,
+  });
+  res.status(201).json({ id: lesson.id, is_published: shouldPublish, notifiedStudents });
+}));
+
+app.post('/api/admin/lessons/:id/publish', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+  const lessonId = Number(req.params.id);
+  const { sb } = await assertCanManageLesson(req.user!, lessonId);
+  const { data: lessonRow } = await sb
+    .from('lessons')
+    .select('id, course_id, title_ar, title_en, lesson_date, start_time, courses(title_ar, title_en)')
+    .eq('id', lessonId)
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (!lessonRow) {
+    res.status(404).json({ error: 'Lesson not found' });
+    return;
+  }
+
+  const existingMeta = await getLessonMeta(sb, lessonId);
+  const nextMeta: LessonMetaRecord = {
+    lesson_id: lessonId,
+    weekday_ar: existingMeta?.weekday_ar || '',
+    is_published: true,
+    published_at: new Date().toISOString(),
+  };
+  await saveLessonMeta(sb, nextMeta);
+
+  const courseInfo = Array.isArray(lessonRow.courses) ? lessonRow.courses[0] : lessonRow.courses;
+  const courseObj = courseInfo as { title_ar?: string; title_en?: string } | null;
+  const scheduleHint = [nextMeta.weekday_ar, lessonRow.lesson_date, lessonRow.start_time].filter(Boolean).join(' · ');
+  const notifiedStudents = await notifyCourseLessonPublished(
+    sb,
+    Number(lessonRow.course_id),
+    courseObj?.title_ar || '',
+    courseObj?.title_en || courseObj?.title_ar || '',
+    String(lessonRow.title_ar || ''),
+    String(lessonRow.title_en || lessonRow.title_ar || ''),
+    scheduleHint
+  );
+
+  invalidateOverviewCache();
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'PUBLISH_LESSON', 'lesson', lessonId, { notifiedStudents });
+  res.json({ ok: true, notifiedStudents, published_at: nextMeta.published_at });
 }));
 
 app.patch('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
@@ -4148,6 +4974,8 @@ app.patch('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHan
     duration_min: z.coerce.number().int().min(10).max(360).optional(),
     objectives_ar: z.string().trim().max(1000).optional(),
     objectives_en: z.string().trim().max(1000).optional(),
+    weekday_ar: z.string().trim().max(80).optional(),
+    is_published: z.boolean().optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -4155,11 +4983,27 @@ app.patch('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHan
     return;
   }
   const sb = requireSupabaseAdmin();
-  const { error } = await sb.from('lessons').update(parsed.data).eq('id', id).is('deleted_at', null);
-  if (error) {
-    res.status(500).json({ error: error.message });
-    return;
+  const { weekday_ar, is_published, ...lessonUpdates } = parsed.data;
+  if (Object.keys(lessonUpdates).length > 0) {
+    const { error } = await sb.from('lessons').update(lessonUpdates).eq('id', id).is('deleted_at', null);
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
   }
+
+  if (weekday_ar !== undefined || is_published !== undefined) {
+    const existingMeta = await getLessonMeta(sb, id);
+    const nextPublished = is_published !== undefined ? is_published : existingMeta ? existingMeta.is_published : true;
+    await saveLessonMeta(sb, {
+      lesson_id: id,
+      weekday_ar: weekday_ar !== undefined ? weekday_ar : existingMeta?.weekday_ar || '',
+      is_published: nextPublished,
+      published_at: nextPublished ? existingMeta?.published_at || new Date().toISOString() : null,
+    });
+  }
+
+  invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_LESSON', 'lesson', id, parsed.data);
   res.json({ ok: true });
 }));
@@ -4168,6 +5012,7 @@ app.delete('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHa
   const id = Number(req.params.id);
   const sb = requireSupabaseAdmin();
   await sb.from('lessons').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+  invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'SOFT_DELETE_LESSON', 'lesson', id, {});
   res.json({ ok: true });
 }));
@@ -4215,6 +5060,7 @@ app.post('/api/admin/teachers', authenticate, requireRole('admin'), asyncHandler
     hourly_rate: Number(hourly_rate || 180),
   });
 
+  invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_TEACHER', 'teacher', teacher.id, { email: cleanEmail, name_ar: cleanName });
   res.status(201).json({ id: teacher.id, temporary_password: tempPassword });
 }));
@@ -4244,6 +5090,7 @@ app.patch('/api/admin/teachers/:id', authenticate, requireRole('admin'), asyncHa
     res.status(500).json({ error: error.message });
     return;
   }
+  invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_TEACHER', 'teacher', id, parsed.data);
   res.json({ ok: true });
 }));
@@ -4252,6 +5099,7 @@ app.delete('/api/admin/teachers/:id', authenticate, requireRole('admin'), asyncH
   const id = Number(req.params.id);
   const sb = requireSupabaseAdmin();
   await sb.from('teachers').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+  invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'SOFT_DELETE_TEACHER', 'teacher', id, {});
   res.json({ ok: true });
 }));
@@ -4312,6 +5160,7 @@ app.post('/api/admin/students', authenticate, requireRole('admin'), asyncHandler
     });
   }
 
+  invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_STUDENT', 'student', student.id, { email: cleanEmail, full_name_ar: cleanName });
   res.status(201).json({ id: student.id, student_code: code, temporary_password: tempPassword });
 }));
@@ -4400,6 +5249,7 @@ app.delete('/api/admin/students/:id', authenticate, requireRole('admin'), asyncH
   const id = Number(req.params.id);
   const sb = requireSupabaseAdmin();
   await sb.from('students').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+  invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'SOFT_DELETE_STUDENT', 'student', id, {});
   res.json({ ok: true });
 }));
@@ -4535,6 +5385,7 @@ app.post('/api/admin/admissions/:id/decision', authenticate, requireRole('admin'
       body_ar: `تم قبول طلب انضمامك وتفعيل حسابك بنجاح. كود الطالب: ${studentCode}`,
       body_en: `Your admission request has been approved. Student Code: ${studentCode}`,
     });
+    invalidateOverviewCache();
   } else if (meta?.pending_profile_id) {
     await deletePendingAuthProfileIfSafe(sb, meta.pending_profile_id);
   }
@@ -4609,6 +5460,7 @@ app.post('/api/admin/teacher-applications/:id/decision', authenticate, requireRo
       reviewed_by: req.user!.id,
       reviewed_at: new Date().toISOString(),
     });
+    invalidateOverviewCache();
     await writeAuditLog(req.user!.id, req.user!.full_name, 'TEACHER_APP_APPROVED', 'teacher', teacher.id, {
       email: appRecord.email,
       name_ar: appRecord.name_ar,
@@ -4628,6 +5480,88 @@ app.post('/api/admin/teacher-applications/:id/decision', authenticate, requireRo
   await writeAuditLog(req.user!.id, req.user!.full_name, 'TEACHER_APP_REJECTED', 'teacher_application', id, {
     email: appRecord.email,
     name_ar: appRecord.name_ar,
+  });
+  res.json({ ok: true });
+}));
+
+app.post('/api/admin/guardian-requests/:id/decision', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const id = Number(req.params.id);
+  const schema = z.object({ decision: z.enum(['approved', 'rejected']) });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid guardian decision payload' });
+    return;
+  }
+
+  const sb = requireSupabaseAdmin();
+  const reqRecord = await getGuardianRequest(sb, id);
+  if (!reqRecord) {
+    res.status(404).json({ error: 'Guardian activation request not found' });
+    return;
+  }
+  if (reqRecord.status !== 'pending') {
+    res.status(409).json({ error: 'This guardian activation request has already been processed.' });
+    return;
+  }
+
+  const { decision } = parsed.data;
+  if (decision === 'approved') {
+    const { data: guardianRow } = await sb
+      .from('guardians')
+      .select('id, profile_id')
+      .eq('id', reqRecord.guardian_id)
+      .maybeSingle();
+
+    if (guardianRow?.profile_id && guardianRow.profile_id !== reqRecord.profile_id) {
+      res.status(409).json({ error: 'This student is already linked to another guardian account.' });
+      return;
+    }
+
+    await sb.from('profiles').update({ is_active: true, role: 'guardian' }).eq('id', reqRecord.profile_id);
+    await sb
+      .from('guardians')
+      .update({
+        profile_id: reqRecord.profile_id,
+        full_name: reqRecord.full_name,
+        email: reqRecord.email,
+        ...(reqRecord.phone ? { phone: reqRecord.phone } : {}),
+        ...(reqRecord.relation ? { relation: reqRecord.relation } : {}),
+      })
+      .eq('id', reqRecord.guardian_id);
+
+    await insertRowSafe('notifications', {
+      profile_id: reqRecord.profile_id,
+      title_ar: 'تم تفعيل حساب ولي الأمر بنجاح',
+      title_en: 'Guardian Account Approved',
+      body_ar: `تمت الموافقة على ربط حسابك بالطالب (${reqRecord.student_name} — ${reqRecord.student_code}). يمكنك الآن تسجيل الدخول ومتابعة التقارير.`,
+      body_en: `Your guardian portal link to ${reqRecord.student_code} is now active. You may sign in anytime.`,
+    });
+
+    await saveGuardianRequest(sb, {
+      ...reqRecord,
+      status: 'approved',
+      reviewed_by: req.user!.id,
+      reviewed_at: new Date().toISOString(),
+    });
+    await writeAuditLog(req.user!.id, req.user!.full_name, 'GUARDIAN_APP_APPROVED', 'guardian', reqRecord.guardian_id, {
+      email: reqRecord.email,
+      student_code: reqRecord.student_code,
+    });
+    void broadcastRealtimeEvent('academic:updated', { kind: 'guardian' });
+    res.json({ ok: true, email: reqRecord.email, student_code: reqRecord.student_code });
+    return;
+  }
+
+  await saveGuardianRequest(sb, {
+    ...reqRecord,
+    status: 'rejected',
+    reviewed_by: req.user!.id,
+    reviewed_at: new Date().toISOString(),
+  });
+  await deletePendingAuthProfileIfSafe(sb, reqRecord.profile_id);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'GUARDIAN_APP_REJECTED', 'guardian_request', id, {
+    email: reqRecord.email,
+    student_code: reqRecord.student_code,
   });
   res.json({ ok: true });
 }));
@@ -4827,22 +5761,114 @@ app.put('/api/admin/legal/:docType', authenticate, requireRole('admin'), asyncHa
       updated_at: new Date().toISOString(),
     })
     .eq('doc_type', docType);
+  invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_LEGAL_DOC', 'legal_document', docType, { version });
   res.json({ ok: true });
 }));
 
-app.patch('/api/admin/users/:id/role', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = String(req.params.id);
-  const { role, is_active } = req.body as { role?: 'student' | 'teacher' | 'admin' | 'guardian'; is_active?: boolean | number };
+app.post('/api/admin/admins', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const schema = z.object({
+    full_name: z.string().trim().min(2).max(120),
+    email: z.string().trim().email().max(160),
+    password: z.string().min(8).max(128),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Valid full name, email, and password (min 8 characters) are required.' });
+    return;
+  }
+
+  const cleanEmail = parsed.data.email.toLowerCase();
+  const cleanName = parsed.data.full_name;
   const sb = requireSupabaseAdmin();
 
+  const { data: existingProfile } = await sb
+    .from('profiles')
+    .select('id')
+    .ilike('email', cleanEmail)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (existingProfile) {
+    res.status(409).json({ error: 'An account with this email already exists.' });
+    return;
+  }
+
+  const existingAuth = await findSupabaseAuthUserByEmail(cleanEmail);
+  if (existingAuth) {
+    res.status(409).json({ error: 'This email is already registered in Supabase Auth.' });
+    return;
+  }
+
+  const { user } = await provisionSupabaseAuthUser(cleanEmail, parsed.data.password, cleanName, 'admin');
+  const { error: profErr } = await sb.from('profiles').upsert(
+    {
+      id: user.id,
+      email: cleanEmail,
+      full_name: cleanName,
+      role: 'admin',
+      is_active: true,
+      preferred_lang: 'ar',
+    },
+    { onConflict: 'id' }
+  );
+  if (profErr) {
+    await sb.auth.admin.deleteUser(user.id).catch(() => {});
+    res.status(500).json({ error: profErr.message });
+    return;
+  }
+
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_ADMIN', 'profile', user.id, {
+    email: cleanEmail,
+    full_name: cleanName,
+  });
+
+  res.status(201).json({
+    id: user.id,
+    email: cleanEmail,
+    full_name: cleanName,
+    role: 'admin',
+  });
+}));
+
+app.patch('/api/admin/users/:id/role', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const id = String(req.params.id);
+  const schema = z.object({
+    role: z.enum(['student', 'teacher', 'admin', 'guardian']).optional(),
+    is_active: z.union([z.boolean(), z.number()]).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid user role or status payload.' });
+    return;
+  }
+
+  const sb = requireSupabaseAdmin();
   const { data: target } = await sb.from('profiles').select('id, email, full_name, role, is_active').eq('id', id).maybeSingle();
   if (!target) {
     res.status(404).json({ error: 'User not found' });
     return;
   }
-  const newRole = role || target.role;
-  const newActive = is_active !== undefined ? Boolean(is_active) : target.is_active;
+
+  const newRole = parsed.data.role || target.role;
+  const newActive = parsed.data.is_active !== undefined ? Boolean(parsed.data.is_active) : Boolean(target.is_active);
+
+  if (id === req.user!.id && (newRole !== 'admin' || !newActive)) {
+    res.status(400).json({ error: 'You cannot demote or deactivate your own administrator account.' });
+    return;
+  }
+
+  if (target.role === 'admin' && (newRole !== 'admin' || !newActive)) {
+    const { count } = await sb
+      .from('profiles')
+      .select('id', { count: 'exact', head: true })
+      .eq('role', 'admin')
+      .eq('is_active', true)
+      .is('deleted_at', null);
+    if ((count || 0) <= 1) {
+      res.status(400).json({ error: 'Cannot remove or deactivate the last active administrator account.' });
+      return;
+    }
+  }
 
   await sb.from('profiles').update({ role: newRole, is_active: newActive }).eq('id', id);
   await sb.auth.admin.updateUserById(id, { user_metadata: { full_name: target.full_name, role: newRole } });
@@ -4889,6 +5915,382 @@ app.post('/api/admin/users/:id/reset-password', authenticate, requireRole('admin
     role: target.role,
   });
   res.json({ ok: true });
+}));
+
+// ============================================================================
+// REAL AUTHENTICATED COMMUNITY COMMENTS, DEVELOPMENT SUGGESTIONS & PLACEMENT TEST CMS
+// ============================================================================
+app.get('/api/public/comments', asyncHandler(async (req, res) => {
+  const viewer = await tryAuthenticateOptional(req);
+  const sb = requireSupabaseAdmin();
+  const all = await listAllComments(sb);
+  const visible = all.filter((c) => c.is_visible);
+  res.setHeader('Cache-Control', 'no-cache');
+  res.json({ comments: visible.map((c) => sanitizeCommentForPublic(c, viewer?.id || null)) });
+}));
+
+app.post('/api/comments', authenticate, communityWriteLimiter, asyncHandler<AuthRequest>(async (req, res) => {
+  const schema = z.object({
+    rating: z.coerce.number().int().min(1).max(5).default(5),
+    content: z.string().trim().min(5).max(800),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Comment must be between 5 and 800 characters with a 1-5 rating.' });
+    return;
+  }
+
+  const sb = requireSupabaseAdmin();
+  const nowIso = new Date().toISOString();
+  const id = generateRecordId('c');
+  const record = {
+    id,
+    author_profile_id: req.user!.id,
+    author_name: req.user!.full_name,
+    author_role: req.user!.role,
+    rating: parsed.data.rating,
+    content: parsed.data.content,
+    is_visible: true,
+    replies: [],
+    created_at: nowIso,
+    updated_at: nowIso,
+  };
+  await saveComment(sb, record);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_COMMENT', 'comment', id, {
+    rating: record.rating,
+    role: req.user!.role,
+  });
+  res.status(201).json({ comment: sanitizeCommentForPublic(record, req.user!.id) });
+}));
+
+app.post('/api/comments/:id/replies', authenticate, communityWriteLimiter, asyncHandler<AuthRequest>(async (req, res) => {
+  const schema = z.object({
+    content: z.string().trim().min(2).max(600),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Reply must be between 2 and 600 characters.' });
+    return;
+  }
+
+  const sb = requireSupabaseAdmin();
+  const existing = await getCommentById(sb, String(req.params.id));
+  if (!existing) {
+    res.status(404).json({ error: 'Comment not found' });
+    return;
+  }
+  if (!existing.is_visible && req.user!.role !== 'admin' && existing.author_profile_id !== req.user!.id) {
+    res.status(404).json({ error: 'Comment not found' });
+    return;
+  }
+
+  const reply = {
+    id: generateRecordId('r'),
+    author_profile_id: req.user!.id,
+    author_name: req.user!.full_name,
+    author_role: req.user!.role,
+    content: parsed.data.content,
+    created_at: new Date().toISOString(),
+  };
+
+  existing.replies = [...(existing.replies || []), reply];
+  existing.updated_at = reply.created_at;
+  await saveComment(sb, existing);
+
+  if (existing.author_profile_id !== req.user!.id) {
+    await insertRowSafe('notifications', {
+      profile_id: existing.author_profile_id,
+      title_ar: `رد جديد على تعليقك من ${req.user!.full_name}`,
+      title_en: `New Reply on Your Review from ${req.user!.full_name}`,
+      body_ar: parsed.data.content.slice(0, 140),
+      body_en: parsed.data.content.slice(0, 140),
+    }).catch(() => {});
+  }
+
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'REPLY_COMMENT', 'comment', existing.id, {
+    reply_id: reply.id,
+  });
+
+  res.status(201).json({ comment: sanitizeCommentForPublic(existing, req.user!.id) });
+}));
+
+app.delete('/api/comments/:id', authenticate, asyncHandler<AuthRequest>(async (req, res) => {
+  const sb = requireSupabaseAdmin();
+  const existing = await getCommentById(sb, String(req.params.id));
+  if (!existing) {
+    res.status(404).json({ error: 'Comment not found' });
+    return;
+  }
+  if (req.user!.role !== 'admin' && existing.author_profile_id !== req.user!.id) {
+    res.status(403).json({ error: 'Forbidden: you can only delete your own comments.' });
+    return;
+  }
+  await deleteCommentRecord(sb, existing.id);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'DELETE_COMMENT', 'comment', existing.id, {});
+  res.json({ ok: true });
+}));
+
+app.patch('/api/admin/comments/:id/visibility', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const schema = z.object({ is_visible: z.boolean() });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid visibility flag.' });
+    return;
+  }
+  const sb = requireSupabaseAdmin();
+  const existing = await getCommentById(sb, String(req.params.id));
+  if (!existing) {
+    res.status(404).json({ error: 'Comment not found' });
+    return;
+  }
+  existing.is_visible = parsed.data.is_visible;
+  existing.updated_at = new Date().toISOString();
+  await saveComment(sb, existing);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'MODERATE_COMMENT', 'comment', existing.id, {
+    is_visible: existing.is_visible,
+  });
+  res.json({ comment: sanitizeCommentForPublic(existing, req.user!.id) });
+}));
+
+app.get('/api/public/suggestions', asyncHandler(async (req, res) => {
+  const viewer = await tryAuthenticateOptional(req);
+  const sb = requireSupabaseAdmin();
+  const all = await listAllSuggestions(sb);
+  const publicList = all.filter((s) => s.status !== 'declined');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.json({ suggestions: publicList.map((s) => sanitizeSuggestionForPublic(s, viewer?.id || null)) });
+}));
+
+app.post('/api/suggestions', authenticate, communityWriteLimiter, asyncHandler<AuthRequest>(async (req, res) => {
+  const schema = z.object({
+    category: z.enum(['platform', 'curriculum', 'experience', 'other']).default('platform'),
+    title: z.string().trim().min(4).max(120),
+    description: z.string().trim().min(10).max(1200),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Suggestion title (4-120 chars) and details (10-1200 chars) are required.' });
+    return;
+  }
+  const sb = requireSupabaseAdmin();
+  const nowIso = new Date().toISOString();
+  const id = generateRecordId('s');
+  const record = {
+    id,
+    author_profile_id: req.user!.id,
+    author_name: req.user!.full_name,
+    author_role: req.user!.role,
+    category: parsed.data.category,
+    title: parsed.data.title,
+    description: parsed.data.description,
+    status: 'pending' as const,
+    admin_reply: '',
+    replied_by_name: null,
+    replied_at: null,
+    voter_ids: [req.user!.id],
+    created_at: nowIso,
+    updated_at: nowIso,
+  };
+  await saveSuggestion(sb, record);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_SUGGESTION', 'suggestion', id, {
+    category: record.category,
+    title: record.title,
+  });
+  res.status(201).json({ suggestion: sanitizeSuggestionForPublic(record, req.user!.id) });
+}));
+
+app.post('/api/suggestions/:id/vote', authenticate, communityWriteLimiter, asyncHandler<AuthRequest>(async (req, res) => {
+  const sb = requireSupabaseAdmin();
+  const existing = await getSuggestionById(sb, String(req.params.id));
+  if (!existing || existing.status === 'declined') {
+    res.status(404).json({ error: 'Suggestion not found' });
+    return;
+  }
+  const voters = new Set(existing.voter_ids || []);
+  let hasVoted = false;
+  if (voters.has(req.user!.id)) {
+    voters.delete(req.user!.id);
+    hasVoted = false;
+  } else {
+    voters.add(req.user!.id);
+    hasVoted = true;
+  }
+  existing.voter_ids = Array.from(voters);
+  existing.updated_at = new Date().toISOString();
+  await saveSuggestion(sb, existing);
+  res.json({ votes_count: existing.voter_ids.length, has_voted: hasVoted });
+}));
+
+app.delete('/api/suggestions/:id', authenticate, asyncHandler<AuthRequest>(async (req, res) => {
+  const sb = requireSupabaseAdmin();
+  const existing = await getSuggestionById(sb, String(req.params.id));
+  if (!existing) {
+    res.status(404).json({ error: 'Suggestion not found' });
+    return;
+  }
+  if (req.user!.role !== 'admin' && existing.author_profile_id !== req.user!.id) {
+    res.status(403).json({ error: 'Forbidden: you can only delete your own suggestions.' });
+    return;
+  }
+  await deleteSuggestionRecord(sb, existing.id);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'DELETE_SUGGESTION', 'suggestion', existing.id, {});
+  res.json({ ok: true });
+}));
+
+app.patch('/api/admin/suggestions/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const schema = z.object({
+    status: z.enum(['pending', 'reviewing', 'planned', 'implemented', 'declined']),
+    admin_reply: z.string().trim().max(800).optional().default(''),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid suggestion status or reply payload.' });
+    return;
+  }
+
+  const sb = requireSupabaseAdmin();
+  const existing = await getSuggestionById(sb, String(req.params.id));
+  if (!existing) {
+    res.status(404).json({ error: 'Suggestion not found' });
+    return;
+  }
+
+  const nowIso = new Date().toISOString();
+  existing.status = parsed.data.status;
+  existing.admin_reply = parsed.data.admin_reply;
+  existing.replied_by_name = req.user!.full_name;
+  existing.replied_at = nowIso;
+  existing.updated_at = nowIso;
+  await saveSuggestion(sb, existing);
+
+  if (existing.author_profile_id !== req.user!.id) {
+    await insertRowSafe('notifications', {
+      profile_id: existing.author_profile_id,
+      title_ar: `تحديث على اقتراحك: ${existing.title}`,
+      title_en: `Update on Your Suggestion: ${existing.title}`,
+      body_ar: parsed.data.admin_reply
+        ? `تم تحديث الحالة (${parsed.data.status}): ${parsed.data.admin_reply.slice(0, 120)}`
+        : `تم تحديث حالة اقتراحك إلى: ${parsed.data.status}`,
+      body_en: parsed.data.admin_reply
+        ? `Status updated (${parsed.data.status}): ${parsed.data.admin_reply.slice(0, 120)}`
+        : `Your suggestion status is now: ${parsed.data.status}`,
+    }).catch(() => {});
+  }
+
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'REVIEW_SUGGESTION', 'suggestion', existing.id, {
+    status: existing.status,
+  });
+
+  res.json({ suggestion: sanitizeSuggestionForPublic(existing, req.user!.id) });
+}));
+
+app.get('/api/my/community', authenticate, asyncHandler<AuthRequest>(async (req, res) => {
+  const sb = requireSupabaseAdmin();
+  const [allComments, allSuggestions] = await Promise.all([listAllComments(sb), listAllSuggestions(sb)]);
+  const myComments = allComments
+    .filter((c) => c.author_profile_id === req.user!.id)
+    .map((c) => sanitizeCommentForPublic(c, req.user!.id));
+  const mySuggestions = allSuggestions
+    .filter((s) => s.author_profile_id === req.user!.id)
+    .map((s) => sanitizeSuggestionForPublic(s, req.user!.id));
+  res.json({ comments: myComments, suggestions: mySuggestions });
+}));
+
+app.get('/api/admin/community', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const sb = requireSupabaseAdmin();
+  const [allComments, allSuggestions] = await Promise.all([listAllComments(sb), listAllSuggestions(sb)]);
+  res.json({
+    comments: allComments.map((c) => sanitizeCommentForPublic(c, req.user!.id)),
+    suggestions: allSuggestions.map((s) => sanitizeSuggestionForPublic(s, req.user!.id)),
+  });
+}));
+
+app.get('/api/admin/placement-test', authenticate, requireRole('admin'), asyncHandler(async (_req, res) => {
+  const sb = requireSupabaseAdmin();
+  const [config, { data: submissions }] = await Promise.all([
+    getPlacementTestConfig(sb),
+    sb
+      .from('placement_tests')
+      .select('id, child_name, age, parent_email, score, recommended_level_id, created_at, levels(name_ar, name_en)')
+      .order('created_at', { ascending: false })
+      .limit(30),
+  ]);
+  const recentSubmissions = (submissions || []).map((row: Record<string, unknown>) => {
+    const lvl = row.levels as { name_ar?: string; name_en?: string } | null;
+    const { levels: _l, ...rest } = row;
+    return {
+      ...rest,
+      level_name_ar: lvl?.name_ar ?? '—',
+      level_name_en: lvl?.name_en ?? '—',
+    };
+  });
+  res.json({ config, submissions: recentSubmissions });
+}));
+
+app.put('/api/admin/placement-test', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const questionSchema = z.object({
+    id: z.string().trim().min(1).max(60).optional(),
+    q_ar: z.string().trim().min(3).max(350),
+    q_en: z.string().trim().max(350).optional().default(''),
+    opts_ar: z.array(z.string().trim().min(1).max(200)).min(2).max(5),
+    opts_en: z.array(z.string().trim().max(200)).optional().default([]),
+    correct_index: z.coerce.number().int().min(0).max(4),
+  });
+  const schema = z.object({
+    intro_ar: z.string().trim().min(5).max(400),
+    intro_en: z.string().trim().max(400).optional().default(''),
+    questions: z.array(questionSchema).min(1).max(20),
+    thresholds: z.object({
+      intermediate_min_score: z.coerce.number().int().min(1).max(99),
+      advanced_min_score: z.coerce.number().int().min(1).max(100),
+      advanced_min_age: z.coerce.number().int().min(3).max(22),
+    }),
+  });
+
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid placement test configuration.', details: parsed.error.flatten().fieldErrors });
+    return;
+  }
+
+  for (const q of parsed.data.questions) {
+    if (q.correct_index >= q.opts_ar.length) {
+      res.status(400).json({ error: 'Correct option index exceeds available options for one or more questions.' });
+      return;
+    }
+  }
+  if (parsed.data.thresholds.advanced_min_score < parsed.data.thresholds.intermediate_min_score) {
+    res.status(400).json({ error: 'Advanced threshold score must be greater than or equal to intermediate score.' });
+    return;
+  }
+
+  const sb = requireSupabaseAdmin();
+  const normalizedQuestions = parsed.data.questions.map((q) => ({
+    id: q.id || generateRecordId('pt'),
+    q_ar: q.q_ar,
+    q_en: q.q_en || q.q_ar,
+    opts_ar: q.opts_ar,
+    opts_en:
+      q.opts_en && q.opts_en.length === q.opts_ar.length
+        ? q.opts_en.map((o, idx) => o || q.opts_ar[idx])
+        : q.opts_ar,
+    correct_index: q.correct_index,
+  }));
+
+  const saved = await savePlacementTestConfig(sb, {
+    intro_ar: parsed.data.intro_ar,
+    intro_en: parsed.data.intro_en || parsed.data.intro_ar,
+    questions: normalizedQuestions,
+    thresholds: parsed.data.thresholds,
+    updated_at: new Date().toISOString(),
+  });
+
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_PLACEMENT_TEST', 'placement_test', 'config', {
+    question_count: saved.questions.length,
+    thresholds: saved.thresholds,
+  });
+
+  res.json({ config: saved });
 }));
 
 app.get('/api/admin/supabase-schema', authenticate, requireRole('admin'), (_req, res) => {
@@ -5038,6 +6440,10 @@ async function startServer() {
     app.get('*', (req, res, next) => {
       if (req.path.startsWith('/api')) {
         next();
+        return;
+      }
+      if (/\.(js|css|png|jpg|jpeg|webp|svg|ico|woff2|json|map)$/i.test(req.path)) {
+        res.status(404).end();
         return;
       }
       if (!fs.existsSync(indexHtmlPath)) {

@@ -1,43 +1,12 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { Compass, CheckCircle2, ArrowLeft } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { apiFetch } from '../../lib/api';
+import { queryKeys } from '../../lib/queryClient';
 import { tField } from '../../i18n/translations';
-import type { Level } from '../../types';
-import { Card, PrimaryButton, SecondaryButton } from '../../components/ui/CommonUI';
-
-const QUESTIONS = [
-  {
-    q_ar: '١. هل يميز الطفل شكل الحروف العربية وصوتها بالفتحة والكسرة والضمة؟',
-    q_en: '1. Can the child recognize Arabic letters and their short vowels (Fatha, Kasra, Damma)?',
-    opts_ar: ['لا يعرف الحروف بعد', 'يميز معظم الحروف والحركات', 'يقرأ الكلمات بالحركات بطلاقة تامة'],
-    opts_en: ['Not yet', 'Recognizes most letters & vowels', 'Reads voweled words fluently'],
-  },
-  {
-    q_ar: '٢. اختر الكلمة التي تبدأ بحرف مضموم:',
-    q_en: '2. Which Arabic word starts with a Damma vowel?',
-    opts_ar: ['كَتَبَ', 'عِلْمٌ', 'كُتُبٌ'],
-    opts_en: ['كَتَبَ (Ka-ta-ba)', 'عِلْمٌ (Il-mun)', 'كُتُبٌ (Ku-tu-bun)'],
-  },
-  {
-    q_ar: '٣. ما مستوى حفظ الطفل من جزء عمّ؟',
-    q_en: '3. How much of Juz Amma has the child memorized?',
-    opts_ar: ['أتمّ حفظ جزء عمّ كاملاً', 'يحفظ من 5 إلى 15 سورة قصيرة', 'لم يبدأ الحفظ بعد أو يحفظ أقل من 5 سور'],
-    opts_en: ['Completed Juz Amma', 'Memorized 5–15 short Surahs', 'Just starting (< 5 Surahs)'],
-  },
-  {
-    q_ar: '٤. في كلمة "مِنْكُمْ"، ما الحكم التجويدي للنون الساكنة قبل الكاف؟',
-    q_en: '4. What is the Tajweed rule of Noon Sakinah in "مِنْكُمْ"?',
-    opts_ar: ['إظهار حلقي', 'إدغام بغنة', 'إخفاء حقيقي'],
-    opts_en: ['Izhar Halqi', 'Idgham with Ghunnah', 'Ikhfa Haqiqi'],
-  },
-  {
-    q_ar: '٥. هل يستطيع الطفل القراءة مباشرة من المصحف الشريف بالتشكيل؟',
-    q_en: '5. Can the child read directly from the Mushaf with diacritics?',
-    opts_ar: ['يحتاج للتأسيس أولاً', 'يقرأ جملاً قصيرة ببطء', 'يقرأ من المصحف بثقة وانطلاق'],
-    opts_en: ['Needs foundational reading first', 'Reads short phrases slowly', 'Reads from Mushaf smoothly'],
-  },
-];
+import type { Level, PlacementTestPublicConfig } from '../../types';
+import { Card, LoadingState, PrimaryButton, SecondaryButton } from '../../components/ui/CommonUI';
 
 export function PlacementTestPage({
   onSelectLevelForAdmission,
@@ -48,7 +17,7 @@ export function PlacementTestPage({
   const [childName, setChildName] = useState('');
   const [age, setAge] = useState('8');
   const [parentEmail, setParentEmail] = useState('');
-  const [answers, setAnswers] = useState<number[]>(Array(QUESTIONS.length).fill(-1));
+  const [answers, setAnswers] = useState<number[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<{
     score: number;
@@ -57,11 +26,26 @@ export function PlacementTestPage({
     recommendedLevel: Level;
   } | null>(null);
 
+  const { data: testConfig, isLoading } = useQuery({
+    queryKey: queryKeys.publicPlacementTest,
+    queryFn: () => apiFetch<PlacementTestPublicConfig>('/api/public/placement-test'),
+  });
+
+  const questions = testConfig?.questions || [];
+
+  useEffect(() => {
+    if (questions.length > 0 && answers.length !== questions.length) {
+      setAnswers(Array(questions.length).fill(-1));
+    }
+  }, [questions.length, answers.length]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!childName.trim() || answers.some((a) => a === -1)) {
+    if (!childName.trim() || answers.length !== questions.length || answers.some((a) => a === -1)) {
       toast(
-        lang === 'ar' ? 'يرجى إدخال اسم الطفل والإجابة على جميع الأسئلة.' : 'Please enter child name and answer all 5 questions.',
+        lang === 'ar'
+          ? `يرجى إدخال اسم الطفل والإجابة على جميع الأسئلة (${questions.length}).`
+          : `Please enter child name and answer all ${questions.length} questions.`,
         'error'
       );
       return;
@@ -90,6 +74,14 @@ export function PlacementTestPage({
     }
   };
 
+  if (isLoading) {
+    return (
+      <div className="max-w-3xl mx-auto px-4 sm:px-6 py-12">
+        <LoadingState label={lang === 'ar' ? 'جاري تحميل اختبار تحديد المستوى...' : 'Loading placement test...'} />
+      </div>
+    );
+  }
+
   return (
     <div className="max-w-3xl mx-auto px-4 sm:px-6 py-12 space-y-8">
       <div className="space-y-2">
@@ -102,8 +94,8 @@ export function PlacementTestPage({
         </h1>
         <p className="text-sm sm:text-base text-slate-600 dark:text-slate-300">
           {lang === 'ar'
-            ? 'أجب مع طفلك عن 5 أسئلة قصيرة لنرشح لك المستوى والحلقة الأنسب له.'
-            : 'Complete 5 short questions with your child to receive an instant level recommendation.'}
+            ? testConfig?.intro_ar || 'أجب مع طفلك عن الأسئلة القصيرة التالية لنرشح لك المستوى والحلقة الأنسب له.'
+            : testConfig?.intro_en || 'Complete these short questions with your child to receive an instant level recommendation.'}
         </p>
       </div>
 
@@ -111,8 +103,10 @@ export function PlacementTestPage({
         <Card className="p-6 sm:p-8 space-y-6">
           <div className="flex items-center gap-3 text-[#0F766E] dark:text-[#2DD4BF]">
             <CheckCircle2 className="w-7 h-7" />
-            <h2 className="text-2xl font-extrabold">
-              {lang === 'ar' ? `النتيجة: ${result.score}%` : `Score: ${result.score}%`}
+            <h2 className="text-2xl font-extrabold tabular-nums">
+              {lang === 'ar'
+                ? `النتيجة: ${result.score}% (${result.correctCount} من ${result.total})`
+                : `Score: ${result.score}% (${result.correctCount} / ${result.total})`}
             </h2>
           </div>
 
@@ -133,7 +127,12 @@ export function PlacementTestPage({
               <span>{lang === 'ar' ? 'قدّم الآن في هذا المستوى' : 'Apply for This Level'}</span>
               <ArrowLeft className="w-4 h-4 rtl:rotate-0 ltr:rotate-180" />
             </PrimaryButton>
-            <SecondaryButton onClick={() => setResult(null)}>
+            <SecondaryButton
+              onClick={() => {
+                setResult(null);
+                setAnswers(Array(questions.length).fill(-1));
+              }}
+            >
               {lang === 'ar' ? 'إعادة الاختبار' : 'Retake Test'}
             </SecondaryButton>
           </div>
@@ -156,8 +155,8 @@ export function PlacementTestPage({
               <label className="text-xs font-bold">{lang === 'ar' ? 'العمر (بالسنوات) *' : 'Age (years) *'}</label>
               <input
                 type="number"
-                min={4}
-                max={16}
+                min={3}
+                max={22}
                 required
                 value={age}
                 onChange={(e) => setAge(e.target.value)}
@@ -176,11 +175,11 @@ export function PlacementTestPage({
             </div>
           </Card>
 
-          {QUESTIONS.map((q, qIdx) => (
-            <Card key={qIdx} className="p-6 space-y-3">
-              <h3 className="font-bold text-sm sm:text-base">{lang === 'ar' ? q.q_ar : q.q_en}</h3>
+          {questions.map((q, qIdx) => (
+            <Card key={q.id || qIdx} className="p-6 space-y-3">
+              <h3 className="font-bold text-sm sm:text-base">{lang === 'ar' ? q.q_ar : q.q_en || q.q_ar}</h3>
               <div className="grid grid-cols-1 gap-2.5">
-                {(lang === 'ar' ? q.opts_ar : q.opts_en).map((opt, oIdx) => {
+                {(lang === 'ar' ? q.opts_ar : q.opts_en?.length ? q.opts_en : q.opts_ar).map((opt, oIdx) => {
                   const chosen = answers[qIdx] === oIdx;
                   return (
                     <button

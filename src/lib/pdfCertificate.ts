@@ -58,6 +58,54 @@ function renderTextStripToPng(options: {
   return canvas.toDataURL('image/png');
 }
 
+async function loadLogoAsPngDataUrl(src: string): Promise<string | null> {
+  if (typeof document === 'undefined' || typeof Image === 'undefined') return null;
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    const timer = setTimeout(() => resolve(null), 2500);
+    img.onload = () => {
+      clearTimeout(timer);
+      try {
+        const size = 240;
+        const canvas = document.createElement('canvas');
+        canvas.width = size;
+        canvas.height = size;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(null);
+          return;
+        }
+        // White seal backdrop + subtle gold circular/rounded border
+        ctx.fillStyle = '#FFFFFF';
+        ctx.beginPath();
+        ctx.arc(size / 2, size / 2, size / 2 - 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.lineWidth = 5;
+        ctx.strokeStyle = '#C98A1E';
+        ctx.stroke();
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(size / 2, size / 2, size / 2 - 12, 0, Math.PI * 2);
+        ctx.clip();
+        const pad = 22;
+        ctx.drawImage(img, pad, pad, size - pad * 2, size - pad * 2);
+        ctx.restore();
+
+        resolve(canvas.toDataURL('image/png'));
+      } catch {
+        resolve(null);
+      }
+    };
+    img.onerror = () => {
+      clearTimeout(timer);
+      resolve(null);
+    };
+    img.src = src;
+  });
+}
+
 export async function generateCertificatePDF(cert: CertificatePDFData): Promise<void> {
   await waitForFontsReady();
 
@@ -88,53 +136,63 @@ export async function generateCertificatePDF(cert: CertificatePDFData): Promise<
   doc.setLineWidth(1);
   doc.rect(42, 42, w - 84, h - 84);
 
-  // Bilingual Header
+  // Official Academy Logo Emblem at Top Crown
+  const logoPng = await loadLogoAsPngDataUrl('/assets/images/academy_logo.webp');
+  const hasLogo = Boolean(logoPng);
+  if (logoPng) {
+    const logoSize = 48;
+    doc.addImage(logoPng, 'PNG', w / 2 - logoSize / 2, 52, logoSize, logoSize);
+  }
+
+  const yOffset = hasLogo ? 40 : 0;
+
+  // Bilingual Header (safely inside gold double frame)
   const arAcademyStrip = renderTextStripToPng({
-    text: 'أكاديمية نور وبيان لتحفيظ القرآن الكريم واللغة العربية',
-    widthPt: 580,
-    heightPt: 26,
-    fontSizePx: 14,
+    text: 'أكاديمية نور وبيان للقرآن واللغات والعلوم والمهارات',
+    widthPt: 600,
+    heightPt: 24,
+    fontSizePx: 12.5,
     fontWeight: '800',
     color: '#0F213E',
   });
   if (arAcademyStrip) {
-    doc.addImage(arAcademyStrip, 'PNG', w / 2 - 290, 56, 580, 26);
+    doc.addImage(arAcademyStrip, 'PNG', w / 2 - 300, 62 + yOffset, 600, 24);
   }
 
   doc.setTextColor(15, 33, 62);
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(11);
-  doc.text('NOOR & BAYAN ACADEMY', w / 2, 95, { align: 'center' });
+  doc.setFontSize(10);
+  doc.text('NOOR & BAYAN ACADEMY', w / 2, 97 + yOffset, { align: 'center' });
 
   // Main Arabic + English Title
   const arTitleStrip = renderTextStripToPng({
     text: 'شهادة إتمام وتفوّق',
     widthPt: 480,
-    heightPt: 40,
-    fontSizePx: 26,
+    heightPt: 38,
+    fontSizePx: 24,
     fontWeight: '800',
     color: '#C98A1E',
   });
   if (arTitleStrip) {
-    doc.addImage(arTitleStrip, 'PNG', w / 2 - 240, 108, 480, 40);
+    doc.addImage(arTitleStrip, 'PNG', w / 2 - 240, 108 + yOffset, 480, 38);
   }
 
   doc.setTextColor(201, 138, 30);
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(17);
-  doc.text('CERTIFICATE OF ACHIEVEMENT', w / 2, 166, { align: 'center' });
+  doc.setFontSize(15);
+  doc.text('CERTIFICATE OF ACHIEVEMENT', w / 2, 160 + yOffset, { align: 'center' });
 
   // Intro line
   const arAwardStrip = renderTextStripToPng({
     text: 'تشهد إدارة الأكاديمية بكل فخر بأن الطالب / الطالبة',
     widthPt: 540,
-    heightPt: 24,
-    fontSizePx: 13,
+    heightPt: 22,
+    fontSizePx: 12.5,
     fontWeight: '600',
     color: '#475569',
   });
   if (arAwardStrip) {
-    doc.addImage(arAwardStrip, 'PNG', w / 2 - 270, 182, 540, 24);
+    doc.addImage(arAwardStrip, 'PNG', w / 2 - 270, 174 + yOffset, 540, 22);
   }
 
   // Student Name (Arabic primary + English subtitle)
@@ -142,60 +200,60 @@ export async function generateCertificatePDF(cert: CertificatePDFData): Promise<
   const arStudentStrip = renderTextStripToPng({
     text: studentAr,
     widthPt: 620,
-    heightPt: 42,
-    fontSizePx: 26,
+    heightPt: 38,
+    fontSizePx: 24,
     fontWeight: '800',
     color: '#0F213E',
   });
   if (arStudentStrip) {
-    doc.addImage(arStudentStrip, 'PNG', w / 2 - 310, 208, 620, 42);
+    doc.addImage(arStudentStrip, 'PNG', w / 2 - 310, 198 + yOffset, 620, 38);
   }
 
   if (cert.student_name_en && cert.student_name_en !== cert.student_name_ar) {
     const enStudentStrip = renderTextStripToPng({
       text: cert.student_name_en,
       widthPt: 580,
-      heightPt: 24,
-      fontSizePx: 14,
+      heightPt: 22,
+      fontSizePx: 13.5,
       fontWeight: '700',
       color: '#475569',
       direction: 'ltr',
     });
     if (enStudentStrip) {
-      doc.addImage(enStudentStrip, 'PNG', w / 2 - 290, 249, 580, 24);
+      doc.addImage(enStudentStrip, 'PNG', w / 2 - 290, 237 + yOffset, 580, 22);
     }
   }
 
   // Gold Divider
   doc.setDrawColor(201, 138, 30);
   doc.setLineWidth(1.5);
-  doc.line(w / 2 - 170, 276, w / 2 + 170, 276);
+  doc.line(w / 2 - 170, 264 + yOffset, w / 2 + 170, 264 + yOffset);
 
-  // Achievement details (Arabic + English, rendered cleanly with max-width fitting)
+  // Achievement details (Arabic + English title, Arabic program/standing only)
   const arCertTitle = cert.title_ar || cert.title_en;
   const arAchievementStrip = renderTextStripToPng({
     text: `قد أتمّ بنجاح: ${arCertTitle}`,
     widthPt: 640,
-    heightPt: 32,
-    fontSizePx: 17,
+    heightPt: 30,
+    fontSizePx: 16,
     fontWeight: '700',
     color: '#0F766E',
   });
   if (arAchievementStrip) {
-    doc.addImage(arAchievementStrip, 'PNG', w / 2 - 320, 286, 640, 32);
+    doc.addImage(arAchievementStrip, 'PNG', w / 2 - 320, 274 + yOffset, 640, 30);
   }
 
   const enTitleStrip = renderTextStripToPng({
     text: cert.title_en,
     widthPt: 620,
-    heightPt: 24,
-    fontSizePx: 13,
+    heightPt: 22,
+    fontSizePx: 12.5,
     fontWeight: '700',
     color: '#0F766E',
     direction: 'ltr',
   });
   if (enTitleStrip) {
-    doc.addImage(enTitleStrip, 'PNG', w / 2 - 310, 318, 620, 24);
+    doc.addImage(enTitleStrip, 'PNG', w / 2 - 310, 306 + yOffset, 620, 22);
   }
 
   const arProgramText = cert.course_title_ar
@@ -206,24 +264,11 @@ export async function generateCertificatePDF(cert: CertificatePDFData): Promise<
     widthPt: 660,
     heightPt: 26,
     fontSizePx: 13,
-    fontWeight: '600',
+    fontWeight: '700',
     color: '#334155',
   });
   if (arProgramStrip) {
-    doc.addImage(arProgramStrip, 'PNG', w / 2 - 330, 344, 660, 26);
-  }
-
-  const enProgramStrip = renderTextStripToPng({
-    text: `Program: ${cert.course_title_en}  ·  Standing: ${cert.grade_label}`,
-    widthPt: 660,
-    heightPt: 24,
-    fontSizePx: 11.5,
-    fontWeight: '600',
-    color: '#475569',
-    direction: 'ltr',
-  });
-  if (enProgramStrip) {
-    doc.addImage(enProgramStrip, 'PNG', w / 2 - 330, 372, 660, 24);
+    doc.addImage(arProgramStrip, 'PNG', w / 2 - 330, 332 + yOffset, 660, 26);
   }
 
   // QR Code for instant verification
@@ -242,9 +287,9 @@ export async function generateCertificatePDF(cert: CertificatePDFData): Promise<
         light: '#FAF8F3',
       },
     });
-    const qrSize = 74;
+    const qrSize = 72;
     const qrX = w - 64 - qrSize;
-    const qrY = h - 64 - qrSize - 12;
+    const qrY = h - 62 - qrSize - 12;
     doc.setDrawColor(201, 138, 30);
     doc.setLineWidth(1);
     doc.rect(qrX - 4, qrY - 4, qrSize + 8, qrSize + 8);
@@ -257,25 +302,25 @@ export async function generateCertificatePDF(cert: CertificatePDFData): Promise<
     // Non-fatal fallback if QR canvas fails
   }
 
-  // Footer metadata
-  const issuedDate = String(cert.issued_at).slice(0, 10);
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(10.5);
-  doc.setTextColor(71, 85, 105);
-  doc.text(`Issued Date: ${issuedDate}`, 64, h - 86);
-  doc.text(`Verification ID: ${cert.verification_code}`, 64, h - 68);
-
+  // Footer metadata & Verification Notice (positioned cleanly without horizontal overlap)
   const arFooterStrip = renderTextStripToPng({
     text: 'شهادة موثّقة إلكترونياً — تحقّق عبر رمز الاستجابة السريعة أو صفحة التحقق',
-    widthPt: 420,
+    widthPt: 400,
     heightPt: 22,
-    fontSizePx: 10.5,
+    fontSizePx: 10,
     fontWeight: '600',
     color: '#64748B',
   });
   if (arFooterStrip) {
-    doc.addImage(arFooterStrip, 'PNG', w / 2 - 210, h - 82, 420, 22);
+    doc.addImage(arFooterStrip, 'PNG', w / 2 - 200, h - 108, 400, 22);
   }
+
+  const issuedDate = String(cert.issued_at).slice(0, 10);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(10.5);
+  doc.setTextColor(71, 85, 105);
+  doc.text(`Issued Date: ${issuedDate}`, 64, h - 84);
+  doc.text(`Verification ID: ${cert.verification_code}`, 64, h - 66);
 
   doc.save(`${cert.verification_code}.pdf`);
 }

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ResponsiveContainer,
@@ -9,13 +9,25 @@ import {
   Tooltip,
   CartesianGrid,
 } from 'recharts';
-import { ExternalLink, Download, Gamepad2, Calendar, Award, Video, FileText, PlayCircle, Copy, Check, Upload, CheckCircle2, Clock, ListChecks, AlertCircle } from 'lucide-react';
+import { ExternalLink, Download, Gamepad2, Calendar, Award, Video, FileText, PlayCircle, Copy, Check, Upload, CheckCircle2, Clock, ListChecks, AlertCircle, Timer, Lock } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { apiFetch } from '../../lib/api';
 import { queryKeys } from '../../lib/queryClient';
 import { tField } from '../../i18n/translations';
 import { Card, LoadingState, ResponsiveTable, PrimaryButton, EmptyState } from '../../components/ui/CommonUI';
 import { ChangePasswordCard } from '../../components/dashboard/ChangePasswordCard';
+import { MyCommunityPanel } from '../../components/dashboard/MyCommunityPanel';
+
+function formatCountdown(totalSeconds: number): string {
+  const clamped = Math.max(0, Math.floor(totalSeconds));
+  const hrs = Math.floor(clamped / 3600);
+  const mins = Math.floor((clamped % 3600) / 60);
+  const secs = clamped % 60;
+  if (hrs > 0) {
+    return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  }
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
 
 interface StudentDashboardData {
   student: {
@@ -32,7 +44,7 @@ interface StudentDashboardData {
     guardian_email: string;
   };
   enrollments: Array<{ id: number; course_id: number; title_ar: string; title_en: string; schedule_ar: string; schedule_en: string; teacher_name_ar: string; teacher_name_en: string }>;
-  lessons: Array<{ id: number; course_id: number; title_ar: string; title_en: string; course_title_ar: string; course_title_en: string; lesson_date: string; start_time: string; duration_min: number; objectives_ar: string; objectives_en: string }>;
+  lessons: Array<{ id: number; course_id: number; title_ar: string; title_en: string; course_title_ar: string; course_title_en: string; lesson_date: string; start_time: string; duration_min: number; objectives_ar: string; objectives_en: string; weekday_ar?: string }>;
   lessonLinks: Array<{ id: number; lesson_id: number; title_ar: string; title_en: string; url: string; link_type: string }>;
   attendance: Array<{ id: number; lesson_title_ar: string; lesson_title_en: string; lesson_date: string; status: string; notes: string }>;
   exams?: Array<{
@@ -48,10 +60,18 @@ interface StudentDashboardData {
     instructions_ar: string;
     instructions_en: string;
     due_at: string | null;
+    time_limit_minutes?: number | null;
     allow_late_submission: boolean;
     show_answers_after_submit: boolean;
     is_open: boolean;
     is_past_deadline: boolean;
+    attempt?: {
+      started_at: string;
+      expires_at: string;
+      remaining_seconds: number | null;
+      is_expired: boolean;
+    } | null;
+    server_now?: string;
     has_question_file: boolean;
     question_file_name: string | null;
     question_count: number;
@@ -69,6 +89,7 @@ interface StudentDashboardData {
       status: 'submitted_pending' | 'graded';
       submitted_at: string;
       is_late: boolean;
+      timed_out?: boolean;
       has_solution_file: boolean;
       solution_file_name: string | null;
       student_notes: string;
@@ -107,6 +128,22 @@ export function StudentDashboard({
   const [activeQuizExamId, setActiveQuizExamId] = useState<number | null>(null);
   const [quizAnswers, setQuizAnswers] = useState<Record<string, number>>({});
   const [submittingQuiz, setSubmittingQuiz] = useState(false);
+  const [startingExamId, setStartingExamId] = useState<number | null>(null);
+  const [examDeadlinesMs, setExamDeadlinesMs] = useState<Record<number, number>>({});
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const autoSubmittedExamIdsRef = useRef<Set<number>>(new Set());
+  const quizAnswersRef = useRef<Record<string, number>>({});
+
+  useEffect(() => {
+    quizAnswersRef.current = quizAnswers;
+    if (activeQuizExamId && user?.id) {
+      try {
+        localStorage.setItem(`nb_quiz_draft_${user.id}_${activeQuizExamId}`, JSON.stringify(quizAnswers));
+      } catch {
+        // Ignore storage quota issues
+      }
+    }
+  }, [quizAnswers, activeQuizExamId, user?.id]);
 
   const { data, isLoading, error } = useQuery({
     queryKey: queryKeys.studentDashboard(user?.id),
@@ -118,6 +155,148 @@ export function StudentDashboard({
       toast(error instanceof Error ? error.message : 'Error', 'error');
     }
   }, [error, toast]);
+
+  // Hydrate server-side active attempt deadlines on dashboard fetch
+  useEffect(() => {
+    const examsList = data?.exams || [];
+    if (examsList.length === 0) return;
+    setExamDeadlinesMs((prev) => {
+      const next = { ...prev };
+      let changed = false;
+      for (const ex of examsList) {
+        if (ex.attempt && ex.attempt.remaining_seconds !== null && !ex.submission) {
+          const computed = Date.now() + Math.max(0, ex.attempt.remaining_seconds) * 1000;
+          if (!next[ex.id] || Math.abs(next[ex.id] - computed) > 2500) {
+            next[ex.id] = computed;
+            changed = true;
+          }
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [data]);
+
+  const hasActiveTimers = Boolean(
+    Object.keys(examDeadlinesMs).length > 0 ||
+      (data?.exams || []).some((e) => Boolean(e.attempt && !e.submission))
+  );
+
+  useEffect(() => {
+    if (!hasActiveTimers) return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [hasActiveTimers]);
+
+  const submitOnlineQuiz = useCallback(
+    async (
+      examItem: NonNullable<StudentDashboardData['exams']>[number],
+      options?: { isAutoTimeout?: boolean }
+    ) => {
+      const isAutoTimeout = Boolean(options?.isAutoTimeout);
+      const answersSource = quizAnswersRef.current;
+      const draftKey = user?.id ? `nb_quiz_draft_${user.id}_${examItem.id}` : null;
+      let storedDraft: Record<string, number> = {};
+      if (draftKey && Object.keys(answersSource).length === 0) {
+        try {
+          const raw = localStorage.getItem(draftKey);
+          if (raw) storedDraft = JSON.parse(raw) as Record<string, number>;
+        } catch {
+          // Ignore malformed draft
+        }
+      }
+      const effectiveAnswers = Object.keys(answersSource).length > 0 ? answersSource : storedDraft;
+
+      const answeredList = examItem.questions
+        .filter((q) => effectiveAnswers[q.id] !== undefined && effectiveAnswers[q.id] >= 0)
+        .map((q) => ({
+          question_id: q.id,
+          selected_index: effectiveAnswers[q.id],
+        }));
+
+      if (!isAutoTimeout && answeredList.length < examItem.questions.length) {
+        toast(
+          lang === 'ar'
+            ? 'يرجى الإجابة على جميع الأسئلة قبل الإرسال'
+            : 'Please answer all questions before submitting',
+          'error'
+        );
+        return;
+      }
+
+      setSubmittingQuiz(true);
+      try {
+        const res = await apiFetch<{ auto_score: number; max_score: number; finalized: boolean }>(
+          `/api/exams/${examItem.id}/submit-quiz`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              answers: answeredList,
+              timed_out: isAutoTimeout,
+            }),
+          }
+        );
+        if (draftKey) {
+          try {
+            localStorage.removeItem(draftKey);
+          } catch {
+            // Ignore
+          }
+        }
+        toast(
+          isAutoTimeout
+            ? res.finalized
+              ? lang === 'ar'
+                ? `انتهى وقت الامتحان! تم إغلاقه تلقائياً واعتماد إجاباتك (${res.auto_score} / ${res.max_score})`
+                : `Time expired! Auto-submitted saved answers (${res.auto_score} / ${res.max_score})`
+              : lang === 'ar'
+              ? `انتهى الوقت وتم حفظ إجاباتك المسجلة (${res.auto_score})`
+              : `Time expired! Saved answers recorded (${res.auto_score})`
+            : res.finalized
+            ? lang === 'ar'
+              ? `تم تصحيح الاختبار تلقائياً: ${res.auto_score} / ${res.max_score}`
+              : `Auto-graded score: ${res.auto_score} / ${res.max_score}`
+            : lang === 'ar'
+            ? `تم حفظ إجاباتك (${res.auto_score}) بانتظار تصحيح ملف الحل`
+            : `Quiz answers saved (${res.auto_score})`,
+          isAutoTimeout ? 'info' : 'success'
+        );
+        if (activeQuizExamId === examItem.id) {
+          setActiveQuizExamId(null);
+        }
+        void qc.invalidateQueries({ queryKey: queryKeys.studentDashboard(user?.id) });
+      } catch (err) {
+        toast(err instanceof Error ? err.message : 'Submission failed', 'error');
+      } finally {
+        setSubmittingQuiz(false);
+      }
+    },
+    [activeQuizExamId, lang, qc, toast, user?.id]
+  );
+
+  // Auto-lock & auto-submit when any active quiz/hybrid timer reaches zero
+  useEffect(() => {
+    const examsList = data?.exams || [];
+    for (const ex of examsList) {
+      if (!ex.time_limit_minutes || ex.time_limit_minutes <= 0) continue;
+      if (ex.exam_mode === 'file') continue;
+      const quizAlreadyDone = Boolean(ex.submission && ex.submission.quiz_answers.length > 0);
+      const isGraded = Boolean(ex.result || ex.submission?.status === 'graded');
+      if (quizAlreadyDone || isGraded) continue;
+
+      const deadlineMs = examDeadlinesMs[ex.id];
+      const hasTimedAttempt = Boolean(ex.attempt || deadlineMs);
+      if (!hasTimedAttempt) continue;
+
+      const isExpired = deadlineMs ? nowMs >= deadlineMs : Boolean(ex.attempt?.is_expired);
+      if (isExpired && !autoSubmittedExamIdsRef.current.has(ex.id) && !submittingQuiz) {
+        autoSubmittedExamIdsRef.current.add(ex.id);
+        void submitOnlineQuiz(ex, { isAutoTimeout: true });
+      }
+    }
+  }, [data?.exams, examDeadlinesMs, nowMs, submittingQuiz, submitOnlineQuiz]);
 
   if (isLoading) return <LoadingState />;
   if (!data) return <EmptyState title={lang === 'ar' ? 'لا توجد بيانات طالب مرتبطة' : 'No linked student record'} />;
@@ -284,7 +463,7 @@ export function StudentDashboard({
                   <h3 className="font-bold text-base">{tField(l as unknown as Record<string, unknown>, 'title', lang)}</h3>
                   <p className="text-xs text-slate-600 dark:text-slate-300">{tField(l as unknown as Record<string, unknown>, 'objectives', lang)}</p>
                   <div className="text-xs font-mono-tabular text-[#0F766E] dark:text-[#2DD4BF]">
-                    {l.lesson_date} · {l.start_time} ({l.duration_min} {lang === 'ar' ? 'د' : 'm'})
+                    {l.weekday_ar ? `${l.weekday_ar} · ` : ''}{l.lesson_date} · {l.start_time} ({l.duration_min} {lang === 'ar' ? 'د' : 'm'})
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -392,40 +571,76 @@ export function StudentDashboard({
       }
     };
 
-    const submitOnlineQuiz = async (examItem: NonNullable<StudentDashboardData['exams']>[number]) => {
-      const answers = examItem.questions.map((q) => ({
-        question_id: q.id,
-        selected_index: quizAnswers[q.id] ?? -1,
-      }));
-      if (answers.some((a) => a.selected_index < 0)) {
-        toast(lang === 'ar' ? 'يرجى الإجابة على جميع الأسئلة قبل الإرسال' : 'Please answer all questions before submitting', 'error');
+    const openOrStartQuiz = async (examItem: NonNullable<StudentDashboardData['exams']>[number]) => {
+      if (activeQuizExamId === examItem.id) {
+        setActiveQuizExamId(null);
         return;
       }
-      setSubmittingQuiz(true);
-      try {
-        const res = await apiFetch<{ auto_score: number; max_score: number; finalized: boolean }>(
-          `/api/exams/${examItem.id}/submit-quiz`,
-          {
-            method: 'POST',
-            body: JSON.stringify({ answers }),
+
+      // Restore draft answers if present in localStorage
+      if (user?.id) {
+        try {
+          const savedDraft = localStorage.getItem(`nb_quiz_draft_${user.id}_${examItem.id}`);
+          if (savedDraft) {
+            setQuizAnswers(JSON.parse(savedDraft) as Record<string, number>);
+          } else {
+            setQuizAnswers({});
           }
+        } catch {
+          setQuizAnswers({});
+        }
+      }
+
+      if (examItem.time_limit_minutes && examItem.time_limit_minutes > 0 && !examItem.attempt) {
+        setStartingExamId(examItem.id);
+        try {
+          const res = await apiFetch<{ started_at: string; expires_at: string; time_limit_minutes: number; server_now: string }>(
+            `/api/exams/${examItem.id}/start`,
+            { method: 'POST' }
+          );
+          const remainingMs = Math.max(0, new Date(res.expires_at).getTime() - new Date(res.server_now).getTime());
+          setExamDeadlinesMs((prev) => ({
+            ...prev,
+            [examItem.id]: Date.now() + remainingMs,
+          }));
+          setNowMs(Date.now());
+          setActiveQuizExamId(examItem.id);
+          void qc.invalidateQueries({ queryKey: queryKeys.studentDashboard(user?.id) });
+        } catch (err) {
+          toast(err instanceof Error ? err.message : 'Failed to start timed exam', 'error');
+        } finally {
+          setStartingExamId(null);
+        }
+        return;
+      }
+
+      setActiveQuizExamId(examItem.id);
+    };
+
+    const startTimedFileAttempt = async (examItem: NonNullable<StudentDashboardData['exams']>[number]) => {
+      setStartingExamId(examItem.id);
+      try {
+        const res = await apiFetch<{ started_at: string; expires_at: string; time_limit_minutes: number; server_now: string }>(
+          `/api/exams/${examItem.id}/start`,
+          { method: 'POST' }
         );
+        const remainingMs = Math.max(0, new Date(res.expires_at).getTime() - new Date(res.server_now).getTime());
+        setExamDeadlinesMs((prev) => ({
+          ...prev,
+          [examItem.id]: Date.now() + remainingMs,
+        }));
+        setNowMs(Date.now());
         toast(
-          res.finalized
-            ? lang === 'ar'
-              ? `تم تصحيح الاختبار تلقائياً: ${res.auto_score} / ${res.max_score}`
-              : `Auto-graded score: ${res.auto_score} / ${res.max_score}`
-            : lang === 'ar'
-            ? `تم حفظ إجاباتك (${res.auto_score}) بانتظار تصحيح ملف الحل`
-            : `Quiz answers saved (${res.auto_score})`,
-          'success'
+          lang === 'ar'
+            ? `بدأ مؤقت الامتحان (${res.time_limit_minutes} دقيقة). احرص على رفع الحل قبل انتهاء العداد.`
+            : `Exam timer started (${res.time_limit_minutes}m). Upload your solution before time expires.`,
+          'info'
         );
-        setActiveQuizExamId(null);
         void qc.invalidateQueries({ queryKey: queryKeys.studentDashboard(user?.id) });
       } catch (err) {
-        toast(err instanceof Error ? err.message : 'Submission failed', 'error');
+        toast(err instanceof Error ? err.message : 'Unable to start exam timer', 'error');
       } finally {
-        setSubmittingQuiz(false);
+        setStartingExamId(null);
       }
     };
 
@@ -435,8 +650,8 @@ export function StudentDashboard({
           <h2 className="text-xl font-extrabold">{lang === 'ar' ? 'الامتحانات والاختبارات الإلكترونية' : 'Exams & Assessments'}</h2>
           <p className="text-xs text-slate-500 dark:text-slate-400">
             {lang === 'ar'
-              ? 'نزّل ورقة الامتحان أو حل الاختبار الإلكتروني، وارفع حلك بصيغة PDF أو صورة واضحة ليصحّحه المعلم ويرصد درجتك.'
-              : 'Download exam papers, take interactive quizzes, or upload your PDF/image solution for grading.'}
+              ? 'نزّل ورقة الامتحان أو حل الاختبار الإلكتروني، وعند انتهاء العداد يتم قفل الامتحان تلقائياً واعتماد إجاباتك المسجلة.'
+              : 'Download exam papers or take timed online quizzes; saved answers auto-submit when the countdown expires.'}
           </p>
         </div>
 
@@ -446,10 +661,24 @@ export function StudentDashboard({
           <div className="space-y-4">
             {examsList.map((ex) => {
               const isGraded = Boolean(ex.result || ex.submission?.status === 'graded');
+              const isTimed = Boolean(ex.time_limit_minutes && ex.time_limit_minutes > 0);
+              const deadlineMs = examDeadlinesMs[ex.id];
+              const remainingSeconds =
+                isTimed && deadlineMs !== undefined
+                  ? Math.max(0, Math.ceil((deadlineMs - nowMs) / 1000))
+                  : isTimed && ex.attempt?.remaining_seconds !== null && ex.attempt?.remaining_seconds !== undefined
+                  ? ex.attempt.remaining_seconds
+                  : null;
+              const isAttemptExpired = Boolean(
+                isTimed &&
+                  !ex.submission &&
+                  (ex.attempt?.is_expired || (deadlineMs !== undefined && nowMs >= deadlineMs))
+              );
               const canUploadFile =
                 (ex.exam_mode === 'file' || ex.exam_mode === 'hybrid') &&
                 ex.is_open &&
                 !isGraded &&
+                !isAttemptExpired &&
                 (!ex.is_past_deadline || ex.allow_late_submission);
               const quizAlreadyDone = Boolean(ex.submission && ex.submission.quiz_answers.length > 0);
               const canStartQuiz =
@@ -457,7 +686,9 @@ export function StudentDashboard({
                 ex.is_open &&
                 ex.questions.length > 0 &&
                 !quizAlreadyDone &&
+                !isAttemptExpired &&
                 (!ex.is_past_deadline || ex.allow_late_submission);
+              const isUrgent = remainingSeconds !== null && remainingSeconds > 0 && remainingSeconds <= 60;
 
               return (
                 <Card key={ex.id} className="p-6 space-y-4">
@@ -474,11 +705,33 @@ export function StudentDashboard({
                             </span>
                           </>
                         )}
+                        {isTimed && (
+                          <>
+                            {' · '}
+                            <span className="font-bold text-[#0F766E] dark:text-[#2DD4BF]">
+                              {lang === 'ar' ? `المدة: ${ex.time_limit_minutes} دقيقة` : `Duration: ${ex.time_limit_minutes}m`}
+                            </span>
+                          </>
+                        )}
                       </div>
                       <h3 className="text-lg font-extrabold">{tField(ex as unknown as Record<string, unknown>, 'title', lang)}</h3>
                     </div>
 
-                    <div className="text-sm font-extrabold tabular-nums">
+                    <div className="flex flex-wrap items-center gap-3 text-sm font-extrabold tabular-nums">
+                      {isTimed && remainingSeconds !== null && !ex.submission && !isGraded && (
+                        <div
+                          className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-xl border text-xs font-mono-tabular ${
+                            isAttemptExpired
+                              ? 'border-red-400 bg-red-50 dark:bg-red-950/30 text-red-700 dark:text-red-300'
+                              : isUrgent
+                              ? 'border-red-500 bg-red-50 dark:bg-red-950/30 text-red-700 dark:text-red-300 animate-pulse'
+                              : 'border-[#C98A1E] bg-[#C98A1E]/10 text-[#9A6710] dark:text-[#FBBF24]'
+                          }`}
+                        >
+                          <Timer className="w-3.5 h-3.5" />
+                          <span>{isAttemptExpired ? '00:00' : formatCountdown(remainingSeconds)}</span>
+                        </div>
+                      )}
                       {ex.result ? (
                         <span className="inline-flex items-center gap-1.5 text-[#0F766E] dark:text-[#2DD4BF]">
                           <CheckCircle2 className="w-4 h-4" />
@@ -487,7 +740,14 @@ export function StudentDashboard({
                       ) : ex.submission ? (
                         <span className="inline-flex items-center gap-1.5 text-[#C98A1E]">
                           <Clock className="w-4 h-4" />
-                          {lang === 'ar' ? 'تم التسليم — بانتظار التصحيح' : 'Submitted — Pending Grading'}
+                          {ex.submission.timed_out
+                            ? lang === 'ar' ? 'أُغلق بانتهاء الوقت — بانتظار المراجعة' : 'Auto-closed — Pending Review'
+                            : lang === 'ar' ? 'تم التسليم — بانتظار التصحيح' : 'Submitted — Pending Grading'}
+                        </span>
+                      ) : isAttemptExpired ? (
+                        <span className="inline-flex items-center gap-1.5 text-red-600">
+                          <Lock className="w-4 h-4" />
+                          {lang === 'ar' ? 'انتهى وقت الامتحان وتم قفله' : 'Exam Time Expired (Locked)'}
                         </span>
                       ) : !ex.is_open ? (
                         <span className="inline-flex items-center gap-1.5 text-slate-500">
@@ -525,10 +785,36 @@ export function StudentDashboard({
                     {canStartQuiz && (
                       <PrimaryButton
                         type="button"
-                        onClick={() => setActiveQuizExamId(activeQuizExamId === ex.id ? null : ex.id)}
+                        disabled={startingExamId === ex.id}
+                        onClick={() => void openOrStartQuiz(ex)}
                       >
                         <ListChecks className="w-4 h-4" />
-                        <span>{activeQuizExamId === ex.id ? (lang === 'ar' ? 'إخفاء الأسئلة' : 'Hide Quiz') : (lang === 'ar' ? 'بدء الاختبار الإلكتروني' : 'Start Online Quiz')}</span>
+                        <span>
+                          {startingExamId === ex.id
+                            ? lang === 'ar' ? 'جاري تشغيل المؤقت...' : 'Starting timer...'
+                            : activeQuizExamId === ex.id
+                            ? lang === 'ar' ? 'إخفاء الأسئلة' : 'Hide Quiz'
+                            : ex.attempt
+                            ? lang === 'ar' ? 'متابعة الاختبار الإلكتروني' : 'Resume Online Quiz'
+                            : isTimed
+                            ? lang === 'ar' ? `بدء الاختبار (${ex.time_limit_minutes} د)` : `Start Timed Quiz (${ex.time_limit_minutes}m)`
+                            : lang === 'ar' ? 'بدء الاختبار الإلكتروني' : 'Start Online Quiz'}
+                        </span>
+                      </PrimaryButton>
+                    )}
+
+                    {ex.exam_mode === 'file' && isTimed && ex.is_open && !ex.attempt && !ex.submission && !isGraded && (
+                      <PrimaryButton
+                        type="button"
+                        disabled={startingExamId === ex.id}
+                        onClick={() => void startTimedFileAttempt(ex)}
+                      >
+                        <Timer className="w-4 h-4" />
+                        <span>
+                          {startingExamId === ex.id
+                            ? lang === 'ar' ? 'جاري تشغيل المؤقت...' : 'Starting...'
+                            : lang === 'ar' ? `بدء الامتحان (${ex.time_limit_minutes} دقيقة)` : `Start Exam Timer (${ex.time_limit_minutes}m)`}
+                        </span>
                       </PrimaryButton>
                     )}
 
@@ -556,7 +842,7 @@ export function StudentDashboard({
                   </div>
 
                   {/* PDF / Image Solution Upload Box */}
-                  {canUploadFile && (
+                  {canUploadFile && (ex.exam_mode !== 'file' || !isTimed || Boolean(ex.attempt)) && (
                     <div className="p-4 rounded-xl border border-[#E5DEC9] dark:border-[#233C63] bg-[#FAF8F3] dark:bg-[#091529] space-y-3">
                       <div className="text-xs font-bold text-slate-700 dark:text-slate-200">
                         {ex.submission?.has_solution_file
@@ -599,6 +885,28 @@ export function StudentDashboard({
                   {/* Interactive Online Quiz Box */}
                   {activeQuizExamId === ex.id && canStartQuiz && (
                     <div className="p-4 rounded-xl border border-[#0F766E]/30 bg-[#FAF8F3] dark:bg-[#091529] space-y-4">
+                      {isTimed && remainingSeconds !== null && (
+                        <div
+                          className={`flex flex-wrap items-center justify-between gap-3 p-3 rounded-xl border ${
+                            isUrgent
+                              ? 'border-red-500 bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300'
+                              : 'border-[#C98A1E]/50 bg-white dark:bg-[#0F213E] text-[#0F213E] dark:text-[#F6F1E3]'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2 text-xs font-bold">
+                            <Timer className={`w-4 h-4 ${isUrgent ? 'text-red-600 animate-pulse' : 'text-[#C98A1E]'}`} />
+                            <span>
+                              {lang === 'ar'
+                                ? 'الوقت المتبقي للامتحان (يُغلق ويُعتمد تلقائياً عند الصفر):'
+                                : 'Time remaining (auto-locks and submits saved answers at 00:00):'}
+                            </span>
+                          </div>
+                          <span className="font-mono-tabular text-lg font-extrabold tracking-wider">
+                            {formatCountdown(remainingSeconds)}
+                          </span>
+                        </div>
+                      )}
+
                       {ex.questions.map((q, qIdx) => (
                         <div key={q.id} className="space-y-2 pb-3 border-b border-[#E5DEC9] dark:border-[#233C63] last:border-b-0">
                           <div className="text-sm font-bold">
@@ -618,6 +926,7 @@ export function StudentDashboard({
                                 <input
                                   type="radio"
                                   name={`quiz_${ex.id}_${q.id}`}
+                                  disabled={isAttemptExpired || submittingQuiz}
                                   checked={quizAnswers[q.id] === oIdx}
                                   onChange={() => setQuizAnswers({ ...quizAnswers, [q.id]: oIdx })}
                                 />
@@ -627,7 +936,7 @@ export function StudentDashboard({
                           </div>
                         </div>
                       ))}
-                      <PrimaryButton type="button" disabled={submittingQuiz} onClick={() => submitOnlineQuiz(ex)}>
+                      <PrimaryButton type="button" disabled={submittingQuiz || isAttemptExpired} onClick={() => void submitOnlineQuiz(ex)}>
                         <span>{submittingQuiz ? (lang === 'ar' ? 'جاري التصحيح...' : 'Submitting...') : (lang === 'ar' ? 'إرسال الإجابات والتصحيح' : 'Submit Answers')}</span>
                       </PrimaryButton>
                     </div>
@@ -869,6 +1178,7 @@ export function StudentDashboard({
         </div>
       </Card>
       <ChangePasswordCard />
+      <MyCommunityPanel />
     </div>
   );
 }

@@ -1,4 +1,5 @@
 import React, { useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { motion, useScroll, useTransform } from 'motion/react';
 import {
   ArrowLeft,
@@ -12,14 +13,35 @@ import {
   Moon,
   Heart,
   Sparkles,
+  MessageSquare,
+  Lightbulb,
+  Star,
+  ThumbsUp,
+  Send,
+  Trash2,
+  LogIn,
 } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
+import { apiFetch } from '../../lib/api';
+import { queryKeys } from '../../lib/queryClient';
 import { dict, tField } from '../../i18n/translations';
-import type { PublicOverview } from '../../types';
+import type {
+  AcademySuggestion,
+  CommunityComment,
+  PublicOverview,
+  SuggestionCategory,
+} from '../../types';
 import { Card, PrimaryButton, SecondaryButton, ResilientImage } from '../../components/ui/CommonUI';
 import { FadeUp, AnimatedCounter } from '../../components/ui/MotionPrimitives';
+import {
+  formatRoleLabel,
+  formatSuggestionCategory,
+  formatSuggestionStatus,
+  suggestionStatusClass,
+} from '../../components/dashboard/MyCommunityPanel';
 
 import { getCourseImageUrl } from '../../lib/courseImages';
+import { formatCoursePriceSummary, type DisplayCurrency } from '../../lib/currency';
 
 const nightHeroImg = '/assets/images/hero_noor_night.webp';
 const CLIENT_BANNER_IMG = '/assets/images/academy_banner.webp';
@@ -144,10 +166,10 @@ const FAQ_ITEMS = [
     a_en: 'Yes! Alongside Quran, Noor Al-Bayan, and Arabic, we offer British/American curricula, languages, and mental math.',
   },
   {
-    q_ar: 'كيف يتابع ولي الأمر والأمهات تقدم الأبناء؟',
-    q_en: 'How do mothers and guardians track progress?',
-    a_ar: 'يحصل الطالب على تقييم دوري في لوحة التحكم، كما نوفر قسماً خاصاً للأمهات لتبادل الخبرات والاستفادة من النصائح التربوية.',
-    a_en: 'Periodic evaluations appear in the dashboard, supported by our dedicated Mothers Community for educational guidance.',
+    q_ar: 'كيف يتابع ولي الأمر تقدم الأبناء؟',
+    q_en: 'How do parents and guardians track progress?',
+    a_ar: 'يحصل الطالب على تقييم دوري في لوحة التحكم، كما نوفر قسماً خاصاً بأولياء الأمور لتبادل الخبرات والاستفادة من النصائح التربوية.',
+    a_en: 'Periodic evaluations appear in the dashboard, supported by our dedicated Parents Corner for educational guidance.',
   },
 ];
 
@@ -160,10 +182,134 @@ export function HomePage({
   onNavigate: (path: string) => void;
   onLaunchGame: (slug: string) => void;
 }) {
-  const { lang, theme, toggleTheme } = useApp();
+  const { lang, theme, toggleTheme, currency, setCurrency, user, toast } = useApp();
+  const qc = useQueryClient();
   const t = dict[lang];
   const [openFaq, setOpenFaq] = useState<number | null>(0);
   const heroRef = useRef<HTMLElement | null>(null);
+
+  // Real Community Reviews State
+  const [commentRating, setCommentRating] = useState(5);
+  const [commentBody, setCommentBody] = useState('');
+  const [postingComment, setPostingComment] = useState(false);
+  const [replyTargetId, setReplyTargetId] = useState<string | null>(null);
+  const [replyBody, setReplyBody] = useState('');
+  const [postingReply, setPostingReply] = useState(false);
+
+  // Academy Development Suggestions State
+  const [sugCategory, setSugCategory] = useState<SuggestionCategory>('platform');
+  const [sugTitle, setSugTitle] = useState('');
+  const [sugDesc, setSugDesc] = useState('');
+  const [postingSug, setPostingSug] = useState(false);
+
+  const { data: commentsData } = useQuery({
+    queryKey: queryKeys.publicComments,
+    queryFn: () => apiFetch<{ comments: CommunityComment[] }>('/api/public/comments'),
+  });
+  const { data: suggestionsData } = useQuery({
+    queryKey: queryKeys.publicSuggestions,
+    queryFn: () => apiFetch<{ suggestions: AcademySuggestion[] }>('/api/public/suggestions'),
+  });
+
+  const refreshCommunity = () => {
+    void qc.invalidateQueries({ queryKey: queryKeys.publicComments });
+    void qc.invalidateQueries({ queryKey: queryKeys.publicSuggestions });
+    if (user) {
+      void qc.invalidateQueries({ queryKey: queryKeys.myCommunity(user.id) });
+    }
+  };
+
+  const handleCreateComment = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (commentBody.trim().length < 5) {
+      toast(lang === 'ar' ? 'يرجى كتابة تعليق لا يقل عن 5 أحرف.' : 'Comment must be at least 5 characters.', 'error');
+      return;
+    }
+    setPostingComment(true);
+    try {
+      await apiFetch('/api/comments', {
+        method: 'POST',
+        body: JSON.stringify({ rating: commentRating, content: commentBody.trim() }),
+      });
+      setCommentBody('');
+      setCommentRating(5);
+      toast(lang === 'ar' ? 'تم نشر تعليقك بنجاح وحفظه في ملفك الشخصي' : 'Review posted & saved to your profile!', 'success');
+      refreshCommunity();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Unable to post review', 'error');
+    } finally {
+      setPostingComment(false);
+    }
+  };
+
+  const handleReplyComment = async (commentId: string) => {
+    if (replyBody.trim().length < 2) return;
+    setPostingReply(true);
+    try {
+      await apiFetch(`/api/comments/${commentId}/replies`, {
+        method: 'POST',
+        body: JSON.stringify({ content: replyBody.trim() }),
+      });
+      setReplyTargetId(null);
+      setReplyBody('');
+      toast(lang === 'ar' ? 'تمت إضافة الرد' : 'Reply added', 'success');
+      refreshCommunity();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Unable to reply', 'error');
+    } finally {
+      setPostingReply(false);
+    }
+  };
+
+  const handleDeleteComment = async (commentId: string) => {
+    try {
+      await apiFetch(`/api/comments/${commentId}`, { method: 'DELETE' });
+      toast(lang === 'ar' ? 'تم حذف التعليق' : 'Review removed', 'info');
+      refreshCommunity();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Delete failed', 'error');
+    }
+  };
+
+  const handleCreateSuggestion = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (sugTitle.trim().length < 4 || sugDesc.trim().length < 10) {
+      toast(
+        lang === 'ar' ? 'أدخل عنواناً واضحاً (4+ أحرف) وتفاصيل الاقتراح (10+ أحرف).' : 'Enter title (4+ chars) and details (10+ chars).',
+        'error'
+      );
+      return;
+    }
+    setPostingSug(true);
+    try {
+      await apiFetch('/api/suggestions', {
+        method: 'POST',
+        body: JSON.stringify({ category: sugCategory, title: sugTitle.trim(), description: sugDesc.trim() }),
+      });
+      setSugTitle('');
+      setSugDesc('');
+      toast(lang === 'ar' ? 'تم تسجيل مقترحك لتطوير الأكاديمية بنجاح' : 'Suggestion submitted successfully!', 'success');
+      refreshCommunity();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Unable to submit suggestion', 'error');
+    } finally {
+      setPostingSug(false);
+    }
+  };
+
+  const handleToggleVote = async (suggestionId: string) => {
+    if (!user) {
+      toast(lang === 'ar' ? 'يرجى تسجيل الدخول أولاً للتصويت على المقترحات.' : 'Sign in first to upvote suggestions.', 'info');
+      onNavigate('/login');
+      return;
+    }
+    try {
+      await apiFetch(`/api/suggestions/${suggestionId}/vote`, { method: 'POST' });
+      refreshCommunity();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Vote failed', 'error');
+    }
+  };
 
   const { scrollYProgress } = useScroll({
     target: heroRef,
@@ -203,9 +349,10 @@ export function HomePage({
     },
   ];
 
-  const featuredCourses = overview?.courses.slice(0, 6) || [];
+  const featuredCourses = overview?.courses.slice(0, 8) || [];
   const teachers = overview?.teachers || [];
-  const testimonials = overview?.testimonials || [];
+  const communityComments = commentsData?.comments || [];
+  const suggestions = suggestionsData?.suggestions || [];
 
   return (
     <div>
@@ -391,7 +538,7 @@ export function HomePage({
                     <div>
                       <div className="aspect-[16/10] bg-[#FAF8F3] dark:bg-[#13284A] overflow-hidden">
                         <ResilientImage
-                          src={svc.image}
+                          src={matchedCourse ? getCourseImageUrl(matchedCourse.title_ar, matchedCourse.cover_url) : svc.image}
                           alt={lang === 'ar' ? svc.title_ar : svc.title_en}
                           className="w-full h-full object-cover"
                         />
@@ -443,12 +590,36 @@ export function HomePage({
             <h2 className="text-2xl sm:text-3xl font-extrabold">{t.coursesTitle}</h2>
             <p className="text-sm sm:text-base text-slate-600 dark:text-slate-300">{t.coursesSubtitle}</p>
           </div>
-          <button
-            onClick={() => onNavigate('/courses')}
-            className="text-sm font-bold text-[#0F766E] dark:text-[#2DD4BF] hover:underline whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            {lang === 'ar' ? 'عرض كل الدورات ←' : 'View All Courses →'}
-          </button>
+          <div className="flex flex-wrap items-center gap-3 shrink-0">
+            <div className="inline-flex rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] p-1 text-xs font-bold">
+              {(
+                [
+                  { id: 'BOTH', ar: 'ج.م + ر.س', en: 'EGP + SAR' },
+                  { id: 'EGP', ar: 'ج.م', en: 'EGP' },
+                  { id: 'SAR', ar: 'ر.س', en: 'SAR' },
+                ] as Array<{ id: DisplayCurrency; ar: string; en: string }>
+              ).map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => setCurrency(opt.id)}
+                  className={`px-2.5 py-1 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    currency === opt.id
+                      ? 'bg-[#0F213E] text-white dark:bg-[#C98A1E]'
+                      : 'text-slate-600 dark:text-slate-300 hover:text-[#0F213E]'
+                  }`}
+                >
+                  {lang === 'ar' ? opt.ar : opt.en}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => onNavigate('/courses')}
+              className="text-sm font-bold text-[#0F766E] dark:text-[#2DD4BF] hover:underline whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              {lang === 'ar' ? 'عرض كل الدورات ←' : 'View All Courses →'}
+            </button>
+          </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
@@ -458,7 +629,7 @@ export function HomePage({
                 <div>
                   <div className="aspect-[16/10] bg-[#FAF8F3] dark:bg-[#13284A] overflow-hidden">
                     <ResilientImage
-                      src={getCourseImageUrl(course.title_ar)}
+                      src={getCourseImageUrl(course.title_ar, course.cover_url)}
                       alt={tField(course as unknown as Record<string, unknown>, 'title', lang)}
                       className="w-full h-full object-cover"
                     />
@@ -479,10 +650,10 @@ export function HomePage({
                 </div>
 
                 <div className="p-5 pt-4 mt-2 border-t border-[#EFEAD8] dark:border-[#1D355B] space-y-3">
-                  <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
                     <span>{tField(course as unknown as Record<string, unknown>, 'schedule', lang)}</span>
                     <span className="font-bold text-sm text-[#0F213E] dark:text-[#F8F5EC] tabular-nums">
-                      {course.price_monthly} {t.monthlyCurrency}
+                      {formatCoursePriceSummary(course, lang, currency)}
                     </span>
                   </div>
                   <button
@@ -532,25 +703,25 @@ export function HomePage({
         </div>
       </section>
 
-      {/* 7. MOTHERS & GUARDIANS SECTION (قسم خاص بالأمهات) */}
+      {/* 7. PARENTS & GUARDIANS SECTION (قسم أولياء الأمور) */}
       <section className="max-w-7xl mx-auto px-4 sm:px-6 py-16">
         <Card className="p-6 sm:p-10 bg-white dark:bg-[#0F213E] grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
           <div className="lg:col-span-7 space-y-4">
             <div className="inline-flex items-center gap-2 text-xs font-bold text-[#C98A1E]">
               <Heart className="w-4 h-4" />
-              <span>{lang === 'ar' ? 'قسم خاص بالأمهات وأولياء الأمور' : 'Dedicated Mothers & Parents Community'}</span>
+              <span>{lang === 'ar' ? 'قسم خاص بأولياء الأمور' : 'Dedicated Parents & Guardians Corner'}</span>
             </div>
             <h2 className="text-2xl sm:text-3xl font-extrabold">
-              {lang === 'ar' ? 'أنتِ شريكة في رحلة نجاح طفلك' : 'You Are a Partner in Your Child’s Success'}
+              {lang === 'ar' ? 'ولي الأمر شريك في رحلة نجاح طفلك' : 'Parents Are True Partners in Your Child’s Success'}
             </h2>
             <p className="text-sm sm:text-base text-slate-600 dark:text-slate-300 leading-relaxed">
               {lang === 'ar'
-                ? 'مجتمع يجمع الأمهات لتبادل الخبرات، والاستفادة من النصائح التربوية والتعليمية، ومناقشة كل ما يساعد في تربية أطفالنا وتنمية مهاراتهم.'
-                : 'A supportive community bringing mothers together to share experiences, benefit from educational and parenting tips, and nurture children’s skills.'}
+                ? 'مساحة تجمع أولياء الأمور لتبادل الخبرات، والاستفادة من النصائح التربوية والتعليمية، ومتابعة كل ما يساعد في تربية أبنائنا وتنمية مهاراتهم.'
+                : 'A supportive space bringing parents and guardians together to share experiences, benefit from educational and parenting tips, and nurture children’s skills.'}
             </p>
             <div className="flex flex-wrap gap-3 pt-2">
               <PrimaryButton onClick={() => onNavigate('/parents')}>
-                {lang === 'ar' ? 'استكشفي ركن الأمهات' : 'Explore Mothers Corner'}
+                {lang === 'ar' ? 'استكشف قسم أولياء الأمور' : 'Explore Parents Corner'}
               </PrimaryButton>
               <SecondaryButton onClick={() => onNavigate('/placement')}>
                 {t.ctaPlacement}
@@ -567,9 +738,9 @@ export function HomePage({
                 desc_en: 'Practical routines for calm study habits and love for Quran.',
               },
               {
-                title_ar: 'تبادل الخبرات بين الأمهات',
-                title_en: 'Shared Mothers Experience',
-                desc_ar: 'حوارات موجهة مع المشرفات التربويات حول تنمية مهارات الأبناء.',
+                title_ar: 'تبادل الخبرات بين أولياء الأمور',
+                title_en: 'Shared Parent Experiences',
+                desc_ar: 'حوارات موجهة مع المشرفين التربويين حول تنمية مهارات الأبناء.',
                 desc_en: 'Guided discussions with academic mentors on child growth.',
               },
               {
@@ -693,37 +864,301 @@ export function HomePage({
         </div>
       </section>
 
-      {/* 10. TESTIMONIALS */}
-      {testimonials.length > 0 && (
-        <section className="max-w-7xl mx-auto px-4 sm:px-6 py-16 space-y-8 overflow-hidden">
+      {/* 10. REAL AUTHENTICATED COMMUNITY REVIEWS */}
+      <section className="max-w-7xl mx-auto px-4 sm:px-6 py-16 space-y-8 overflow-hidden">
+        <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
           <div className="space-y-2 max-w-2xl">
-            <h2 className="text-2xl sm:text-3xl font-extrabold">{t.testimonialsTitle}</h2>
-            <p className="text-sm sm:text-base text-slate-600 dark:text-slate-300">{t.testimonialsSubtitle}</p>
+            <div className="inline-flex items-center gap-2 text-xs font-bold text-[#0F766E] dark:text-[#2DD4BF]">
+              <MessageSquare className="w-4 h-4" />
+              <span>{lang === 'ar' ? 'تجارب موثقة من أعضاء الأكاديمية' : 'Verified Member Reviews'}</span>
+            </div>
+            <h2 className="text-2xl sm:text-3xl font-extrabold">
+              {lang === 'ar' ? 'آراء وتعليقات طلابنا وأولياء الأمور' : 'Community Reviews & Reflections'}
+            </h2>
+            <p className="text-sm sm:text-base text-slate-600 dark:text-slate-300">
+              {lang === 'ar'
+                ? 'تعليقات حقيقية من الأعضاء المسجلين فقط في الأكاديمية، وتُحفظ تلقائياً في الملف الشخصي مع الردود.'
+                : 'Authentic reviews published exclusively by registered academy members, synced with their profile and replies.'}
+            </p>
           </div>
+          {!user && (
+            <SecondaryButton onClick={() => onNavigate('/login')} className="text-xs shrink-0">
+              <LogIn className="w-4 h-4" />
+              <span>{lang === 'ar' ? 'سجّل الدخول لإضافة تعليقك' : 'Sign In to Review'}</span>
+            </SecondaryButton>
+          )}
+        </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            {testimonials.map((item) => (
+        {user && (
+          <Card className="p-5 sm:p-6 space-y-3 bg-white dark:bg-[#0F213E]">
+            <form onSubmit={handleCreateComment} className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-xs font-bold">
+                  {lang === 'ar' ? `اكتب تعليقك باسم ${user.full_name} (${formatRoleLabel(user.role, lang)}):` : `Posting as ${user.full_name} (${formatRoleLabel(user.role, lang)}):`}
+                </div>
+                <div className="inline-flex items-center gap-1" role="radiogroup" aria-label={lang === 'ar' ? 'التقييم' : 'Rating'}>
+                  {[1, 2, 3, 4, 5].map((n) => (
+                    <button
+                      key={n}
+                      type="button"
+                      onClick={() => setCommentRating(n)}
+                      className="p-1 cursor-pointer"
+                      aria-label={`${n} stars`}
+                    >
+                      <Star className={`w-4 h-4 ${n <= commentRating ? 'fill-[#C98A1E] text-[#C98A1E]' : 'text-slate-300 dark:text-slate-600'}`} />
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <textarea
+                rows={2}
+                value={commentBody}
+                onChange={(e) => setCommentBody(e.target.value)}
+                maxLength={800}
+                placeholder={lang === 'ar' ? 'شارك تجربتك مع الحلقات والمعلمين والمتابعة...' : 'Share your honest reflection on classes & teachers...'}
+                className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3.5 py-2.5 text-sm"
+              />
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-[11px] text-slate-500">
+                  {lang === 'ar' ? 'سيظهر تعليقك والردود عليه داخل ملفك الشخصي في لوحة التحكم.' : 'Your review & replies also appear in your dashboard profile.'}
+                </span>
+                <PrimaryButton type="submit" disabled={postingComment} className="text-xs">
+                  <Send className="w-3.5 h-3.5" />
+                  <span>{postingComment ? (lang === 'ar' ? 'جاري النشر...' : 'Publishing...') : (lang === 'ar' ? 'نشر التعليق' : 'Post Review')}</span>
+                </PrimaryButton>
+              </div>
+            </form>
+          </Card>
+        )}
+
+        {communityComments.length === 0 ? (
+          <Card className="p-8 text-center space-y-3">
+            <MessageSquare className="w-8 h-8 text-[#C98A1E] mx-auto" />
+            <div className="font-bold text-base">
+              {lang === 'ar' ? 'لا توجد تعليقات منشورة بعد — كن أول من يشارك رأيه!' : 'No member reviews published yet — be the first!'}
+            </div>
+            <p className="text-xs text-slate-500 max-w-md mx-auto">
+              {lang === 'ar'
+                ? 'لضمان المصداقية، تُتاح التعليقات للأعضاء المسجلين في الأكاديمية (الطلاب، أولياء الأمور، والمعلمين) فقط.'
+                : 'To guarantee authenticity, only registered students, guardians, and teachers can post reviews.'}
+            </p>
+          </Card>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {communityComments.map((item) => (
               <Card key={item.id} className="p-6 flex flex-col justify-between space-y-4">
-                <p className="text-sm sm:text-base leading-relaxed text-[#0F213E] dark:text-[#F8F5EC]">
-                  “{tField(item as unknown as Record<string, unknown>, 'quote', lang)}”
-                </p>
-                <div className="pt-4 border-t border-[#EFEAD8] dark:border-[#1D355B] space-y-1">
-                  <div className="font-bold text-sm">
-                    {tField(item as unknown as Record<string, unknown>, 'guardian_name', lang)}
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="inline-flex items-center gap-0.5 text-[#C98A1E]" aria-label={`${item.rating}/5`}>
+                      {Array.from({ length: item.rating }).map((_, idx) => (
+                        <Star key={idx} className="w-3.5 h-3.5 fill-[#C98A1E]" />
+                      ))}
+                    </div>
+                    <span className="text-[11px] font-mono-tabular text-slate-400">{item.created_at.slice(0, 10)}</span>
                   </div>
-                  <div className="text-xs text-slate-500 dark:text-slate-400">
-                    {tField(item as unknown as Record<string, unknown>, 'relation', lang)}
-                    {' · '}
-                    <span className="text-[#0F766E] dark:text-[#2DD4BF] font-semibold">
-                      {tField(item as unknown as Record<string, unknown>, 'student_outcome', lang)}
-                    </span>
+
+                  <p className="text-sm sm:text-base leading-relaxed text-[#0F213E] dark:text-[#F8F5EC]">
+                    “{item.content}”
+                  </p>
+
+                  {item.replies.length > 0 && (
+                    <div className="space-y-2 pt-2 border-t border-[#EFEAD8] dark:border-[#1D355B]">
+                      {item.replies.map((r) => (
+                        <div key={r.id} className="p-2.5 rounded-xl bg-[#FAF8F3] dark:bg-[#13284A] text-xs space-y-1">
+                          <div className="font-bold text-[#0F766E] dark:text-[#2DD4BF]">
+                            {r.author_name} · {formatRoleLabel(r.author_role, lang)}
+                          </div>
+                          <p className="text-slate-700 dark:text-slate-200">{r.content}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="pt-3 border-t border-[#EFEAD8] dark:border-[#1D355B] space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <div className="font-bold text-sm">{item.author_name}</div>
+                      <div className="text-xs text-[#0F766E] dark:text-[#2DD4BF] font-semibold">
+                        {formatRoleLabel(item.author_role, lang)}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 text-xs">
+                      {user && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setReplyTargetId(replyTargetId === item.id ? null : item.id);
+                            setReplyBody('');
+                          }}
+                          className="font-bold text-[#0F766E] dark:text-[#2DD4BF] hover:underline cursor-pointer"
+                        >
+                          {lang === 'ar' ? 'رد' : 'Reply'}
+                        </button>
+                      )}
+                      {(item.is_mine || user?.role === 'admin') && (
+                        <button
+                          type="button"
+                          onClick={() => void handleDeleteComment(item.id)}
+                          className="text-red-600 p-1 rounded hover:bg-red-50 dark:hover:bg-red-950/30 cursor-pointer"
+                          title={lang === 'ar' ? 'حذف' : 'Delete'}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
                   </div>
+
+                  {user && replyTargetId === item.id && (
+                    <div className="flex gap-2 pt-1">
+                      <input
+                        value={replyBody}
+                        onChange={(e) => setReplyBody(e.target.value)}
+                        maxLength={600}
+                        placeholder={lang === 'ar' ? 'اكتب رداً...' : 'Write a reply...'}
+                        className="flex-1 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-1.5 text-xs"
+                      />
+                      <PrimaryButton
+                        type="button"
+                        disabled={postingReply}
+                        onClick={() => void handleReplyComment(item.id)}
+                        className="text-xs py-1.5"
+                      >
+                        {lang === 'ar' ? 'إرسال' : 'Send'}
+                      </PrimaryButton>
+                    </div>
+                  )}
                 </div>
               </Card>
             ))}
           </div>
-        </section>
-      )}
+        )}
+      </section>
+
+      {/* 10B. ACADEMY & WEBSITE DEVELOPMENT SUGGESTIONS */}
+      <section className="bg-[#F2EFE6] dark:bg-[#0C1A32] border-y border-[#E5DEC9] dark:border-[#233C63]">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-16 space-y-8">
+          <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+            <div className="space-y-2 max-w-2xl">
+              <div className="inline-flex items-center gap-2 text-xs font-bold text-[#C98A1E]">
+                <Lightbulb className="w-4 h-4" />
+                <span>{lang === 'ar' ? 'صوتك يصنع التطوير' : 'Co-Build the Academy'}</span>
+              </div>
+              <h2 className="text-2xl sm:text-3xl font-extrabold">
+                {lang === 'ar' ? 'اقتراحات تطوير الأكاديمية والموقع' : 'Academy & Platform Development Suggestions'}
+              </h2>
+              <p className="text-sm sm:text-base text-slate-600 dark:text-slate-300">
+                {lang === 'ar'
+                  ? 'هل لديك فكرة لميزة جديدة في الموقع أو دورة مطلوبة أو تحسين في تجربة التعلم؟ شاركنا مقترحك وتابع حالة تنفيذه.'
+                  : 'Have an idea for a new course, website feature, or learning improvement? Share it and vote on community ideas.'}
+              </p>
+            </div>
+            {!user && (
+              <SecondaryButton onClick={() => onNavigate('/login')} className="text-xs shrink-0">
+                <LogIn className="w-4 h-4" />
+                <span>{lang === 'ar' ? 'سجّل الدخول لإرسال مقترح' : 'Sign In to Suggest'}</span>
+              </SecondaryButton>
+            )}
+          </div>
+
+          {user && (
+            <Card className="p-5 sm:p-6 bg-white dark:bg-[#0F213E]">
+              <form onSubmit={handleCreateSuggestion} className="space-y-3">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <select
+                    value={sugCategory}
+                    onChange={(e) => setSugCategory(e.target.value as SuggestionCategory)}
+                    className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-xs font-semibold"
+                  >
+                    <option value="platform">{formatSuggestionCategory('platform', lang)}</option>
+                    <option value="curriculum">{formatSuggestionCategory('curriculum', lang)}</option>
+                    <option value="experience">{formatSuggestionCategory('experience', lang)}</option>
+                    <option value="other">{formatSuggestionCategory('other', lang)}</option>
+                  </select>
+                  <input
+                    value={sugTitle}
+                    onChange={(e) => setSugTitle(e.target.value)}
+                    maxLength={120}
+                    placeholder={lang === 'ar' ? 'عنوان المقترح (مثال: إضافة مسار تجويد مكثف للكبار)' : 'Suggestion title...'}
+                    className="sm:col-span-2 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3.5 py-2 text-sm"
+                  />
+                </div>
+                <textarea
+                  rows={2}
+                  value={sugDesc}
+                  onChange={(e) => setSugDesc(e.target.value)}
+                  maxLength={1200}
+                  placeholder={lang === 'ar' ? 'اشرح المقترح والفائدة المرجوة منه...' : 'Describe your suggestion and how it helps...'}
+                  className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3.5 py-2 text-sm"
+                />
+                <PrimaryButton type="submit" disabled={postingSug} className="text-xs">
+                  <Lightbulb className="w-3.5 h-3.5" />
+                  <span>{postingSug ? (lang === 'ar' ? 'جاري الإرسال...' : 'Submitting...') : (lang === 'ar' ? 'إرسال المقترح' : 'Submit Suggestion')}</span>
+                </PrimaryButton>
+              </form>
+            </Card>
+          )}
+
+          {suggestions.length === 0 ? (
+            <Card className="p-8 text-center space-y-2 bg-white dark:bg-[#0F213E]">
+              <Lightbulb className="w-8 h-8 text-[#C98A1E] mx-auto" />
+              <div className="font-bold text-base">
+                {lang === 'ar' ? 'نرحب بأول مقترح تطويري من طلابنا وأولياء الأمور!' : 'We welcome your first development idea!'}
+              </div>
+              <p className="text-xs text-slate-500">
+                {lang === 'ar'
+                  ? 'كل مقترح يُراجع مباشرة من إدارة الأكاديمية مع إظهار حالة التنفيذ.'
+                  : 'Every suggestion is reviewed by academy management with transparent status tracking.'}
+              </p>
+            </Card>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+              {suggestions.slice(0, 6).map((s) => (
+                <Card key={s.id} className="p-5 flex flex-col justify-between space-y-4 bg-white dark:bg-[#0F213E]">
+                  <div className="space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                      <span className={`px-2 py-0.5 rounded-md border font-bold text-[11px] ${suggestionStatusClass(s.status)}`}>
+                        {formatSuggestionStatus(s.status, lang)}
+                      </span>
+                      <span className="text-slate-500 font-semibold">{formatSuggestionCategory(s.category, lang)}</span>
+                    </div>
+                    <h3 className="font-extrabold text-base">{s.title}</h3>
+                    <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">{s.description}</p>
+                    {s.admin_reply && (
+                      <div className="p-3 rounded-xl bg-[#FAF8F3] dark:bg-[#13284A] text-xs space-y-1 border border-[#E5DEC9] dark:border-[#233C63]">
+                        <div className="font-bold text-[#0F766E] dark:text-[#2DD4BF]">
+                          {lang === 'ar' ? 'رد الإدارة:' : 'Director Note:'}
+                        </div>
+                        <p>{s.admin_reply}</p>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="pt-3 border-t border-[#EFEAD8] dark:border-[#1D355B] flex items-center justify-between gap-2">
+                    <div className="text-xs text-slate-500">
+                      <span className="font-bold text-[#0F213E] dark:text-[#F8F5EC]">{s.author_name}</span>
+                      {' · '}
+                      <span>{formatRoleLabel(s.author_role, lang)}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleToggleVote(s.id)}
+                      className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-bold tabular-nums transition-colors cursor-pointer ${
+                        s.has_voted
+                          ? 'bg-[#0F766E] text-white border-[#0F766E]'
+                          : 'bg-[#FAF8F3] dark:bg-[#13284A] border-[#D6CDB4] dark:border-[#294A7D] hover:border-[#C98A1E]'
+                      }`}
+                    >
+                      <ThumbsUp className="w-3.5 h-3.5" />
+                      <span>{s.votes_count}</span>
+                    </button>
+                  </div>
+                </Card>
+              ))}
+            </div>
+          )}
+        </div>
+      </section>
 
       {/* 11. FAQ ACCORDION */}
       <section className="max-w-4xl mx-auto px-4 sm:px-6 py-12 space-y-6">

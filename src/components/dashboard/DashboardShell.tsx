@@ -22,6 +22,7 @@ export interface NavTab {
   label_en: string;
   icon: React.ComponentType<{ className?: string }>;
   allowedRoles: UserRole[];
+  badgeCount?: number;
 }
 
 export function DashboardShell({
@@ -93,20 +94,34 @@ export function DashboardShell({
           {visibleTabs.map((tab) => {
             const Icon = tab.icon;
             const active = tab.id === activeTab;
+            const count = Number(tab.badgeCount || 0);
             return (
               <button
                 key={tab.id}
                 onClick={() => onSelectTab(tab.id)}
                 title={lang === 'ar' ? tab.label_ar : tab.label_en}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-colors cursor-pointer ${
+                className={`w-full flex items-center justify-between gap-2 px-3 py-2.5 rounded-xl text-sm font-semibold transition-colors cursor-pointer ${
                   active
                     ? 'bg-[#0F213E] text-white dark:bg-[#C98A1E] dark:text-white'
                     : 'text-slate-700 dark:text-slate-300 hover:bg-[#F2EFE6] dark:hover:bg-[#162C4E]'
                 }`}
               >
-                <Icon className="w-4 h-4 shrink-0" />
-                {!collapsed && (
-                  <span className="truncate">{lang === 'ar' ? tab.label_ar : tab.label_en}</span>
+                <span className="flex items-center gap-3 min-w-0">
+                  <Icon className="w-4 h-4 shrink-0" />
+                  {!collapsed && (
+                    <span className="truncate">{lang === 'ar' ? tab.label_ar : tab.label_en}</span>
+                  )}
+                </span>
+                {!collapsed && count > 0 && (
+                  <span
+                    className={`shrink-0 px-1.5 py-0.5 rounded-md text-[11px] font-bold font-mono-tabular ${
+                      active
+                        ? 'bg-white/20 text-white'
+                        : 'bg-[#C98A1E]/15 text-[#A56D10] dark:text-amber-300'
+                    }`}
+                  >
+                    {count}
+                  </span>
                 )}
               </button>
             );

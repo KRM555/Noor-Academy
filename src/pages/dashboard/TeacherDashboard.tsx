@@ -17,12 +17,13 @@ import { tField } from '../../i18n/translations';
 import { Card, LoadingState, ResponsiveTable, PrimaryButton, EmptyState } from '../../components/ui/CommonUI';
 import { ChangePasswordCard } from '../../components/dashboard/ChangePasswordCard';
 import { ExamCenter, type ManagedExamItem } from '../../components/dashboard/ExamCenter';
+import { MyCommunityPanel } from '../../components/dashboard/MyCommunityPanel';
 
 interface TeacherDashboardData {
   teacher: { id: number; name_ar: string; name_en: string; specialty_ar: string; specialty_en: string; hourly_rate: number };
   courses: Array<{ id: number; title_ar: string; title_en: string; level_name_ar: string; level_name_en: string; schedule_ar: string; schedule_en: string; capacity: number }>;
   students: Array<{ id: number; student_code: string; full_name_ar: string; full_name_en: string; age: number; level_name_ar: string; level_name_en: string; course_id: number; course_title_ar: string; course_title_en: string }>;
-  lessons: Array<{ id: number; course_id: number; title_ar: string; title_en: string; course_title_ar: string; course_title_en: string; lesson_date: string; start_time: string; duration_min: number }>;
+  lessons: Array<{ id: number; course_id: number; title_ar: string; title_en: string; course_title_ar: string; course_title_en: string; lesson_date: string; start_time: string; duration_min: number; weekday_ar?: string }>;
   lessonLinks?: Array<{ id: number; lesson_id: number; title_ar: string; title_en: string; url: string; link_type: string }>;
   attendance: Array<{ id: number; lesson_id: number; student_id: number; status: string; notes: string }>;
   exams: ManagedExamItem[];
@@ -266,7 +267,7 @@ export function TeacherDashboard({ activeTab }: { activeTab: string }) {
                       <div className="text-xs text-slate-500">{tField(ls as unknown as Record<string, unknown>, 'course_title', lang)}</div>
                       <div className="font-bold text-sm">{tField(ls as unknown as Record<string, unknown>, 'title', lang)}</div>
                       <div className="text-xs font-mono-tabular text-[#0F766E] dark:text-[#2DD4BF]">
-                        {ls.lesson_date} · {ls.start_time}
+                        {ls.weekday_ar ? `${ls.weekday_ar} · ` : ''}{ls.lesson_date} · {ls.start_time}
                       </div>
                     </div>
                     <button
@@ -767,6 +768,7 @@ export function TeacherDashboard({ activeTab }: { activeTab: string }) {
       </Card>
 
       <ChangePasswordCard />
+      <MyCommunityPanel />
     </div>
   );
 }

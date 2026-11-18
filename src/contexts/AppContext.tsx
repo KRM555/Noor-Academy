@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import type { AuthUser, Lang, NotificationItem, Theme } from '../types';
+import type { DisplayCurrency } from '../lib/currency';
 import { apiFetch, getStoredToken, setStoredToken } from '../lib/api';
 import { queryKeys } from '../lib/queryClient';
 
@@ -17,6 +18,8 @@ interface AppContextValue {
   theme: Theme;
   setTheme: (theme: Theme) => void;
   toggleTheme: () => void;
+  currency: DisplayCurrency;
+  setCurrency: (currency: DisplayCurrency) => void;
   user: AuthUser | null;
   authLoading: boolean;
   loginWithCredentials: (email: string, password: string) => Promise<AuthUser>;
@@ -34,6 +37,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const qc = useQueryClient();
   const [lang, setLangState] = useState<Lang>(() => (localStorage.getItem('nb_lang') as Lang) || 'ar');
   const [theme, setThemeState] = useState<Theme>(() => (localStorage.getItem('nb_theme') as Theme) || 'day');
+  const [currency, setCurrencyState] = useState<DisplayCurrency>(() => {
+    const saved = localStorage.getItem('nb_currency');
+    return saved === 'EGP' || saved === 'SAR' || saved === 'BOTH' ? saved : 'BOTH';
+  });
   const [user, setUser] = useState<AuthUser | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
@@ -73,6 +80,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const toggleTheme = useCallback(() => {
     setTheme(theme === 'day' ? 'night' : 'day');
   }, [theme, setTheme]);
+
+  const setCurrency = useCallback((next: DisplayCurrency) => {
+    setCurrencyState(next);
+    localStorage.setItem('nb_currency', next);
+  }, []);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -163,6 +175,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         theme,
         setTheme,
         toggleTheme,
+        currency,
+        setCurrency,
         user,
         authLoading,
         loginWithCredentials,

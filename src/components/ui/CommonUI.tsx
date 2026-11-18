@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { X, AlertTriangle, Inbox } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { dict } from '../../i18n/translations';
@@ -45,6 +45,9 @@ export function ResilientImage({
   fallbackTitle?: string;
 }) {
   const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    setFailed(false);
+  }, [src]);
 
   if (failed || !src) {
     return (

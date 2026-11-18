@@ -740,10 +740,8 @@ CREATE POLICY "payroll_own_read" ON public.payroll
 DROP POLICY IF EXISTS "payroll_admin_all" ON public.payroll;
 CREATE POLICY "payroll_admin_all" ON public.payroll FOR ALL USING (public.is_admin()) WITH CHECK (public.is_admin());
 
--- Public Submissions (Insert-only publicly, Admin read/update only)
+-- Public Submissions (Routed exclusively through Express backend with Zod validation & rate limits)
 DROP POLICY IF EXISTS "admission_public_insert" ON public.admission_requests;
-CREATE POLICY "admission_public_insert" ON public.admission_requests
-  FOR INSERT WITH CHECK (consent_accepted = TRUE AND student_age BETWEEN 3 AND 25);
 DROP POLICY IF EXISTS "admission_admin_read_update" ON public.admission_requests;
 CREATE POLICY "admission_admin_read_update" ON public.admission_requests
   FOR SELECT USING (public.is_admin());
@@ -752,15 +750,11 @@ CREATE POLICY "admission_admin_modify" ON public.admission_requests
   FOR UPDATE USING (public.is_admin());
 
 DROP POLICY IF EXISTS "placement_public_insert" ON public.placement_tests;
-CREATE POLICY "placement_public_insert" ON public.placement_tests
-  FOR INSERT WITH CHECK (age BETWEEN 3 AND 25);
 DROP POLICY IF EXISTS "placement_admin_read" ON public.placement_tests;
 CREATE POLICY "placement_admin_read" ON public.placement_tests
   FOR SELECT USING (public.is_admin());
 
 DROP POLICY IF EXISTS "consents_public_insert" ON public.consents;
-CREATE POLICY "consents_public_insert" ON public.consents
-  FOR INSERT WITH CHECK (length(email) > 3);
 DROP POLICY IF EXISTS "consents_admin_read" ON public.consents;
 CREATE POLICY "consents_admin_read" ON public.consents
   FOR SELECT USING (public.is_admin());
@@ -770,3 +764,11 @@ DROP POLICY IF EXISTS "audit_logs_admin_read" ON public.audit_logs;
 CREATE POLICY "audit_logs_admin_read" ON public.audit_logs FOR SELECT USING (public.is_admin());
 DROP POLICY IF EXISTS "audit_logs_admin_insert" ON public.audit_logs;
 CREATE POLICY "audit_logs_admin_insert" ON public.audit_logs FOR INSERT WITH CHECK (public.is_admin());
+
+-- ============================================================================
+-- Zero-Trust PostgREST Lockdown (All queries execute through Express service_role)
+-- Keeps public.verify_certificate(TEXT) RPC callable if needed
+-- ============================================================================
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM anon, authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon, authenticated;

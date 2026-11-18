@@ -26,7 +26,44 @@ export interface TeacherApplicationRecord {
   reviewed_at?: string | null;
 }
 
+export interface GuardianRequestRecord {
+  id: number;
+  profile_id: string;
+  guardian_id: number;
+  student_id: number;
+  student_code: string;
+  student_name: string;
+  full_name: string;
+  email: string;
+  phone: string;
+  relation: string;
+  status: 'pending' | 'approved' | 'rejected';
+  created_at: string;
+  reviewed_by?: string | null;
+  reviewed_at?: string | null;
+}
+
+export interface CourseMetaRecord {
+  course_id: number;
+  cover_url?: string | null;
+  cover_storage_path?: string | null;
+  cover_mime?: string | null;
+  co_teacher_ids?: number[];
+  price_monthly_sar?: number | null;
+  updated_at: string;
+}
+
+export interface LessonMetaRecord {
+  lesson_id: number;
+  weekday_ar: string;
+  is_published: boolean;
+  published_at: string | null;
+}
+
+export const COURSE_COVERS_BUCKET = 'course-covers';
+
 let vaultCheckedAt = 0;
+let coversBucketCheckedAt = 0;
 
 async function ensureApplicationVaultBucket(sb: SupabaseClient): Promise<void> {
   if (Date.now() - vaultCheckedAt < 60_000) return;
@@ -41,6 +78,39 @@ async function ensureApplicationVaultBucket(sb: SupabaseClient): Promise<void> {
     }
   }
   vaultCheckedAt = Date.now();
+}
+
+async function ensureCourseCoversBucket(sb: SupabaseClient): Promise<void> {
+  if (Date.now() - coversBucketCheckedAt < 60_000) return;
+  const { data: bucket } = await sb.storage.getBucket(COURSE_COVERS_BUCKET);
+  if (!bucket) {
+    const { error } = await sb.storage.createBucket(COURSE_COVERS_BUCKET, {
+      public: false,
+      fileSizeLimit: 5 * 1024 * 1024,
+    });
+    if (error && !String(error.message || '').toLowerCase().includes('already exists')) {
+      throw new Error(`Course covers bucket init failed: ${error.message}`);
+    }
+  }
+  coversBucketCheckedAt = Date.now();
+}
+
+async function listAllVaultFiles(sb: SupabaseClient, folder: string): Promise<Array<{ name: string }>> {
+  await ensureApplicationVaultBucket(sb);
+  const all: Array<{ name: string }> = [];
+  const limit = 500;
+  for (let offset = 0; offset < 10_000; offset += limit) {
+    const { data: files } = await sb.storage.from(APPLICATION_VAULT_BUCKET).list(folder, {
+      limit,
+      offset,
+    });
+    if (!files || !files.length) break;
+    for (const f of files) {
+      if (f.name.endsWith('.json')) all.push({ name: f.name });
+    }
+    if (files.length < limit) break;
+  }
+  return all;
 }
 
 async function readJsonFromVault<T>(sb: SupabaseClient, path: string): Promise<T | null> {
@@ -75,14 +145,11 @@ export async function getAdmissionMeta(sb: SupabaseClient, admissionId: number):
 }
 
 export async function listAdmissionMetas(sb: SupabaseClient): Promise<Map<number, AdmissionMetaRecord>> {
-  await ensureApplicationVaultBucket(sb);
   const result = new Map<number, AdmissionMetaRecord>();
-  const { data: files } = await sb.storage.from(APPLICATION_VAULT_BUCKET).list('admissions', { limit: 500 });
-  if (!files || !files.length) return result;
+  const files = await listAllVaultFiles(sb, 'admissions');
+  if (!files.length) return result;
   const rows = await Promise.all(
-    files
-      .filter((f) => f.name.endsWith('.json'))
-      .map((f) => readJsonFromVault<AdmissionMetaRecord>(sb, `admissions/${f.name}`))
+    files.map((f) => readJsonFromVault<AdmissionMetaRecord>(sb, `admissions/${f.name}`))
   );
   for (const row of rows) {
     if (row && typeof row.admission_id === 'number') {
@@ -105,17 +172,112 @@ export async function getTeacherApplication(sb: SupabaseClient, id: number): Pro
 }
 
 export async function listTeacherApplications(sb: SupabaseClient): Promise<TeacherApplicationRecord[]> {
-  await ensureApplicationVaultBucket(sb);
-  const { data: files } = await sb.storage.from(APPLICATION_VAULT_BUCKET).list('teacher-applications', { limit: 500 });
-  if (!files || !files.length) return [];
+  const files = await listAllVaultFiles(sb, 'teacher-applications');
+  if (!files.length) return [];
   const rows = await Promise.all(
-    files
-      .filter((f) => f.name.endsWith('.json'))
-      .map((f) => readJsonFromVault<TeacherApplicationRecord>(sb, `teacher-applications/${f.name}`))
+    files.map((f) => readJsonFromVault<TeacherApplicationRecord>(sb, `teacher-applications/${f.name}`))
   );
   return rows
     .filter((r): r is TeacherApplicationRecord => Boolean(r && typeof r.id === 'number'))
     .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+}
+
+export async function saveGuardianRequest(sb: SupabaseClient, record: GuardianRequestRecord): Promise<void> {
+  await writeJsonToVault(sb, `guardian-requests/${record.id}.json`, record);
+}
+
+export async function getGuardianRequest(sb: SupabaseClient, id: number): Promise<GuardianRequestRecord | null> {
+  return readJsonFromVault<GuardianRequestRecord>(sb, `guardian-requests/${id}.json`);
+}
+
+export async function listGuardianRequests(sb: SupabaseClient): Promise<GuardianRequestRecord[]> {
+  const files = await listAllVaultFiles(sb, 'guardian-requests');
+  if (!files.length) return [];
+  const rows = await Promise.all(
+    files.map((f) => readJsonFromVault<GuardianRequestRecord>(sb, `guardian-requests/${f.name}`))
+  );
+  return rows
+    .filter((r): r is GuardianRequestRecord => Boolean(r && typeof r.id === 'number'))
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+}
+
+export async function saveCourseMeta(sb: SupabaseClient, record: CourseMetaRecord): Promise<void> {
+  await writeJsonToVault(sb, `course-meta/${record.course_id}.json`, record);
+}
+
+export async function getCourseMeta(sb: SupabaseClient, courseId: number): Promise<CourseMetaRecord | null> {
+  return readJsonFromVault<CourseMetaRecord>(sb, `course-meta/${courseId}.json`);
+}
+
+export async function listCourseMetas(sb: SupabaseClient): Promise<Map<number, CourseMetaRecord>> {
+  const result = new Map<number, CourseMetaRecord>();
+  const files = await listAllVaultFiles(sb, 'course-meta');
+  if (!files.length) return result;
+  const rows = await Promise.all(
+    files.map((f) => readJsonFromVault<CourseMetaRecord>(sb, `course-meta/${f.name}`))
+  );
+  for (const row of rows) {
+    if (row && typeof row.course_id === 'number') {
+      result.set(row.course_id, row);
+    }
+  }
+  return result;
+}
+
+export async function uploadCourseCoverFile(
+  sb: SupabaseClient,
+  courseId: number,
+  buffer: Buffer,
+  mimeType: string,
+  ext: string
+): Promise<string> {
+  await ensureCourseCoversBucket(sb);
+  const objectPath = `courses/${courseId}/${Date.now()}-${crypto.randomBytes(3).toString('hex')}.${ext}`;
+  const { error } = await sb.storage.from(COURSE_COVERS_BUCKET).upload(objectPath, buffer, {
+    contentType: mimeType,
+    upsert: true,
+  });
+  if (error) {
+    throw new Error(`Course cover upload failed: ${error.message}`);
+  }
+  return objectPath;
+}
+
+export async function removeCourseCoverFile(sb: SupabaseClient, storagePath: string | null | undefined): Promise<void> {
+  if (!storagePath) return;
+  await ensureCourseCoversBucket(sb);
+  await sb.storage.from(COURSE_COVERS_BUCKET).remove([storagePath]).catch(() => {});
+}
+
+export async function readCourseCoverFile(sb: SupabaseClient, storagePath: string): Promise<Buffer | null> {
+  await ensureCourseCoversBucket(sb);
+  const { data, error } = await sb.storage.from(COURSE_COVERS_BUCKET).download(storagePath);
+  if (error || !data) return null;
+  const ab = await data.arrayBuffer();
+  return Buffer.from(ab);
+}
+
+export async function saveLessonMeta(sb: SupabaseClient, record: LessonMetaRecord): Promise<void> {
+  await writeJsonToVault(sb, `lesson-meta/${record.lesson_id}.json`, record);
+}
+
+export async function getLessonMeta(sb: SupabaseClient, lessonId: number): Promise<LessonMetaRecord | null> {
+  return readJsonFromVault<LessonMetaRecord>(sb, `lesson-meta/${lessonId}.json`);
+}
+
+export async function listLessonMetas(sb: SupabaseClient): Promise<Map<number, LessonMetaRecord>> {
+  const result = new Map<number, LessonMetaRecord>();
+  const files = await listAllVaultFiles(sb, 'lesson-meta');
+  if (!files.length) return result;
+  const rows = await Promise.all(
+    files.map((f) => readJsonFromVault<LessonMetaRecord>(sb, `lesson-meta/${f.name}`))
+  );
+  for (const row of rows) {
+    if (row && typeof row.lesson_id === 'number') {
+      result.set(row.lesson_id, row);
+    }
+  }
+  return result;
 }
 
 /**
