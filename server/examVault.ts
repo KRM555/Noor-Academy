@@ -102,7 +102,13 @@ export async function ensureExamVaultBucket(sb: SupabaseClient): Promise<void> {
       fileSizeLimit: MAX_EXAM_FILE_BYTES,
     });
     if (error && !String(error.message || '').toLowerCase().includes('already exists')) {
-      throw new AppError(500, `Exam vault bucket initialization failed: ${error.message}`);
+      console.error('[examVault:ensureExamVaultBucket]', error);
+      throw new AppError(
+        500,
+        process.env.NODE_ENV === 'production'
+          ? 'Exam vault bucket initialization failed'
+          : `Exam vault bucket initialization failed: ${error.message}`
+      );
     }
   }
   bucketCheckedAt = Date.now();
@@ -225,7 +231,13 @@ async function writeJsonToVault(sb: SupabaseClient, objectPath: string, payload:
     upsert: true,
   });
   if (error) {
-    throw new AppError(500, `Failed to persist exam metadata: ${error.message}`);
+    console.error('[examVault:writeJsonToVault]', error);
+    throw new AppError(
+      500,
+      process.env.NODE_ENV === 'production'
+        ? 'Failed to persist exam metadata'
+        : `Failed to persist exam metadata: ${error.message}`
+    );
   }
 }
 
@@ -331,6 +343,50 @@ export async function listExamSubmissionsForExam(
   return records.filter((r): r is ExamSubmissionRecord => Boolean(r));
 }
 
+export async function deleteExamDataForStudent(sb: SupabaseClient, studentId: number): Promise<void> {
+  try {
+    await ensureExamVaultBucket(sb);
+    const { data: exams } = await sb.from('exams').select('id');
+    const examIds = (exams || []).map((e: { id: number }) => Number(e.id)).filter((id) => Number.isFinite(id));
+    await Promise.all(examIds.map((eid) => deleteExamSubmissionRecord(sb, eid, studentId)));
+  } catch {
+    // non-fatal cleanup
+  }
+}
+
+export async function deleteExamVaultData(sb: SupabaseClient, examId: number): Promise<void> {
+  try {
+    await ensureExamVaultBucket(sb);
+    const pathsToRemove = [`meta/exam/${examId}.json`];
+    const folders = [
+      `questions/${examId}`,
+      `meta/sub/${examId}`,
+      `meta/attempt/${examId}`,
+      `submissions/${examId}`,
+      `graded/${examId}`,
+    ];
+    for (const folder of folders) {
+      const { data: items } = await sb.storage.from(EXAM_VAULT_BUCKET).list(folder, { limit: 1000 });
+      for (const item of items || []) {
+        if (item.name && item.id) {
+          pathsToRemove.push(`${folder}/${item.name}`);
+        } else if (item.name && !item.id) {
+          const { data: nested } = await sb.storage.from(EXAM_VAULT_BUCKET).list(`${folder}/${item.name}`, { limit: 1000 });
+          for (const sub of nested || []) {
+            if (sub.name) pathsToRemove.push(`${folder}/${item.name}/${sub.name}`);
+          }
+        }
+      }
+    }
+    if (pathsToRemove.length > 0) {
+      await sb.storage.from(EXAM_VAULT_BUCKET).remove(pathsToRemove).catch(() => {});
+    }
+    invalidateExamCache(examId);
+  } catch {
+    // non-fatal cleanup
+  }
+}
+
 export async function uploadExamBinaryFile(params: {
   sb: SupabaseClient;
   folder: string;
@@ -350,7 +406,13 @@ export async function uploadExamBinaryFile(params: {
     upsert: false,
   });
   if (error) {
-    throw new AppError(500, `Exam file upload failed: ${error.message}`);
+    console.error('[examVault:uploadExamBinaryFile]', error);
+    throw new AppError(
+      500,
+      process.env.NODE_ENV === 'production'
+        ? 'Exam file upload failed'
+        : `Exam file upload failed: ${error.message}`
+    );
   }
   return {
     path: objectPath,
@@ -368,7 +430,13 @@ export async function createExamSignedUrl(
 ): Promise<string> {
   const { data, error } = await sb.storage.from(EXAM_VAULT_BUCKET).createSignedUrl(objectPath, expiresInSeconds);
   if (error || !data?.signedUrl) {
-    throw new AppError(500, error?.message || 'Unable to generate secure exam download URL');
+    console.error('[examVault:createExamSignedUrl]', error);
+    throw new AppError(
+      500,
+      process.env.NODE_ENV === 'production'
+        ? 'Unable to generate secure exam download URL'
+        : error?.message || 'Unable to generate secure exam download URL'
+    );
   }
   return data.signedUrl;
 }

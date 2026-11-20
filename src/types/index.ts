@@ -8,6 +8,7 @@ export interface AuthUser {
   full_name: string;
   role: UserRole;
   preferred_lang: Lang;
+  guardian_id?: number;
 }
 
 export interface Course {
@@ -20,10 +21,10 @@ export interface Course {
   level_name_ar?: string;
   level_name_en?: string;
   level_code?: string;
-  teacher_id: number;
-  teacher_name_ar?: string;
-  teacher_name_en?: string;
-  teacher_avatar?: string;
+  teacher_id: number | null;
+  teacher_name_ar?: string | null;
+  teacher_name_en?: string | null;
+  teacher_avatar?: string | null;
   schedule_ar: string;
   schedule_en: string;
   price_monthly: number;

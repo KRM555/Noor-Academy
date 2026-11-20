@@ -152,6 +152,8 @@ function RouterContent() {
     staleTime: 2 * 60 * 1000,
   });
 
+  const isDashboardRoute = path.startsWith('/dashboard');
+
   const { data: adminSummary } = useQuery({
     queryKey: queryKeys.adminDashboard(user?.id),
     queryFn: () =>
@@ -161,14 +163,14 @@ function RouterContent() {
         guardianRequests?: Array<{ status: string }>;
         exams?: Array<{ pending_grading_count?: number }>;
       }>('/api/admin/dashboard'),
-    enabled: user?.role === 'admin',
+    enabled: user?.role === 'admin' && isDashboardRoute,
     staleTime: 60 * 1000,
   });
 
   const { data: adminCommSummary } = useQuery({
     queryKey: queryKeys.adminCommunity,
     queryFn: () => apiFetch<{ suggestions?: AcademySuggestion[] }>('/api/admin/community'),
-    enabled: user?.role === 'admin',
+    enabled: user?.role === 'admin' && isDashboardRoute,
     staleTime: 60 * 1000,
   });
 
@@ -404,6 +406,27 @@ function RouterContent() {
   // Public Routes
   const courseMatch = path.match(/^\/courses\/(\d+)$/);
   const teacherMatch = path.match(/^\/teachers\/(\d+)$/);
+  const knownStaticPaths = new Set([
+    '/',
+    '/courses',
+    '/teachers',
+    '/games',
+    '/levels',
+    '/placement',
+    '/apply',
+    '/admission',
+    '/apply-teacher',
+    '/verify',
+    '/how-it-works',
+    '/parents',
+    '/faq',
+    '/contact',
+    '/legal/terms',
+    '/legal/privacy',
+    '/legal/refund',
+    '/login',
+  ]);
+  const isKnownPublicRoute = knownStaticPaths.has(path) || Boolean(courseMatch) || Boolean(teacherMatch);
 
   return (
     <PublicLayout currentPath={path} onNavigate={navigate}>
@@ -509,6 +532,36 @@ function RouterContent() {
           }}
           onNavigateAdmission={(role) => navigate(role === 'teacher' ? '/apply-teacher' : '/apply')}
         />
+      )}
+
+      {!isKnownPublicRoute && (
+        <div className="max-w-xl mx-auto px-4 py-16 text-center space-y-5">
+          <div className="text-5xl font-extrabold font-mono-tabular text-[#C98A1E]">404</div>
+          <h1 className="text-2xl font-extrabold">
+            {lang === 'ar' ? 'الصفحة غير موجودة' : 'Page Not Found'}
+          </h1>
+          <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+            {lang === 'ar'
+              ? 'الرابط الذي طلبته غير متاح أو ربما تم نقله. يمكنك العودة إلى الصفحة الرئيسية أو استعراض الدورات.'
+              : 'The page you requested does not exist or may have moved. Return home or browse our courses.'}
+          </p>
+          <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
+            <button
+              type="button"
+              onClick={() => navigate('/')}
+              className="inline-flex items-center justify-center rounded-xl px-5 py-2.5 text-sm font-semibold bg-[#C98A1E] hover:bg-[#B47A16] text-white transition-colors cursor-pointer"
+            >
+              {lang === 'ar' ? 'العودة للرئيسية' : 'Back to Home'}
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate('/courses')}
+              className="inline-flex items-center justify-center rounded-xl px-5 py-2.5 text-sm font-semibold bg-[#F2EFE6] hover:bg-[#E5DEC9] text-[#0F213E] dark:bg-[#162C4E] dark:text-[#F8F5EC] border border-[#E5DEC9] dark:border-[#233C63] transition-colors cursor-pointer"
+            >
+              {lang === 'ar' ? 'استعراض الدورات' : 'Browse Courses'}
+            </button>
+          </div>
+        </div>
       )}
     </PublicLayout>
   );

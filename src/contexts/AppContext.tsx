@@ -1,8 +1,8 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import type { AuthUser, Lang, NotificationItem, Theme } from '../types';
+import type { AuthUser, Lang, NotificationItem, Theme, UserRole } from '../types';
 import type { DisplayCurrency } from '../lib/currency';
-import { apiFetch, getStoredToken, setStoredToken } from '../lib/api';
+import { apiFetch, setStoredToken } from '../lib/api';
 import { queryKeys } from '../lib/queryClient';
 
 interface ToastMessage {
@@ -22,7 +22,7 @@ interface AppContextValue {
   setCurrency: (currency: DisplayCurrency) => void;
   user: AuthUser | null;
   authLoading: boolean;
-  loginWithCredentials: (email: string, password: string) => Promise<AuthUser>;
+  loginWithCredentials: (email: string, password: string, portalRole?: UserRole) => Promise<AuthUser>;
   setAuthSession: (token: string, user: AuthUser) => void;
   logout: () => void;
   notifications: NotificationItem[];
@@ -102,7 +102,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [theme]);
 
   const refreshNotifications = useCallback(async () => {
-    if (!getStoredToken() || !user) return;
+    if (!user) return;
     await qc.invalidateQueries({ queryKey: queryKeys.notifications(user.id) });
   }, [qc, user]);
 
@@ -137,10 +137,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     void initAuth();
   }, []);
 
-  const loginWithCredentials = async (email: string, password: string) => {
+  const loginWithCredentials = async (email: string, password: string, portalRole?: UserRole) => {
     const res = await apiFetch<{ token: string; user: AuthUser }>('/api/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ email, password, ...(portalRole ? { portalRole } : {}) }),
     });
     setStoredToken(res.token);
     setUser(res.user);
@@ -161,6 +161,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     void apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
     setStoredToken(null);
     setUser(null);
+    try {
+      for (let i = localStorage.length - 1; i >= 0; i -= 1) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith('nb_quiz_draft_')) {
+          localStorage.removeItem(key);
+        }
+      }
+    } catch {
+      // ignore storage errors
+    }
     qc.removeQueries({ queryKey: ['dashboard'] });
     qc.removeQueries({ queryKey: ['notifications'] });
     qc.removeQueries({ queryKey: ['admin'] });

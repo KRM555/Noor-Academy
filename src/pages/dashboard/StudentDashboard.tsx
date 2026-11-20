@@ -138,7 +138,10 @@ export function StudentDashboard({
     quizAnswersRef.current = quizAnswers;
     if (activeQuizExamId && user?.id) {
       try {
-        localStorage.setItem(`nb_quiz_draft_${user.id}_${activeQuizExamId}`, JSON.stringify(quizAnswers));
+        localStorage.setItem(
+          `nb_quiz_draft_${user.id}_${activeQuizExamId}`,
+          JSON.stringify({ answers: quizAnswers, savedAt: Date.now() })
+        );
       } catch {
         // Ignore storage quota issues
       }
@@ -202,7 +205,24 @@ export function StudentDashboard({
       if (draftKey && Object.keys(answersSource).length === 0) {
         try {
           const raw = localStorage.getItem(draftKey);
-          if (raw) storedDraft = JSON.parse(raw) as Record<string, number>;
+          if (raw) {
+            const parsedDraft = JSON.parse(raw) as unknown;
+            if (
+              parsedDraft &&
+              typeof parsedDraft === 'object' &&
+              'answers' in parsedDraft &&
+              typeof (parsedDraft as { savedAt?: unknown }).savedAt === 'number'
+            ) {
+              const { answers, savedAt } = parsedDraft as { answers?: Record<string, number>; savedAt: number };
+              if (Date.now() - savedAt <= 24 * 60 * 60 * 1000 && answers && typeof answers === 'object') {
+                storedDraft = answers;
+              } else {
+                localStorage.removeItem(draftKey);
+              }
+            } else if (parsedDraft && typeof parsedDraft === 'object') {
+              storedDraft = parsedDraft as Record<string, number>;
+            }
+          }
         } catch {
           // Ignore malformed draft
         }
@@ -577,12 +597,31 @@ export function StudentDashboard({
         return;
       }
 
-      // Restore draft answers if present in localStorage
+      // Restore draft answers if present in localStorage (with 24h TTL)
       if (user?.id) {
+        const key = `nb_quiz_draft_${user.id}_${examItem.id}`;
         try {
-          const savedDraft = localStorage.getItem(`nb_quiz_draft_${user.id}_${examItem.id}`);
+          const savedDraft = localStorage.getItem(key);
           if (savedDraft) {
-            setQuizAnswers(JSON.parse(savedDraft) as Record<string, number>);
+            const parsedDraft = JSON.parse(savedDraft) as unknown;
+            if (
+              parsedDraft &&
+              typeof parsedDraft === 'object' &&
+              'answers' in parsedDraft &&
+              typeof (parsedDraft as { savedAt?: unknown }).savedAt === 'number'
+            ) {
+              const { answers, savedAt } = parsedDraft as { answers?: Record<string, number>; savedAt: number };
+              if (Date.now() - savedAt <= 24 * 60 * 60 * 1000 && answers && typeof answers === 'object') {
+                setQuizAnswers(answers);
+              } else {
+                localStorage.removeItem(key);
+                setQuizAnswers({});
+              }
+            } else if (parsedDraft && typeof parsedDraft === 'object') {
+              setQuizAnswers(parsedDraft as Record<string, number>);
+            } else {
+              setQuizAnswers({});
+            }
           } else {
             setQuizAnswers({});
           }

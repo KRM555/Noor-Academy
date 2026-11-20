@@ -147,9 +147,9 @@ interface AdminData {
     description_ar?: string;
     description_en?: string;
     level_id: number;
-    teacher_id: number;
+    teacher_id: number | null;
     level_name_ar: string;
-    teacher_name_ar: string;
+    teacher_name_ar: string | null;
     schedule_ar: string;
     schedule_en?: string;
     price_monthly: number;
@@ -238,7 +238,22 @@ export function AdminDashboard({
 }) {
   const { lang, toast, user } = useApp();
   const qc = useQueryClient();
-  const [deleteTarget, setDeleteTarget] = useState<{ type: 'courses' | 'lessons' | 'teachers' | 'students'; id: number } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<{
+    type:
+      | 'courses'
+      | 'lessons'
+      | 'teachers'
+      | 'students'
+      | 'revoked_certificate'
+      | 'announcements'
+      | 'payroll'
+      | 'audit_log'
+      | 'audit_logs_all'
+      | 'user';
+    id?: number | string;
+    label?: string;
+    meta?: { isPaid?: boolean };
+  } | null>(null);
   const [syncingSupabase, setSyncingSupabase] = useState(false);
 
   // Search & Filter states
@@ -342,7 +357,7 @@ export function AdminDashboard({
   });
 
   // Create Form states
-  const [newCourse, setNewCourse] = useState({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '1', schedule_ar: 'الإثنين · 5:00 م', price_monthly: '350', price_monthly_sar: '', capacity: '12' });
+  const [newCourse, setNewCourse] = useState({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '', schedule_ar: 'الإثنين · 5:00 م', price_monthly: '350', price_monthly_sar: '', capacity: '12' });
   const [newStudent, setNewStudent] = useState({ email: '', full_name_ar: '', age: '8', level_id: '1', guardian_name: '', guardian_phone: '', guardian_email: '', course_id: '1' });
   const [newTeacher, setNewTeacher] = useState({ email: '', name_ar: '', specialty_ar: 'نور البيان والقرآن', qualifications_ar: 'إجازة حفص', hourly_rate: '180' });
   const [enrollPair, setEnrollPair] = useState({ student_id: '1', course_id: '1' });
@@ -425,16 +440,163 @@ export function AdminDashboard({
   if (isLoading) return <LoadingState />;
   if (!data) return null;
 
-  const confirmSoftDelete = async () => {
+  const confirmDelete = async () => {
     if (!deleteTarget) return;
     try {
-      await apiFetch(`/api/admin/${deleteTarget.type}/${deleteTarget.id}`, { method: 'DELETE' });
-      toast(lang === 'ar' ? 'تمت الأرشفة والحذف الناعم بنجاح' : 'Record soft-deleted and logged', 'success');
+      let endpoint = '';
+      let successMsg = lang === 'ar' ? 'تم الحذف بنجاح' : 'Deleted successfully';
+
+      switch (deleteTarget.type) {
+        case 'courses':
+        case 'lessons':
+          endpoint = `/api/admin/${deleteTarget.type}/${deleteTarget.id}`;
+          successMsg = lang === 'ar' ? 'تمت الأرشفة والحذف بنجاح' : 'Record archived and logged';
+          break;
+        case 'teachers':
+        case 'students':
+          endpoint = `/api/admin/${deleteTarget.type}/${deleteTarget.id}`;
+          successMsg = lang === 'ar'
+            ? 'تم الحذف النهائي من الموقع وقاعدة البيانات وسجلات البريد'
+            : 'Permanently deleted across database and authentication records';
+          break;
+        case 'revoked_certificate':
+          endpoint = `/api/admin/certificates/${deleteTarget.id}`;
+          successMsg = lang === 'ar' ? 'تم حذف الشهادة الملغاة نهائياً' : 'Revoked certificate deleted';
+          break;
+        case 'announcements':
+          endpoint = `/api/admin/announcements/${deleteTarget.id}`;
+          successMsg = lang === 'ar' ? 'تم حذف الإعلان وسجلاته بنجاح' : 'Announcement deleted';
+          break;
+        case 'payroll':
+          endpoint = `/api/admin/payroll/${deleteTarget.id}`;
+          successMsg = lang === 'ar' ? 'تم حذف سجل الراتب بنجاح' : 'Payroll record deleted';
+          break;
+        case 'audit_log':
+          endpoint = `/api/admin/audit-logs/${deleteTarget.id}`;
+          successMsg = lang === 'ar' ? 'تم حذف السجل من سجل العمليات' : 'Audit log entry deleted';
+          break;
+        case 'audit_logs_all':
+          endpoint = '/api/admin/audit-logs';
+          successMsg = lang === 'ar' ? 'تم مسح جميع سجلات العمليات بنجاح' : 'All audit logs cleared';
+          break;
+        case 'user':
+          endpoint = `/api/admin/users/${deleteTarget.id}`;
+          successMsg = lang === 'ar'
+            ? 'تم حذف الحساب نهائياً من النظام وسجلات الدخول'
+            : 'User account permanently deleted';
+          break;
+      }
+
+      await apiFetch(endpoint, { method: 'DELETE' });
+      toast(successMsg, 'success');
       loadData();
     } catch (e: unknown) {
       toast(e instanceof Error ? e.message : 'Error', 'error');
     }
   };
+
+  const getDeleteModalCopy = () => {
+    if (!deleteTarget) return { title: undefined, description: undefined };
+    const nameSuffix = deleteTarget.label ? ` (${deleteTarget.label})` : '';
+    switch (deleteTarget.type) {
+      case 'teachers':
+        return {
+          title: lang === 'ar' ? 'حذف المعلم نهائياً' : 'Permanently Delete Teacher',
+          description:
+            lang === 'ar'
+              ? `هل أنت متأكد من الحذف النهائي للمعلم${nameSuffix}؟ سيتم حذف حسابه وبريده من الإعدادات والأدوار وقاعدة البيانات مع فك ارتباطه من الكورسات دون حذف الكورسات.`
+              : `Permanently delete teacher${nameSuffix}? Their profile, auth email, and payouts will be removed while keeping courses intact.`,
+        };
+      case 'students':
+        return {
+          title: lang === 'ar' ? 'حذف الطالب نهائياً' : 'Permanently Delete Student',
+          description:
+            lang === 'ar'
+              ? `هل أنت متأكد من الحذف النهائي للطالب${nameSuffix}؟ سيتم حذف سجلاته الدراسية واختباراته وشهاداته وبريده من الإعدادات والأدوار وقاعدة البيانات نهائياً.`
+              : `Permanently delete student${nameSuffix}? All enrollments, exams, certificates, profile, and email records will be permanently removed.`,
+        };
+      case 'user':
+        return {
+          title: lang === 'ar' ? 'حذف الحساب نهائياً' : 'Permanently Delete User',
+          description:
+            lang === 'ar'
+              ? `هل أنت متأكد من حذف الحساب${nameSuffix} نهائياً؟ سيتم مسح بيانات المستخدم وبريده بالكامل من الصلاحيات وقاعدة البيانات.`
+              : `Permanently delete account${nameSuffix}? All profile, role, and email records will be removed.`,
+        };
+      case 'revoked_certificate':
+        return {
+          title: lang === 'ar' ? 'حذف الشهادة الملغاة' : 'Delete Revoked Certificate',
+          description:
+            lang === 'ar'
+              ? `سيتم حذف الشهادة الملغاة${nameSuffix} نهائياً من قاعدة البيانات.`
+              : `Permanently remove revoked certificate${nameSuffix} from the database.`,
+        };
+      case 'announcements':
+        return {
+          title: lang === 'ar' ? 'حذف الإعلان' : 'Delete Announcement',
+          description:
+            lang === 'ar'
+              ? `سيتم حذف الإعلان${nameSuffix} وجميع سجلات استهدافه نهائياً.`
+              : `Permanently delete announcement${nameSuffix} and its target records.`,
+        };
+      case 'payroll':
+        return {
+          title: lang === 'ar' ? 'حذف سجل الراتب' : 'Delete Payroll Record',
+          description: deleteTarget.meta?.isPaid
+            ? lang === 'ar'
+              ? `تنبيه: تم تحديد هذا السجل${nameSuffix} كـ «تم الصرف» مسبقاً. هل تؤكد حذفه نهائياً من سجلات الرواتب؟`
+              : `Warning: Payroll record${nameSuffix} is marked as PAID. Confirm permanent deletion?`
+            : lang === 'ar'
+            ? `هل تؤكد حذف سجل الراتب${nameSuffix} نهائياً؟`
+            : `Confirm permanent deletion of payroll record${nameSuffix}?`,
+        };
+      case 'audit_logs_all':
+        return {
+          title: lang === 'ar' ? 'مسح جميع سجلات العمليات' : 'Clear All Audit Logs',
+          description:
+            lang === 'ar'
+              ? 'سيتم مسح كامل سجل العمليات (Audit Logs) نهائياً ولا يمكن التراجع عن ذلك.'
+              : 'All system audit logs will be permanently deleted. This cannot be undone.',
+        };
+      case 'audit_log':
+        return {
+          title: lang === 'ar' ? 'حذف سجل العملية' : 'Delete Audit Log Entry',
+          description:
+            lang === 'ar'
+              ? `هل تؤكد حذف هذا السجل${nameSuffix} من سجل العمليات؟`
+              : `Delete audit log entry${nameSuffix}?`,
+        };
+      case 'courses':
+        return {
+          title: lang === 'ar' ? 'حذف الدورة نهائياً' : 'Permanently Delete Course',
+          description:
+            lang === 'ar'
+              ? `هل أنت متأكد من حذف الدورة${nameSuffix} نهائياً؟ سيتم حذف جميع الحصص والملفات والروابط والامتحانات المرتبطة بها من قاعدة البيانات.`
+              : `Permanently delete course${nameSuffix}? All child lessons, materials, links, and exams will also be permanently deleted.`,
+        };
+      case 'lessons':
+        return {
+          title: lang === 'ar' ? 'حذف الحصة نهائياً' : 'Permanently Delete Lesson',
+          description:
+            lang === 'ar'
+              ? `هل أنت متأكد من حذف الحصة${nameSuffix} نهائياً مع كافة روابطها ومرفقاتها؟`
+              : `Permanently delete lesson${nameSuffix} along with its links and materials?`,
+        };
+      default:
+        return { title: undefined, description: undefined };
+    }
+  };
+
+  const deleteModalCopy = getDeleteModalCopy();
+  const confirmDeleteModalNode = (
+    <ConfirmDeleteModal
+      open={Boolean(deleteTarget)}
+      title={deleteModalCopy.title}
+      description={deleteModalCopy.description}
+      onConfirm={confirmDelete}
+      onClose={() => setDeleteTarget(null)}
+    />
+  );
 
   if (activeTab === 'overview') {
     const chartData = data.courses.map((c) => ({
@@ -498,17 +660,27 @@ export function AdminDashboard({
   };
 
   if (activeTab === 'students') {
+    const effectiveNewStudentCourseId = data.courses.some((c) => String(c.id) === newStudent.course_id)
+      ? newStudent.course_id
+      : String(data.courses[0]?.id || '');
+
     const createStudent = async (e: React.FormEvent) => {
       e.preventDefault();
       try {
-        const res = await apiFetch<{ student_code: string; temporary_password: string }>('/api/admin/students', { method: 'POST', body: JSON.stringify(newStudent) });
+        const res = await apiFetch<{ student_code: string; temporary_password: string }>('/api/admin/students', {
+          method: 'POST',
+          body: JSON.stringify({
+            ...newStudent,
+            course_id: effectiveNewStudentCourseId || undefined,
+          }),
+        });
         toast(
           lang === 'ar'
             ? `تم إنشاء الطالب (${res.student_code}) — كلمة المرور المؤقتة: ${res.temporary_password}`
             : `Student created (${res.student_code}) — Temp password: ${res.temporary_password}`,
           'success'
         );
-        setNewStudent({ email: '', full_name_ar: '', age: '8', level_id: '1', guardian_name: '', guardian_phone: '', guardian_email: '', course_id: '1' });
+        setNewStudent({ email: '', full_name_ar: '', age: '8', level_id: String(data.levels[0]?.id || '1'), guardian_name: '', guardian_phone: '', guardian_email: '', course_id: String(data.courses[0]?.id || '') });
         loadData();
       } catch (err: unknown) {
         toast(err instanceof Error ? err.message : 'Error', 'error');
@@ -601,8 +773,12 @@ export function AdminDashboard({
             <select value={newStudent.level_id} onChange={(e) => setNewStudent({ ...newStudent, level_id: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
               {data.levels.map((l) => <option key={l.id} value={l.id}>{l.name_ar}</option>)}
             </select>
-            <select value={newStudent.course_id} onChange={(e) => setNewStudent({ ...newStudent, course_id: e.target.value })} className="sm:col-span-2 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
-              {data.courses.map((c) => <option key={c.id} value={c.id}>{c.title_ar}</option>)}
+            <select value={effectiveNewStudentCourseId} onChange={(e) => setNewStudent({ ...newStudent, course_id: e.target.value })} className="sm:col-span-2 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+              {data.courses.length === 0 ? (
+                <option value="">{lang === 'ar' ? 'بدون حلقة (سيتم التسجيل لاحقاً)' : 'No course yet'}</option>
+              ) : (
+                data.courses.map((c) => <option key={c.id} value={c.id}>{c.title_ar}</option>)
+              )}
             </select>
             <div className="sm:col-span-3"><PrimaryButton type="submit">{lang === 'ar' ? 'إضافة الطالب' : 'Create Student'}</PrimaryButton></div>
           </form>
@@ -745,7 +921,7 @@ export function AdminDashboard({
                   <button onClick={() => startEditStudent(r)} className="p-1.5 text-[#0F766E] dark:text-[#2DD4BF] hover:bg-[#0F766E]/10 rounded-lg cursor-pointer" title={lang === 'ar' ? 'تعديل' : 'Edit'}>
                     <Pencil className="w-4 h-4" />
                   </button>
-                  <button onClick={() => setDeleteTarget({ type: 'students', id: r.id })} className="p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 rounded-lg cursor-pointer" title="Soft Delete">
+                  <button onClick={() => setDeleteTarget({ type: 'students', id: r.id, label: r.full_name_ar })} className="p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 rounded-lg cursor-pointer" title={lang === 'ar' ? 'حذف نهائي' : 'Permanent Delete'}>
                     <Trash2 className="w-4 h-4" />
                   </button>
                 </div>
@@ -767,8 +943,18 @@ export function AdminDashboard({
           <form
             onSubmit={async (e) => {
               e.preventDefault();
+              const sid = data.students.some((s) => String(s.id) === enrollPair.student_id)
+                ? enrollPair.student_id
+                : String(data.students[0]?.id || '');
+              const cid = data.courses.some((c) => String(c.id) === enrollPair.course_id)
+                ? enrollPair.course_id
+                : String(data.courses[0]?.id || '');
+              if (!sid || !cid) {
+                toast(lang === 'ar' ? 'أضف طالباً وحلقة أولاً' : 'Add a student and course first', 'error');
+                return;
+              }
               try {
-                await apiFetch('/api/admin/enrollments', { method: 'POST', body: JSON.stringify(enrollPair) });
+                await apiFetch('/api/admin/enrollments', { method: 'POST', body: JSON.stringify({ student_id: sid, course_id: cid }) });
                 toast(lang === 'ar' ? 'تم تسجيل الطالب في الحلقة بنجاح' : 'Student enrolled in course', 'success');
                 loadData();
               } catch (err) {
@@ -777,10 +963,20 @@ export function AdminDashboard({
             }}
             className="flex flex-wrap gap-3 items-center"
           >
-            <select value={enrollPair.student_id} onChange={(e) => setEnrollPair({ ...enrollPair, student_id: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+            <select
+              value={data.students.some((s) => String(s.id) === enrollPair.student_id) ? enrollPair.student_id : String(data.students[0]?.id || '')}
+              onChange={(e) => setEnrollPair({ ...enrollPair, student_id: e.target.value })}
+              className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm"
+            >
+              {data.students.length === 0 && <option value="">{lang === 'ar' ? 'لا يوجد طلاب' : 'No students'}</option>}
               {data.students.map((s) => <option key={s.id} value={s.id}>{s.full_name_ar} ({s.student_code})</option>)}
             </select>
-            <select value={enrollPair.course_id} onChange={(e) => setEnrollPair({ ...enrollPair, course_id: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+            <select
+              value={data.courses.some((c) => String(c.id) === enrollPair.course_id) ? enrollPair.course_id : String(data.courses[0]?.id || '')}
+              onChange={(e) => setEnrollPair({ ...enrollPair, course_id: e.target.value })}
+              className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm"
+            >
+              {data.courses.length === 0 && <option value="">{lang === 'ar' ? 'لا توجد كورسات' : 'No courses'}</option>}
               {data.courses.map((c) => <option key={c.id} value={c.id}>{c.title_ar}</option>)}
             </select>
             <PrimaryButton type="submit">{lang === 'ar' ? 'تأكيد التسجيل' : 'Enroll Student'}</PrimaryButton>
@@ -797,7 +993,7 @@ export function AdminDashboard({
           />
         </Card>
 
-        <ConfirmDeleteModal open={Boolean(deleteTarget)} onConfirm={confirmSoftDelete} onClose={() => setDeleteTarget(null)} />
+        {confirmDeleteModalNode}
       </div>
     );
   }
@@ -908,7 +1104,7 @@ export function AdminDashboard({
                   <button onClick={() => startEditTeacher(r)} className="p-1.5 text-[#0F766E] dark:text-[#2DD4BF] rounded-lg cursor-pointer" title={lang === 'ar' ? 'تعديل' : 'Edit'}>
                     <Pencil className="w-4 h-4" />
                   </button>
-                  <button onClick={() => setDeleteTarget({ type: 'teachers', id: r.id })} className="p-1.5 text-red-600 rounded-lg cursor-pointer">
+                  <button onClick={() => setDeleteTarget({ type: 'teachers', id: r.id, label: r.name_ar })} className="p-1.5 text-red-600 rounded-lg cursor-pointer" title={lang === 'ar' ? 'حذف نهائي' : 'Permanent Delete'}>
                     <Trash2 className="w-4 h-4" />
                   </button>
                 </div>
@@ -916,7 +1112,7 @@ export function AdminDashboard({
             },
           ]}
         />
-        <ConfirmDeleteModal open={Boolean(deleteTarget)} onConfirm={confirmSoftDelete} onClose={() => setDeleteTarget(null)} />
+        {confirmDeleteModalNode}
       </div>
     );
   }
@@ -933,7 +1129,7 @@ export function AdminDashboard({
         title_en: c.title_en || c.title_ar || '',
         description_ar: c.description_ar || '',
         level_id: String(c.level_id || 1),
-        teacher_id: String(c.teacher_id || 1),
+        teacher_id: c.teacher_id ? String(c.teacher_id) : '',
         schedule_ar: c.schedule_ar || '',
         price_monthly: String(c.price_monthly ?? 0),
         price_monthly_sar:
@@ -971,7 +1167,7 @@ export function AdminDashboard({
               title_en: courseEdit.title_en,
               description_ar: courseEdit.description_ar,
               level_id: Number(courseEdit.level_id),
-              teacher_id: Number(courseEdit.teacher_id),
+              teacher_id: courseEdit.teacher_id ? Number(courseEdit.teacher_id) : null,
               schedule_ar: courseEdit.schedule_ar,
               price_monthly: Number(courseEdit.price_monthly),
               price_monthly_sar:
@@ -980,7 +1176,9 @@ export function AdminDashboard({
                   : null,
               capacity: Number(courseEdit.capacity),
               is_featured: courseEdit.is_featured,
-              co_teacher_ids: courseEdit.co_teacher_ids.filter((tid) => tid !== Number(courseEdit.teacher_id)),
+              co_teacher_ids: courseEdit.co_teacher_ids.filter(
+                (tid) => !courseEdit.teacher_id || tid !== Number(courseEdit.teacher_id)
+              ),
               cover_url: courseEdit.cover_url || null,
             }),
           });
@@ -1261,7 +1459,9 @@ export function AdminDashboard({
                   <div className="text-xs text-slate-500 flex flex-wrap items-center gap-x-2 gap-y-1">
                     <span>
                       {lang === 'ar' ? 'المعلم الأساسي:' : 'Lead:'}{' '}
-                      <strong className="text-[#0F213E] dark:text-[#F8F5EC]">{selectedCourse.teacher_name_ar}</strong>
+                      <strong className="text-[#0F213E] dark:text-[#F8F5EC]">
+                        {selectedCourse.teacher_name_ar || (lang === 'ar' ? 'بدون معلم معيّن' : 'Unassigned')}
+                      </strong>
                     </span>
                     {secondaryTeachers.length > 0 && (
                       <>
@@ -1560,7 +1760,7 @@ export function AdminDashboard({
                               </button>
                               <button
                                 type="button"
-                                onClick={() => setDeleteTarget({ type: 'lessons', id: ls.id })}
+                                onClick={() => setDeleteTarget({ type: 'lessons', id: ls.id, label: ls.title_ar })}
                                 className="p-1.5 rounded-lg text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 cursor-pointer"
                                 title={lang === 'ar' ? 'حذف الدرس' : 'Delete Lesson'}
                               >
@@ -1789,6 +1989,7 @@ export function AdminDashboard({
                     <div className="space-y-1">
                       <label className="text-xs font-bold">{lang === 'ar' ? 'المعلم الأساسي المسؤول' : 'Lead Teacher'}</label>
                       <select value={courseEdit.teacher_id} onChange={(e) => setCourseEdit({ ...courseEdit, teacher_id: e.target.value })} className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+                        <option value="">{lang === 'ar' ? 'بدون معلم معيّن' : 'Unassigned'}</option>
                         {data.teachers.map((t) => <option key={t.id} value={t.id}>{t.name_ar}</option>)}
                       </select>
                     </div>
@@ -1924,7 +2125,7 @@ export function AdminDashboard({
             </Card>
           )}
 
-          <ConfirmDeleteModal open={Boolean(deleteTarget)} onConfirm={confirmSoftDelete} onClose={() => setDeleteTarget(null)} />
+          {confirmDeleteModalNode}
         </div>
       );
     }
@@ -1941,6 +2142,7 @@ export function AdminDashboard({
           method: 'POST',
           body: JSON.stringify({
             ...newCourse,
+            teacher_id: newCourse.teacher_id ? Number(newCourse.teacher_id) : null,
             price_monthly_sar:
               newCourse.price_monthly_sar.trim() !== ''
                 ? Number(newCourse.price_monthly_sar)
@@ -1957,7 +2159,7 @@ export function AdminDashboard({
           });
         }
         toast(lang === 'ar' ? 'تم إنشاء الكورس وإضافته للصفحة الرئيسية بنجاح' : 'Course created & added to showcase', 'success');
-        setNewCourse({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '1', schedule_ar: 'الإثنين · 5:00 م', price_monthly: '350', price_monthly_sar: '', capacity: '12' });
+        setNewCourse({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '', schedule_ar: 'الإثنين · 5:00 م', price_monthly: '350', price_monthly_sar: '', capacity: '12' });
         setNewCourseCoverUrl('');
         setNewCourseCoverFile(null);
         setNewCourseCoTeacherIds([]);
@@ -2024,6 +2226,7 @@ export function AdminDashboard({
                   {data.levels.map((l) => <option key={l.id} value={l.id}>{l.name_ar}</option>)}
                 </select>
                 <select value={newCourse.teacher_id} onChange={(e) => setNewCourse({ ...newCourse, teacher_id: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+                  <option value="">{lang === 'ar' ? 'بدون معلم معيّن' : 'Unassigned'}</option>
                   {data.teachers.map((t) => <option key={t.id} value={t.id}>{t.name_ar}</option>)}
                 </select>
                 <input placeholder={lang === 'ar' ? 'المواعيد (مثال: الإثنين والأربعاء 5 م)' : 'Schedule'} value={newCourse.schedule_ar} onChange={(e) => setNewCourse({ ...newCourse, schedule_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
@@ -2142,7 +2345,7 @@ export function AdminDashboard({
                   <div className="p-4 space-y-2">
                     <h3 className="font-extrabold text-base leading-snug line-clamp-1">{c.title_ar}</h3>
                     <div className="text-xs text-slate-500 flex flex-wrap items-center gap-x-2 gap-y-1">
-                      <span>{c.teacher_name_ar}{coCount > 0 ? ` (+${coCount})` : ''}</span>
+                      <span>{c.teacher_name_ar ? `${c.teacher_name_ar}${coCount > 0 ? ` (+${coCount})` : ''}` : (lang === 'ar' ? 'بدون معلم معيّن' : 'Unassigned')}</span>
                       <span aria-hidden="true">·</span>
                       <span>{c.level_name_ar}</span>
                     </div>
@@ -2178,7 +2381,7 @@ export function AdminDashboard({
                   </button>
                   <button
                     type="button"
-                    onClick={() => setDeleteTarget({ type: 'courses', id: c.id })}
+                    onClick={() => setDeleteTarget({ type: 'courses', id: c.id, label: c.title_ar })}
                     className="inline-flex items-center justify-center rounded-xl p-2 text-red-600 border border-[#E5DEC9] dark:border-[#233C63] hover:bg-red-50 dark:hover:bg-red-950/30 cursor-pointer"
                     title={lang === 'ar' ? 'أرشفة الكورس' : 'Archive'}
                   >
@@ -2190,7 +2393,7 @@ export function AdminDashboard({
           })}
         </div>
 
-        <ConfirmDeleteModal open={Boolean(deleteTarget)} onConfirm={confirmSoftDelete} onClose={() => setDeleteTarget(null)} />
+        {confirmDeleteModalNode}
       </div>
     );
   }
@@ -2513,17 +2716,21 @@ export function AdminDashboard({
   }
 
   if (activeTab === 'announcements') {
+    const effectiveTargetCourseId = data.courses.some((c) => String(c.id) === newAnn.target_course_id)
+      ? newAnn.target_course_id
+      : String(data.courses[0]?.id || '');
+
     const createAnnouncement = async (e: React.FormEvent) => {
       e.preventDefault();
       await apiFetch('/api/admin/announcements', {
         method: 'POST',
         body: JSON.stringify({
           ...newAnn,
-          target_course_id: newAnn.target_scope === 'course' ? Number(newAnn.target_course_id) : undefined,
+          target_course_id: newAnn.target_scope === 'course' && effectiveTargetCourseId ? Number(effectiveTargetCourseId) : undefined,
         }),
       });
       toast(lang === 'ar' ? 'تم إرسال الإعلان للمستهدفين' : 'Announcement published to targets', 'success');
-      setNewAnn({ title_ar: '', body_ar: '', target_scope: 'all_students', target_course_id: '1', student_ids: [] });
+      setNewAnn({ title_ar: '', body_ar: '', target_scope: 'all_students', target_course_id: String(data.courses[0]?.id || ''), student_ids: [] });
       loadData();
     };
 
@@ -2546,7 +2753,7 @@ export function AdminDashboard({
             </div>
 
             {newAnn.target_scope === 'course' && (
-              <select value={newAnn.target_course_id} onChange={(e) => setNewAnn({ ...newAnn, target_course_id: e.target.value })} className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+              <select value={effectiveTargetCourseId} onChange={(e) => setNewAnn({ ...newAnn, target_course_id: e.target.value })} className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
                 {data.courses.map((c) => <option key={c.id} value={c.id}>{c.title_ar}</option>)}
               </select>
             )}
@@ -2584,8 +2791,24 @@ export function AdminDashboard({
             { key: 'scope', header: lang === 'ar' ? 'الاستهداف' : 'Target', render: (r) => r.target_scope },
             { key: 'course', header: lang === 'ar' ? 'الحلقة' : 'Course', render: (r) => r.course_title_ar || '—' },
             { key: 'date', header: lang === 'ar' ? 'التاريخ' : 'Date', render: (r) => <span className="font-mono-tabular">{String(r.created_at).slice(0, 10)}</span> },
+            {
+              key: 'act',
+              header: '',
+              align: 'end',
+              render: (r) => (
+                <button
+                  type="button"
+                  onClick={() => setDeleteTarget({ type: 'announcements', id: r.id, label: r.title_ar })}
+                  className="p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 rounded-lg cursor-pointer"
+                  title={lang === 'ar' ? 'حذف الإعلان' : 'Delete Announcement'}
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              ),
+            },
           ]}
         />
+        {confirmDeleteModalNode}
       </div>
     );
   }
@@ -2875,9 +3098,23 @@ export function AdminDashboard({
   }
 
   if (activeTab === 'certificates') {
+    const effectiveCertStudentId = data.students.some((s) => String(s.id) === newCert.student_id)
+      ? newCert.student_id
+      : String(data.students[0]?.id || '');
+    const effectiveCertCourseId = data.courses.some((c) => String(c.id) === newCert.course_id)
+      ? newCert.course_id
+      : String(data.courses[0]?.id || '');
+
     const issueCert = async (e: React.FormEvent) => {
       e.preventDefault();
-      const res = await apiFetch<{ verification_code: string }>('/api/admin/certificates', { method: 'POST', body: JSON.stringify(newCert) });
+      if (!effectiveCertStudentId || !effectiveCertCourseId) {
+        toast(lang === 'ar' ? 'يجب توفر طالب وحلقة لإصدار الشهادة' : 'Student and course are required', 'error');
+        return;
+      }
+      const res = await apiFetch<{ verification_code: string }>('/api/admin/certificates', {
+        method: 'POST',
+        body: JSON.stringify({ ...newCert, student_id: effectiveCertStudentId, course_id: effectiveCertCourseId }),
+      });
       toast(`${lang === 'ar' ? 'صدرت الشهادة برقم:' : 'Certificate issued:'} ${res.verification_code}`, 'success');
       loadData();
     };
@@ -2893,10 +3130,12 @@ export function AdminDashboard({
         <Card className="p-6 space-y-4">
           <h2 className="text-lg font-extrabold">{lang === 'ar' ? 'إصدار شهادة برقم تحقق فريد' : 'Issue Verifiable Certificate'}</h2>
           <form onSubmit={issueCert} className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-            <select value={newCert.student_id} onChange={(e) => setNewCert({ ...newCert, student_id: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+            <select value={effectiveCertStudentId} onChange={(e) => setNewCert({ ...newCert, student_id: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+              {data.students.length === 0 && <option value="">{lang === 'ar' ? 'لا يوجد طلاب' : 'No students'}</option>}
               {data.students.map((s) => <option key={s.id} value={s.id}>{s.full_name_ar}</option>)}
             </select>
-            <select value={newCert.course_id} onChange={(e) => setNewCert({ ...newCert, course_id: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+            <select value={effectiveCertCourseId} onChange={(e) => setNewCert({ ...newCert, course_id: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+              {data.courses.length === 0 && <option value="">{lang === 'ar' ? 'لا توجد كورسات' : 'No courses'}</option>}
               {data.courses.map((c) => <option key={c.id} value={c.id}>{c.title_ar}</option>)}
             </select>
             <input placeholder={lang === 'ar' ? 'عنوان الشهادة' : 'Title'} value={newCert.title_ar} onChange={(e) => setNewCert({ ...newCert, title_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
@@ -2939,9 +3178,18 @@ export function AdminDashboard({
                   >
                     <Download className="w-4 h-4" />
                   </button>
-                  {!r.revoked_at && (
+                  {!r.revoked_at ? (
                     <button onClick={() => revokeCert(r.id)} className="text-xs font-bold text-red-600 hover:underline cursor-pointer">
                       {lang === 'ar' ? 'إلغاء' : 'Revoke'}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setDeleteTarget({ type: 'revoked_certificate', id: r.id, label: r.verification_code })}
+                      className="p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 rounded-lg cursor-pointer"
+                      title={lang === 'ar' ? 'حذف الشهادة الملغاة' : 'Delete Revoked Certificate'}
+                    >
+                      <Trash2 className="w-4 h-4" />
                     </button>
                   )}
                 </div>
@@ -2949,15 +3197,24 @@ export function AdminDashboard({
             },
           ]}
         />
+        {confirmDeleteModalNode}
       </div>
     );
   }
 
   if (activeTab === 'payroll') {
+    const effectivePayTeacherId = data.teachers.some((t) => String(t.id) === newPay.teacher_id)
+      ? newPay.teacher_id
+      : String(data.teachers[0]?.id || '');
+
     const createPayroll = async (e: React.FormEvent) => {
       e.preventDefault();
+      if (!effectivePayTeacherId) {
+        toast(lang === 'ar' ? 'لا يوجد معلمون نشطون' : 'No active teachers', 'error');
+        return;
+      }
       try {
-        await apiFetch('/api/admin/payroll', { method: 'POST', body: JSON.stringify(newPay) });
+        await apiFetch('/api/admin/payroll', { method: 'POST', body: JSON.stringify({ ...newPay, teacher_id: effectivePayTeacherId }) });
         toast(lang === 'ar' ? 'تم إنشاء مسير الراتب' : 'Payroll created', 'success');
         loadData();
       } catch (err: unknown) {
@@ -2983,7 +3240,8 @@ export function AdminDashboard({
             </p>
           </div>
           <form onSubmit={createPayroll} className="grid grid-cols-1 sm:grid-cols-5 gap-3">
-            <select value={newPay.teacher_id} onChange={(e) => setNewPay({ ...newPay, teacher_id: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+            <select value={effectivePayTeacherId} onChange={(e) => setNewPay({ ...newPay, teacher_id: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
+              {data.teachers.length === 0 && <option value="">{lang === 'ar' ? 'لا يوجد معلمون' : 'No teachers'}</option>}
               {data.teachers.map((t) => <option key={t.id} value={t.id}>{t.name_ar}</option>)}
             </select>
             <input type="month" value={newPay.month_year} onChange={(e) => setNewPay({ ...newPay, month_year: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm font-mono-tabular" />
@@ -3014,8 +3272,31 @@ export function AdminDashboard({
                   </button>
                 ),
             },
+            {
+              key: 'act',
+              header: '',
+              align: 'end',
+              render: (r) => (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setDeleteTarget({
+                      type: 'payroll',
+                      id: r.id,
+                      label: `${r.teacher_name_ar} · ${r.month_year}`,
+                      meta: { isPaid: r.status === 'paid' },
+                    })
+                  }
+                  className="p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 rounded-lg cursor-pointer"
+                  title={lang === 'ar' ? 'حذف سجل الراتب' : 'Delete Payroll'}
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              ),
+            },
           ]}
         />
+        {confirmDeleteModalNode}
       </div>
     );
   }
@@ -3071,7 +3352,19 @@ export function AdminDashboard({
   if (activeTab === 'audit') {
     return (
       <div className="space-y-4">
-        <h2 className="text-xl font-extrabold">{lang === 'ar' ? 'سجل العمليات (Audit Logs)' : 'System Audit Logs'}</h2>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h2 className="text-xl font-extrabold">{lang === 'ar' ? 'سجل العمليات (Audit Logs)' : 'System Audit Logs'}</h2>
+          {data.auditLogs.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setDeleteTarget({ type: 'audit_logs_all' })}
+              className="inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-bold bg-red-700 hover:bg-red-800 text-white cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>{lang === 'ar' ? 'مسح جميع السجلات' : 'Clear All Logs'}</span>
+            </button>
+          )}
+        </div>
         <ResponsiveTable
           data={data.auditLogs}
           emptyTitle={lang === 'ar' ? 'السجل فارغ' : 'No audit logs'}
@@ -3080,8 +3373,24 @@ export function AdminDashboard({
             { key: 'actor', header: lang === 'ar' ? 'المنفذ' : 'Actor', render: (r) => r.actor_name },
             { key: 'action', header: lang === 'ar' ? 'الإجراء' : 'Action', render: (r) => <span className="font-mono-tabular text-xs font-bold">{r.action}</span> },
             { key: 'entity', header: lang === 'ar' ? 'الكيان' : 'Entity', render: (r) => `${r.entity_type} #${r.entity_id}` },
+            {
+              key: 'act',
+              header: '',
+              align: 'end',
+              render: (r) => (
+                <button
+                  type="button"
+                  onClick={() => setDeleteTarget({ type: 'audit_log', id: r.id, label: `${r.action} #${r.id}` })}
+                  className="p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 rounded-lg cursor-pointer"
+                  title={lang === 'ar' ? 'حذف السجل' : 'Delete Log'}
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              ),
+            },
           ]}
         />
+        {confirmDeleteModalNode}
       </div>
     );
   }
@@ -3232,20 +3541,32 @@ export function AdminDashboard({
           },
           {
             key: 'actions',
-            header: lang === 'ar' ? 'كلمة المرور' : 'Password',
+            header: lang === 'ar' ? 'الإجراءات' : 'Actions',
+            align: 'end',
             render: (r) => (
-              <button
-                type="button"
-                onClick={() => {
-                  setResetTargetUser({ id: r.id, email: r.email, full_name: r.full_name });
-                  setAdminNewPassword('');
-                  setShowAdminNewPassword(false);
-                }}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#13284A] hover:border-[#C98A1E] px-2.5 py-1 text-xs font-bold cursor-pointer"
-              >
-                <KeyRound className="w-3.5 h-3.5 text-[#C98A1E]" />
-                <span>{lang === 'ar' ? 'تعيين كلمة مرور' : 'Set Password'}</span>
-              </button>
+              <div className="inline-flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setResetTargetUser({ id: r.id, email: r.email, full_name: r.full_name });
+                    setAdminNewPassword('');
+                    setShowAdminNewPassword(false);
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#13284A] hover:border-[#C98A1E] px-2.5 py-1 text-xs font-bold cursor-pointer"
+                >
+                  <KeyRound className="w-3.5 h-3.5 text-[#C98A1E]" />
+                  <span>{lang === 'ar' ? 'تعيين كلمة مرور' : 'Set Password'}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={String(r.id) === String(user?.id)}
+                  onClick={() => setDeleteTarget({ type: 'user', id: r.id, label: `${r.full_name} · ${r.email}` })}
+                  className="p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 rounded-lg cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
+                  title={lang === 'ar' ? 'حذف المستخدم نهائياً' : 'Delete User Permanently'}
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
             ),
           },
         ]}
@@ -3474,6 +3795,7 @@ export function AdminDashboard({
           {schemaSql || 'Loading supabase_schema.sql...'}
         </pre>
       </Card>
+      {confirmDeleteModalNode}
     </div>
   );
 }

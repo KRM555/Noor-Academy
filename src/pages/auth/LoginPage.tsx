@@ -54,6 +54,7 @@ export function LoginPage({
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [showGuardianPassword, setShowGuardianPassword] = useState(false);
+  const [showGuardianConfirm, setShowGuardianConfirm] = useState(false);
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
   const [guardianGoogleLoading, setGuardianGoogleLoading] = useState(false);
@@ -70,6 +71,7 @@ export function LoginPage({
     email: '',
     phone: '',
     password: '',
+    confirmPassword: '',
   });
 
   const [forgotOpen, setForgotOpen] = useState(false);
@@ -152,6 +154,16 @@ export function LoginPage({
         ? 'طلبك ما زال قيد المراجعة من إدارة الأكاديمية. ستتمكن من الدخول فور الموافقة وتفعيل الحساب.'
         : raw;
     }
+    if (raw.includes('PORTAL_ROLE_MISMATCH')) {
+      return lang === 'ar'
+        ? 'هذا الحساب لا ينتمي إلى البوابة المختارة. تأكد من اختيار الصفة الصحيحة (طالب · معلم · ولي أمر · إدارة).'
+        : 'This account belongs to a different portal. Please select the matching role tab.';
+    }
+    if (raw.includes('GUARDIAN_PASSWORD_REQUIRED') || lower.includes('guardian portal requires')) {
+      return lang === 'ar'
+        ? 'للدخول إلى بوابة ولي الأمر يرجى تفعيل حساب ولي الأمر أولاً عبر تبويب «تفعيل بكود الطالب» وتعيين كلمة مرور خاصة بولي الأمر.'
+        : 'Please activate Guardian access first via "Activate with Code" and set a dedicated Guardian password.';
+    }
     if (lower.includes('google sign-in without an email password') || raw.includes('GOOGLE_ONLY_ACCOUNT')) {
       return lang === 'ar'
         ? 'هذا البريد مسجّل عبر Google بدون كلمة مرور مستقلة بعد. اضغط «الدخول بحساب Google» أو استخدم «هل نسيت كلمة المرور؟» لتعيين كلمة مرور.'
@@ -159,8 +171,8 @@ export function LoginPage({
     }
     if (lower === 'invalid credentials') {
       return lang === 'ar'
-        ? 'البريد الإلكتروني أو كلمة المرور غير صحيحة. تأكد من لغة لوحة المفاتيح أو اضغط «هل نسيت كلمة المرور؟» لتعيين كلمة مرور جديدة.'
-        : 'Invalid email or password. Please check your spelling/keyboard layout or use Forgot Password.';
+        ? 'البريد الإلكتروني أو كلمة المرور غير صحيحة. تأكد من البوابة المختارة ومن لغة لوحة المفاتيح أو اضغط «هل نسيت كلمة المرور؟».'
+        : 'Invalid email or password for the selected portal. Check spelling or use Forgot Password.';
     }
     return raw;
   };
@@ -170,7 +182,7 @@ export function LoginPage({
     setLoading(true);
     setPendingNotice(false);
     try {
-      await loginWithCredentials(email, password);
+      await loginWithCredentials(email, password, selectedPortal);
       toast(lang === 'ar' ? 'تم تسجيل الدخول بنجاح' : 'Signed in successfully', 'success');
       onSuccess();
     } catch (err: unknown) {
@@ -182,6 +194,14 @@ export function LoginPage({
 
   const handleGuardianRegister = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (guardianForm.password.length < 8) {
+      toast(lang === 'ar' ? 'كلمة مرور ولي الأمر يجب أن تكون 8 أحرف على الأقل' : 'Guardian password must be at least 8 characters', 'error');
+      return;
+    }
+    if (guardianForm.password !== guardianForm.confirmPassword) {
+      toast(lang === 'ar' ? 'كلمتا مرور ولي الأمر غير متطابقتين' : 'Guardian passwords do not match', 'error');
+      return;
+    }
     setLoading(true);
     try {
       const res = await apiFetch<{ status: string; request_id: number; student_code: string; email: string }>(
@@ -189,13 +209,17 @@ export function LoginPage({
         {
           method: 'POST',
           body: JSON.stringify({
-            ...guardianForm,
+            full_name: guardianForm.full_name,
+            student_code: guardianForm.student_code,
+            email: guardianForm.email,
+            phone: guardianForm.phone,
+            password: guardianForm.password,
             ...(guardianGoogleToken ? { google_access_token: guardianGoogleToken } : {}),
           }),
         }
       );
       setGuardianPendingInfo({ student_code: res.student_code, email: res.email });
-      setGuardianForm((prev) => ({ ...prev, password: '' }));
+      setGuardianForm((prev) => ({ ...prev, password: '', confirmPassword: '' }));
       setGuardianGoogleToken(null);
       toast(
         lang === 'ar'
@@ -276,7 +300,7 @@ export function LoginPage({
         | { status: 'needs_registration'; googleProfile: { email: string; full_name: string } }
       >('/api/auth/google', {
         method: 'POST',
-        body: JSON.stringify({ access_token: accessToken, intent: 'login' }),
+        body: JSON.stringify({ access_token: accessToken, intent: 'login', portalRole: selectedPortal }),
       });
 
       if (res.status === 'authenticated') {
@@ -848,8 +872,8 @@ export function LoginPage({
             <div className="rounded-xl p-3 bg-[#F2EFE6] dark:bg-[#13284A] border border-[#E5DEC9] dark:border-[#233C63] text-xs text-slate-600 dark:text-slate-300 leading-relaxed space-y-2">
               <p>
                 {lang === 'ar'
-                  ? 'أدخل كود الطالب الخاص بابنك مع البريد الإلكتروني المسجل لولي الأمر وكلمة المرور التي تريدها. سيتم مراجعة الطلب واعتماده من إدارة الأكاديمية لتفعيل الحساب.'
-                  : 'Enter your child Student Code alongside the registered Guardian Email and your new password. Academy administration approval activates your account.'}
+                  ? 'أدخل البريد الإلكتروني المسجّل للطالب / ولي الأمر مع كود الطالب، وعيّن كلمة مرور جديدة خاصة بولي الأمر لأول مرة. بعد موافقة الإدارة، يمكنك الدخول من بوابة «ولي أمر» بنفس البريد وكلمة مرور ولي الأمر دون التأثير على حساب الطالب.'
+                  : 'Enter the registered Student / Guardian email and Student Code, then set a dedicated Guardian password for first-time activation. After approval, sign in under Guardian using that email and your dedicated Guardian password.'}
               </p>
               {googleEnabled && (
                 <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-[#E5DEC9] dark:border-[#233C63]">
@@ -908,39 +932,65 @@ export function LoginPage({
               </div>
             </div>
             <div className="space-y-1">
-              <label className="text-xs font-bold">{lang === 'ar' ? 'البريد الإلكتروني المسجل لولي الأمر *' : 'Registered Guardian Email *'}</label>
+              <label className="text-xs font-bold">{lang === 'ar' ? 'البريد الإلكتروني المسجّل للطالب / ولي الأمر *' : 'Registered Student / Guardian Email *'}</label>
               <input
                 type="email"
                 dir="ltr"
                 required
                 value={guardianForm.email}
                 onChange={(e) => setGuardianForm({ ...guardianForm, email: e.target.value })}
-                placeholder="parent@example.com"
+                placeholder="email@example.com"
                 className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3.5 py-2.5 text-sm"
               />
             </div>
-            <div className="space-y-1">
-              <label className="text-xs font-bold">{lang === 'ar' ? 'كلمة المرور الجديدة (8 أحرف فأكثر) *' : 'Create Password (min 8 chars) *'}</label>
-              <div className="relative">
-                <input
-                  type={showGuardianPassword ? 'text' : 'password'}
-                  dir="ltr"
-                  autoComplete="new-password"
-                  required
-                  minLength={8}
-                  value={guardianForm.password}
-                  onChange={(e) => setGuardianForm({ ...guardianForm, password: e.target.value })}
-                  placeholder="••••••••"
-                  className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] pl-3.5 pr-10 py-2.5 text-sm"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowGuardianPassword((v) => !v)}
-                  aria-label={showGuardianPassword ? 'Hide password' : 'Show password'}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-[#0F213E] dark:hover:text-[#F8F5EC] cursor-pointer"
-                >
-                  {showGuardianPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </button>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <label className="text-xs font-bold">{lang === 'ar' ? 'كلمة مرور ولي الأمر الجديدة (8+ أحرف) *' : 'Guardian Password (min 8 chars) *'}</label>
+                <div className="relative">
+                  <input
+                    type={showGuardianPassword ? 'text' : 'password'}
+                    dir="ltr"
+                    autoComplete="new-password"
+                    required
+                    minLength={8}
+                    value={guardianForm.password}
+                    onChange={(e) => setGuardianForm({ ...guardianForm, password: e.target.value })}
+                    placeholder="••••••••"
+                    className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] pl-3.5 pr-10 py-2.5 text-sm"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowGuardianPassword((v) => !v)}
+                    aria-label={showGuardianPassword ? 'Hide password' : 'Show password'}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-[#0F213E] dark:hover:text-[#F8F5EC] cursor-pointer"
+                  >
+                    {showGuardianPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-bold">{lang === 'ar' ? 'تأكيد كلمة مرور ولي الأمر *' : 'Confirm Guardian Password *'}</label>
+                <div className="relative">
+                  <input
+                    type={showGuardianConfirm ? 'text' : 'password'}
+                    dir="ltr"
+                    autoComplete="new-password"
+                    required
+                    minLength={8}
+                    value={guardianForm.confirmPassword}
+                    onChange={(e) => setGuardianForm({ ...guardianForm, confirmPassword: e.target.value })}
+                    placeholder="••••••••"
+                    className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] pl-3.5 pr-10 py-2.5 text-sm"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowGuardianConfirm((v) => !v)}
+                    aria-label={showGuardianConfirm ? 'Hide password' : 'Show password'}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-[#0F213E] dark:hover:text-[#F8F5EC] cursor-pointer"
+                  >
+                    {showGuardianConfirm ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
               </div>
             </div>
             <PrimaryButton type="submit" disabled={loading} className="w-full">

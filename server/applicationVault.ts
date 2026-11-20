@@ -38,9 +38,24 @@ export interface GuardianRequestRecord {
   phone: string;
   relation: string;
   status: 'pending' | 'approved' | 'rejected';
+  shared_student_email?: boolean;
   created_at: string;
   reviewed_by?: string | null;
   reviewed_at?: string | null;
+}
+
+export interface GuardianAuthRecord {
+  guardian_id: number;
+  email: string;
+  full_name: string;
+  phone: string;
+  relation: string;
+  linked_profile_id: string | null;
+  password_salt: string;
+  password_hash: string;
+  status: 'pending' | 'approved' | 'rejected';
+  created_at: string;
+  updated_at: string;
 }
 
 export interface CourseMetaRecord {
@@ -201,12 +216,72 @@ export async function listGuardianRequests(sb: SupabaseClient): Promise<Guardian
     .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 }
 
+export async function deleteAdmissionMeta(sb: SupabaseClient, admissionId: number): Promise<void> {
+  await ensureApplicationVaultBucket(sb);
+  await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`admissions/${admissionId}.json`]).catch(() => {});
+}
+
+export async function deleteTeacherApplication(sb: SupabaseClient, id: number): Promise<void> {
+  await ensureApplicationVaultBucket(sb);
+  await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`teacher-applications/${id}.json`]).catch(() => {});
+}
+
+export async function deleteGuardianRequest(sb: SupabaseClient, id: number): Promise<void> {
+  await ensureApplicationVaultBucket(sb);
+  await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`guardian-requests/${id}.json`]).catch(() => {});
+}
+
+export function hashVaultPassword(password: string): { salt: string; hash: string } {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return { salt, hash };
+}
+
+export function verifyVaultPassword(password: string, salt: string, expectedHash: string): boolean {
+  try {
+    if (!salt || !expectedHash) return false;
+    const derived = crypto.scryptSync(password, salt, 64);
+    const expected = Buffer.from(expectedHash, 'hex');
+    if (derived.length !== expected.length) return false;
+    return crypto.timingSafeEqual(derived, expected);
+  } catch {
+    return false;
+  }
+}
+
+export async function saveGuardianAuth(sb: SupabaseClient, record: GuardianAuthRecord): Promise<void> {
+  await writeJsonToVault(sb, `guardian-auth/${record.guardian_id}.json`, record);
+}
+
+export async function getGuardianAuth(sb: SupabaseClient, guardianId: number): Promise<GuardianAuthRecord | null> {
+  return readJsonFromVault<GuardianAuthRecord>(sb, `guardian-auth/${guardianId}.json`);
+}
+
+export async function deleteGuardianAuth(sb: SupabaseClient, guardianId: number): Promise<void> {
+  await ensureApplicationVaultBucket(sb);
+  await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`guardian-auth/${guardianId}.json`]).catch(() => {});
+}
+
+export async function listGuardianAuths(sb: SupabaseClient): Promise<GuardianAuthRecord[]> {
+  const files = await listAllVaultFiles(sb, 'guardian-auth');
+  if (!files.length) return [];
+  const rows = await Promise.all(
+    files.map((f) => readJsonFromVault<GuardianAuthRecord>(sb, `guardian-auth/${f.name}`))
+  );
+  return rows.filter((r): r is GuardianAuthRecord => Boolean(r && typeof r.guardian_id === 'number'));
+}
+
 export async function saveCourseMeta(sb: SupabaseClient, record: CourseMetaRecord): Promise<void> {
   await writeJsonToVault(sb, `course-meta/${record.course_id}.json`, record);
 }
 
 export async function getCourseMeta(sb: SupabaseClient, courseId: number): Promise<CourseMetaRecord | null> {
   return readJsonFromVault<CourseMetaRecord>(sb, `course-meta/${courseId}.json`);
+}
+
+export async function deleteCourseMeta(sb: SupabaseClient, courseId: number): Promise<void> {
+  await ensureApplicationVaultBucket(sb);
+  await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`course-meta/${courseId}.json`]).catch(() => {});
 }
 
 export async function listCourseMetas(sb: SupabaseClient): Promise<Map<number, CourseMetaRecord>> {
@@ -263,6 +338,11 @@ export async function saveLessonMeta(sb: SupabaseClient, record: LessonMetaRecor
 
 export async function getLessonMeta(sb: SupabaseClient, lessonId: number): Promise<LessonMetaRecord | null> {
   return readJsonFromVault<LessonMetaRecord>(sb, `lesson-meta/${lessonId}.json`);
+}
+
+export async function deleteLessonMeta(sb: SupabaseClient, lessonId: number): Promise<void> {
+  await ensureApplicationVaultBucket(sb);
+  await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`lesson-meta/${lessonId}.json`]).catch(() => {});
 }
 
 export async function listLessonMetas(sb: SupabaseClient): Promise<Map<number, LessonMetaRecord>> {

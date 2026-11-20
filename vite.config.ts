@@ -112,7 +112,7 @@ export default defineConfig(() => {
                 networkTimeoutSeconds: 4,
                 expiration: {
                   maxEntries: 25,
-                  maxAgeSeconds: 60 * 60 * 24,
+                  maxAgeSeconds: 60 * 60,
                 },
                 cacheableResponse: {
                   statuses: [0, 200],
@@ -122,7 +122,7 @@ export default defineConfig(() => {
           ],
         },
         devOptions: {
-          enabled: true,
+          enabled: false,
           type: 'module',
         },
       }),

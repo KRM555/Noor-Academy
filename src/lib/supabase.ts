@@ -76,6 +76,11 @@ export function waitForGoogleOAuthToken(
     const cleanup = () => {
       window.removeEventListener('message', onMessage);
       window.removeEventListener('storage', onStorage);
+      try {
+        localStorage.removeItem('nb_google_oauth_result');
+      } catch {
+        // ignore
+      }
       if (channel) {
         try {
           channel.close();
@@ -122,6 +127,11 @@ export function waitForGoogleOAuthToken(
       if (event.key !== 'nb_google_oauth_result' || !event.newValue) return;
       try {
         const parsed = JSON.parse(event.newValue) as { state?: string; access_token?: string; error?: string };
+        try {
+          localStorage.removeItem('nb_google_oauth_result');
+        } catch {
+          // ignore
+        }
         handlePayload({ type: 'NB_GOOGLE_OAUTH', ...parsed });
       } catch {
         // ignore

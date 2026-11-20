@@ -70,47 +70,66 @@ export function CoursesPage({
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        {courses.map((c) => (
-          <Card key={c.id} className="overflow-hidden flex flex-col justify-between">
-            <div>
-              <div className="aspect-[16/10] bg-[#F2EFE6] dark:bg-[#13284A]">
-                <ResilientImage
-                  src={getCourseImageUrl(c.title_ar, c.cover_url)}
-                  alt={tField(c as unknown as Record<string, unknown>, 'title', lang)}
-                  className="w-full h-full object-cover"
-                />
-              </div>
-              <div className="p-6 pb-2 space-y-2.5">
-                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
-                  {tField(c as unknown as Record<string, unknown>, 'level_name', lang)} · {tField(c as unknown as Record<string, unknown>, 'teacher_name', lang)}
-                  {c.co_teacher_names_ar && c.co_teacher_names_ar.length > 0 && ` (+${c.co_teacher_names_ar.length})`}
+      {courses.length === 0 ? (
+        <Card className="p-10 text-center space-y-2">
+          <BookOpen className="w-8 h-8 text-[#C98A1E] mx-auto" />
+          <h2 className="text-lg font-bold">
+            {lang === 'ar' ? 'لا توجد دورات منشورة حالياً' : 'No Published Courses Yet'}
+          </h2>
+          <p className="text-sm text-slate-600 dark:text-slate-300 max-w-md mx-auto">
+            {lang === 'ar'
+              ? 'ستظهر الدورات هنا تلقائياً فور إضافتها من لوحة تحكم الإدارة.'
+              : 'Courses added from the academy admin dashboard will appear here automatically.'}
+          </p>
+        </Card>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {courses.map((c) => (
+            <Card key={c.id} className="overflow-hidden flex flex-col justify-between">
+              <div>
+                <div className="aspect-[16/10] bg-[#F2EFE6] dark:bg-[#13284A]">
+                  <ResilientImage
+                    src={getCourseImageUrl(c.title_ar, c.cover_url)}
+                    alt={tField(c as unknown as Record<string, unknown>, 'title', lang)}
+                    className="w-full h-full object-cover"
+                  />
                 </div>
-                <h2 className="text-lg font-bold">{tField(c as unknown as Record<string, unknown>, 'title', lang)}</h2>
-                <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
-                  {tField(c as unknown as Record<string, unknown>, 'description', lang)}
-                </p>
+                <div className="p-6 pb-2 space-y-2.5">
+                  <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                    {[
+                      tField(c as unknown as Record<string, unknown>, 'level_name', lang),
+                      tField(c as unknown as Record<string, unknown>, 'teacher_name', lang),
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')}
+                    {c.co_teacher_names_ar && c.co_teacher_names_ar.length > 0 && ` (+${c.co_teacher_names_ar.length})`}
+                  </div>
+                  <h2 className="text-lg font-bold">{tField(c as unknown as Record<string, unknown>, 'title', lang)}</h2>
+                  <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                    {tField(c as unknown as Record<string, unknown>, 'description', lang)}
+                  </p>
+                </div>
               </div>
-            </div>
-            <div className="p-6 pt-4 border-t border-[#EFEAD8] dark:border-[#1D355B] space-y-3 mt-4">
-              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
-                <span>{tField(c as unknown as Record<string, unknown>, 'schedule', lang)}</span>
-                <span className="text-sm sm:text-base font-extrabold text-[#0F213E] dark:text-[#F8F5EC] tabular-nums">
-                  {formatCoursePriceSummary(c, lang, currency)}
-                </span>
+              <div className="p-6 pt-4 border-t border-[#EFEAD8] dark:border-[#1D355B] space-y-3 mt-4">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
+                  <span>{tField(c as unknown as Record<string, unknown>, 'schedule', lang)}</span>
+                  <span className="text-sm sm:text-base font-extrabold text-[#0F213E] dark:text-[#F8F5EC] tabular-nums">
+                    {formatCoursePriceSummary(c, lang, currency)}
+                  </span>
+                </div>
+                <div className="flex gap-2">
+                  <SecondaryButton className="flex-1 text-xs py-2" onClick={() => onSelectCourse(c.id)}>
+                    {lang === 'ar' ? 'تفاصيل الدورة' : 'Details'}
+                  </SecondaryButton>
+                  <PrimaryButton className="flex-1 text-xs py-2" onClick={() => onApplyCourse(c.id)}>
+                    {t.navApply}
+                  </PrimaryButton>
+                </div>
               </div>
-              <div className="flex gap-2">
-                <SecondaryButton className="flex-1 text-xs py-2" onClick={() => onSelectCourse(c.id)}>
-                  {lang === 'ar' ? 'تفاصيل الدورة' : 'Details'}
-                </SecondaryButton>
-                <PrimaryButton className="flex-1 text-xs py-2" onClick={() => onApplyCourse(c.id)}>
-                  {t.navApply}
-                </PrimaryButton>
-              </div>
-            </div>
-          </Card>
-        ))}
-      </div>
+            </Card>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -125,7 +144,7 @@ export function CourseDetailPage({
   onBack: () => void;
 }) {
   const { lang } = useApp();
-  const { data } = useQuery({
+  const { data, isLoading, isError } = useQuery({
     queryKey: queryKeys.courseDetail(courseId),
     queryFn: () =>
       apiFetch<{
@@ -133,9 +152,29 @@ export function CourseDetailPage({
         lessons: Array<{ id: number; title_ar: string; title_en: string; lesson_date: string; duration_min: number; objectives_ar: string; objectives_en: string }>;
       }>(`/api/public/courses/${courseId}`),
     staleTime: 2 * 60 * 1000,
+    retry: 1,
   });
 
-  if (!data) return <div className="max-w-5xl mx-auto px-4 py-12"><LoadingState /></div>;
+  if (isLoading) return <div className="max-w-5xl mx-auto px-4 py-12"><LoadingState /></div>;
+  if (isError || !data) {
+    return (
+      <div className="max-w-xl mx-auto px-4 py-16">
+        <Card className="p-8 text-center space-y-4">
+          <h1 className="text-xl font-extrabold">
+            {lang === 'ar' ? 'تعذّر العثور على الدورة المطلوبة' : 'Course Not Found'}
+          </h1>
+          <p className="text-sm text-slate-600 dark:text-slate-300">
+            {lang === 'ar'
+              ? 'ربما حُذفت هذه الدورة أو حدث خطأ مؤقت في التحميل.'
+              : 'This course may have been removed or a temporary loading error occurred.'}
+          </p>
+          <SecondaryButton onClick={onBack}>
+            {lang === 'ar' ? '← العودة للدورات' : '← Back to Courses'}
+          </SecondaryButton>
+        </Card>
+      </div>
+    );
+  }
   const { course, lessons } = data;
 
   return (
@@ -170,7 +209,12 @@ export function CourseDetailPage({
               <div>
                 <div className="text-xs text-slate-500">{lang === 'ar' ? 'المعلمون المسؤولون' : 'Instructors'}</div>
                 <div className="font-bold">
-                  {tField(course as unknown as Record<string, unknown>, 'teacher_name', lang)}
+                  {tField(course as unknown as Record<string, unknown>, 'teacher_name', lang) ||
+                    ((course.co_teacher_names_ar && course.co_teacher_names_ar.length > 0)
+                      ? ''
+                      : lang === 'ar'
+                      ? 'يُحدد لاحقاً'
+                      : 'To be assigned')}
                   {course.co_teacher_names_ar && course.co_teacher_names_ar.length > 0 && (
                     <span className="block text-xs font-normal text-slate-500 mt-0.5">
                       {(lang === 'ar' ? course.co_teacher_names_ar : course.co_teacher_names_en || course.co_teacher_names_ar).join(' · ')}
@@ -240,36 +284,46 @@ export function TeachersPage({
         <h1 className="text-3xl font-extrabold">{dict[lang].teachersTitle}</h1>
         <p className="text-slate-600 dark:text-slate-300">{dict[lang].teachersSubtitle}</p>
       </div>
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        {teachers.map((t) => (
-          <Card key={t.id} className="overflow-hidden flex flex-col">
-            <div className="aspect-[4/3] bg-[#F2EFE6] dark:bg-[#13284A]">
-              <ResilientImage
-                src={t.avatar_url}
-                alt={tField(t as unknown as Record<string, unknown>, 'name', lang)}
-                className="w-full h-full object-cover object-top"
-              />
-            </div>
-            <div className="p-6 space-y-3 flex-1 flex flex-col justify-between">
-              <div className="space-y-2">
-                <div className="text-xs font-semibold text-[#0F766E] dark:text-[#2DD4BF]">
-                  {tField(t as unknown as Record<string, unknown>, 'specialty', lang)}
-                </div>
-                <h2 className="text-xl font-bold">{tField(t as unknown as Record<string, unknown>, 'name', lang)}</h2>
-                <p className="text-xs text-slate-500 dark:text-slate-400">
-                  {tField(t as unknown as Record<string, unknown>, 'qualifications', lang)}
-                </p>
-                <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
-                  {tField(t as unknown as Record<string, unknown>, 'bio', lang)}
-                </p>
+      {teachers.length === 0 ? (
+        <Card className="p-10 text-center space-y-2">
+          <p className="text-sm font-semibold text-slate-600 dark:text-slate-300">
+            {lang === 'ar'
+              ? 'سيتم عرض المعلمين المعتمدين هنا فور إضافتهم من لوحة الإدارة.'
+              : 'Approved teachers will appear here once added from the admin dashboard.'}
+          </p>
+        </Card>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          {teachers.map((t) => (
+            <Card key={t.id} className="overflow-hidden flex flex-col">
+              <div className="aspect-[4/3] bg-[#F2EFE6] dark:bg-[#13284A]">
+                <ResilientImage
+                  src={t.avatar_url}
+                  alt={tField(t as unknown as Record<string, unknown>, 'name', lang)}
+                  className="w-full h-full object-cover object-top"
+                />
               </div>
-              <SecondaryButton className="w-full text-xs mt-2" onClick={() => onSelectTeacher(t.id)}>
-                {lang === 'ar' ? 'الملف الشخصي والدورات' : 'Profile & Courses'}
-              </SecondaryButton>
-            </div>
-          </Card>
-        ))}
-      </div>
+              <div className="p-6 space-y-3 flex-1 flex flex-col justify-between">
+                <div className="space-y-2">
+                  <div className="text-xs font-semibold text-[#0F766E] dark:text-[#2DD4BF]">
+                    {tField(t as unknown as Record<string, unknown>, 'specialty', lang)}
+                  </div>
+                  <h2 className="text-xl font-bold">{tField(t as unknown as Record<string, unknown>, 'name', lang)}</h2>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    {tField(t as unknown as Record<string, unknown>, 'qualifications', lang)}
+                  </p>
+                  <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                    {tField(t as unknown as Record<string, unknown>, 'bio', lang)}
+                  </p>
+                </div>
+                <SecondaryButton className="w-full text-xs mt-2" onClick={() => onSelectTeacher(t.id)}>
+                  {lang === 'ar' ? 'الملف الشخصي والدورات' : 'Profile & Courses'}
+                </SecondaryButton>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -284,13 +338,33 @@ export function TeacherDetailPage({
   onBack: () => void;
 }) {
   const { lang } = useApp();
-  const { data } = useQuery({
+  const { data, isLoading, isError } = useQuery({
     queryKey: queryKeys.teacherDetail(teacherId),
     queryFn: () => apiFetch<{ teacher: Teacher; courses: Course[] }>(`/api/public/teachers/${teacherId}`),
     staleTime: 2 * 60 * 1000,
+    retry: 1,
   });
 
-  if (!data) return <div className="max-w-5xl mx-auto px-4 py-12"><LoadingState /></div>;
+  if (isLoading) return <div className="max-w-5xl mx-auto px-4 py-12"><LoadingState /></div>;
+  if (isError || !data) {
+    return (
+      <div className="max-w-xl mx-auto px-4 py-16">
+        <Card className="p-8 text-center space-y-4">
+          <h1 className="text-xl font-extrabold">
+            {lang === 'ar' ? 'ملف المعلم غير متاح' : 'Teacher Profile Not Found'}
+          </h1>
+          <p className="text-sm text-slate-600 dark:text-slate-300">
+            {lang === 'ar'
+              ? 'هذا الملف غير متاح حالياً أو تم تحديث بياناته.'
+              : 'This teacher profile is currently unavailable.'}
+          </p>
+          <SecondaryButton onClick={onBack}>
+            {lang === 'ar' ? '← العودة للمعلمين' : '← Back to Teachers'}
+          </SecondaryButton>
+        </Card>
+      </div>
+    );
+  }
   const { teacher, courses } = data;
 
   return (
@@ -411,12 +485,40 @@ export function VerifyCertificatePage() {
     setLoading(true);
     try {
       const res = await fetch(`/api/public/certificates/verify/${encodeURIComponent(trimmed)}`);
-      const data = await res.json();
+      if (res.status === 429) {
+        setResult({
+          valid: false,
+          error:
+            lang === 'ar'
+              ? 'محاولات تحقق كثيرة جداً. يرجى الانتظار قليلاً ثم المحاولة مرة أخرى.'
+              : 'Too many verification attempts. Please wait a moment and try again.',
+        });
+        return;
+      }
+      const data = await res.json().catch(() => null);
+      if (!data || typeof data.valid !== 'boolean') {
+        setResult({
+          valid: false,
+          error:
+            lang === 'ar'
+              ? 'تعذر التحقق من الشهادة حالياً. يرجى المحاولة لاحقاً.'
+              : 'Unable to verify certificate right now. Please try again shortly.',
+        });
+        return;
+      }
       setResult(data);
+    } catch {
+      setResult({
+        valid: false,
+        error:
+          lang === 'ar'
+            ? 'تعذر الاتصال بالخادم أثناء التحقق من الشهادة. تحقق من اتصالك بالإنترنت.'
+            : 'Network error while verifying certificate. Please check your connection.',
+      });
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [lang]);
 
   useEffect(() => {
     const fromQuery = new URLSearchParams(window.location.search).get('code');
@@ -497,9 +599,12 @@ export function VerifyCertificatePage() {
             </>
           ) : (
             <div className="flex items-center gap-2.5 text-red-600 dark:text-red-400 font-bold">
-              <XCircle className="w-6 h-6" />
+              <XCircle className="w-6 h-6 shrink-0" />
               <span>
-                {lang === 'ar' ? 'لم يتم العثور على شهادة سارية بهذا الرقم.' : 'No active certificate matches this code.'}
+                {result.error ||
+                  (lang === 'ar'
+                    ? 'لم يتم العثور على شهادة سارية بهذا الرقم.'
+                    : 'No active certificate matches this code.')}
               </span>
             </div>
           )}

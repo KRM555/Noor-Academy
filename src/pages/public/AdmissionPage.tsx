@@ -29,10 +29,6 @@ const studentAdmissionSchema = z
   .refine((data) => data.student_password === data.confirm_student_password, {
     path: ['confirm_student_password'],
     message: 'Passwords do not match',
-  })
-  .refine((data) => data.student_email.trim().toLowerCase() !== data.guardian_email.trim().toLowerCase(), {
-    path: ['student_email'],
-    message: 'Student email must differ from guardian email',
   });
 
 type StudentAdmissionValues = z.infer<typeof studentAdmissionSchema>;
@@ -90,6 +86,7 @@ export function AdmissionPage({
   const [showStudentConfirm, setShowStudentConfirm] = useState(false);
   const [showTeacherPass, setShowTeacherPass] = useState(false);
   const [showTeacherConfirm, setShowTeacherConfirm] = useState(false);
+  const [sameEmailForGuardian, setSameEmailForGuardian] = useState(true);
   const googleEnabled = isBrowserSupabaseConfigured();
 
   useEffect(() => {
@@ -140,6 +137,15 @@ export function AdmissionPage({
       // ignore
     }
   }, [studentForm, teacherForm]);
+
+  const watchedStudentEmail = studentForm.watch('student_email');
+  useEffect(() => {
+    if (sameEmailForGuardian && watchedStudentEmail !== undefined) {
+      studentForm.setValue('guardian_email', watchedStudentEmail, {
+        shouldValidate: Boolean(watchedStudentEmail),
+      });
+    }
+  }, [sameEmailForGuardian, watchedStudentEmail, studentForm]);
 
   const handleGooglePrefill = async () => {
     setGooglePrefillLoading(true);
@@ -391,14 +397,14 @@ export function AdmissionPage({
                   />
                   <p className="text-[11px] text-slate-500">
                     {lang === 'ar'
-                      ? 'يجب أن يكون مختلفاً عن بريد ولي الأمر حتى يتمكن كل منهما من الدخول بحساب مستقل.'
-                      : 'Must be different from Guardian Email so both portals remain separate.'}
+                      ? 'يمكن استخدام نفس البريد الإلكتروني لحساب ولي الأمر أيضاً، مع تخصيص كلمة مرور مستقلة وبوابة دخول خاصة بكل منهما.'
+                      : 'You can share this email with the Guardian portal; each portal keeps its own independent password.'}
                   </p>
                   {studentForm.formState.errors.student_email && (
                     <p className="text-xs text-red-600">
                       {lang === 'ar'
-                        ? 'يرجى إدخال بريد إلكتروني صحيح ومختلف عن بريد ولي الأمر'
-                        : 'Valid student email different from guardian email is required'}
+                        ? 'يرجى إدخال بريد إلكتروني صحيح للطالب'
+                        : 'Please enter a valid student email address'}
                     </p>
                   )}
                 </div>
@@ -488,18 +494,46 @@ export function AdmissionPage({
                 )}
               </div>
 
-              <div className="space-y-1.5 sm:col-span-2">
-                <label className="text-xs font-bold">{lang === 'ar' ? 'البريد الإلكتروني لولي الأمر (للتفعيل بكود الطالب لاحقاً) *' : 'Guardian Email (for Student Code linking) *'}</label>
-                <input
-                  type="email"
-                  dir="ltr"
-                  {...studentForm.register('guardian_email')}
-                  placeholder="parent@example.com"
-                  className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3.5 py-2.5 text-sm"
-                />
-                {studentForm.formState.errors.guardian_email && (
-                  <p className="text-xs text-red-600">{lang === 'ar' ? 'بريد إلكتروني غير صالح' : 'Valid email required'}</p>
-                )}
+              <div className="space-y-2 sm:col-span-2">
+                <label className="inline-flex items-center gap-2 text-xs font-bold text-[#0F766E] dark:text-[#2DD4BF] cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={sameEmailForGuardian}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setSameEmailForGuardian(checked);
+                      if (checked) {
+                        studentForm.setValue('guardian_email', studentForm.getValues('student_email') || '', {
+                          shouldValidate: true,
+                        });
+                      }
+                    }}
+                    className="accent-[#0F766E]"
+                  />
+                  <span>
+                    {lang === 'ar'
+                      ? 'استخدام نفس البريد الإلكتروني للطالب وولي الأمر (ببوابة وكلمة مرور مستقلة لولي الأمر لاحقاً)'
+                      : 'Use the same email for Student & Guardian (separate password per portal)'}
+                  </span>
+                </label>
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold">{lang === 'ar' ? 'البريد الإلكتروني لولي الأمر (للتفعيل بكود الطالب لاحقاً) *' : 'Guardian Email (for Student Code linking) *'}</label>
+                  <input
+                    type="email"
+                    dir="ltr"
+                    readOnly={sameEmailForGuardian}
+                    {...studentForm.register('guardian_email')}
+                    placeholder="parent@example.com"
+                    className={`w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] px-3.5 py-2.5 text-sm ${
+                      sameEmailForGuardian
+                        ? 'bg-[#F2EFE6] dark:bg-[#13284A] opacity-80'
+                        : 'bg-[#FAF8F3] dark:bg-[#091529]'
+                    }`}
+                  />
+                  {studentForm.formState.errors.guardian_email && (
+                    <p className="text-xs text-red-600">{lang === 'ar' ? 'بريد إلكتروني غير صالح' : 'Valid email required'}</p>
+                  )}
+                </div>
               </div>
 
               <div className="space-y-1.5">

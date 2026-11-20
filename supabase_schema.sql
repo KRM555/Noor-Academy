@@ -772,3 +772,39 @@ CREATE POLICY "audit_logs_admin_insert" ON public.audit_logs FOR INSERT WITH CHE
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM anon, authenticated;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon, authenticated;
+
+-- ============================================================================
+-- Student Levels Catalog Update (Level 1 / Level 2 / Level 3)
+-- ============================================================================
+UPDATE public.levels
+SET
+  code = 'LEVEL-1',
+  name_ar = 'المستوى الأول',
+  name_en = 'Level 1',
+  description_ar = 'مرحلة التأسيس الأولى لبناء المهارات الأساسية خطوة بخطوة',
+  description_en = 'First foundational level for building core skills step by step',
+  criteria_ar = 'بداية المسار أو في مرحلة التأسيس الأولى',
+  criteria_en = 'Starting path or early foundation stage'
+WHERE id = 1 OR code = 'L1-BRAEM';
+
+UPDATE public.levels
+SET
+  code = 'LEVEL-2',
+  name_ar = 'المستوى الثاني',
+  name_en = 'Level 2',
+  description_ar = 'مرحلة التطبيق المتوسط وتنمية الفهم والقراءة والتدريب العملي',
+  description_en = 'Intermediate level focused on practice, comprehension, and fluency',
+  criteria_ar = 'إتقان مبادئ المستوى الأول واجتياز التقييم المبدئي',
+  criteria_en = 'Mastery of Level 1 basics and passing initial placement'
+WHERE id = 2 OR code = 'L2-NOOR';
+
+UPDATE public.levels
+SET
+  code = 'LEVEL-3',
+  name_ar = 'المستوى الثالث',
+  name_en = 'Level 3',
+  description_ar = 'المستوى المتقدم للتعمّق والإتقان في المناهج المقررة',
+  description_en = 'Advanced level for deeper mastery across enrolled tracks',
+  criteria_ar = 'اجتياز المستوى الثاني أو تحقيق درجة متقدمة في تحديد المستوى',
+  criteria_en = 'Completion of Level 2 or advanced placement score'
+WHERE id = 3 OR code = 'L3-TAJWEED';

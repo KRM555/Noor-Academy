@@ -79,73 +79,6 @@ const WHY_US_POINTS = [
   },
 ];
 
-const EDUCATIONAL_SERVICES = [
-  {
-    title_ar: 'التأسيس واللغة العربية',
-    title_en: 'Foundations & Arabic Language',
-    desc_ar: 'نور البيان، القراءة، الكتابة، النحو والإملاء.',
-    desc_en: 'Noor Al-Bayan, reading fluency, writing, grammar, and spelling.',
-    image: '/assets/courses/course_arabic_foundations.jpg',
-    courseMatchKeyword: 'نور البيان',
-  },
-  {
-    title_ar: 'تعليم اللغات',
-    title_en: 'World Languages',
-    desc_ar: 'الإنجليزية والعربية والفرنسية والألمانية وغيرها.',
-    desc_en: 'English, Arabic, French, German, and conversational fluency.',
-    image: '/assets/courses/course_languages.jpg',
-    courseMatchKeyword: 'اللغات',
-  },
-  {
-    title_ar: 'المناهج الدولية',
-    title_en: 'International Curricula',
-    desc_ar: 'المناهج البريطانية والأمريكية والدولية.',
-    desc_en: 'British, American, and international school tracks.',
-    image: '/assets/courses/course_international.jpg',
-    courseMatchKeyword: 'المناهج الدولية',
-  },
-  {
-    title_ar: 'جميع المواد الدراسية',
-    title_en: 'All School Subjects',
-    desc_ar: 'رياضيات وعلوم وعربي وإنجليزي وجميع المواد.',
-    desc_en: 'Mathematics, Science, Arabic, English, and core subjects.',
-    image: '/assets/courses/course_all_subjects.jpg',
-    courseMatchKeyword: 'جميع المواد',
-  },
-  {
-    title_ar: 'القرآن والعلوم الإسلامية',
-    title_en: 'Quran & Islamic Studies',
-    desc_ar: 'تحفيظ وتجويد وقيم إسلامية وسيرة نبوية.',
-    desc_en: 'Quran memorization, Tajweed, Islamic values, and Prophetic biography.',
-    image: '/assets/courses/course_quran.jpg',
-    courseMatchKeyword: 'القرآن',
-  },
-  {
-    title_ar: 'الحساب الذهني وتنمية المهارات',
-    title_en: 'Mental Math & Brain Skills',
-    desc_ar: 'تنمية التركيز والذكاء والقدرات العقلية.',
-    desc_en: 'Developing concentration, intelligence, and cognitive speed.',
-    image: '/assets/courses/course_mental_math.jpg',
-    courseMatchKeyword: 'الحساب الذهني',
-  },
-  {
-    title_ar: 'تنمية النطق والمهارات',
-    title_en: 'Speech & Communication Skills',
-    desc_ar: 'برامج متخصصة لتنمية التواصل والمهارات.',
-    desc_en: 'Specialized programs for clear articulation and communication.',
-    image: '/assets/courses/course_speech_skills.jpg',
-    courseMatchKeyword: 'النطق',
-  },
-  {
-    title_ar: 'الدعم والمتابعة التعليمية',
-    title_en: 'Academic Support & Follow-up',
-    desc_ar: 'متابعة مستوى الطالب وتطوير أدائه باستمرار.',
-    desc_en: 'Ongoing student performance coaching and parent updates.',
-    image: '/assets/courses/course_academic_support.jpg',
-    courseMatchKeyword: 'الدعم',
-  },
-];
-
 const FAQ_ITEMS = [
   {
     q_ar: 'ما هي الفئة العمرية المناسبة للالتحاق بأكاديمية نور وبيان؟',
@@ -349,7 +282,7 @@ export function HomePage({
     },
   ];
 
-  const featuredCourses = overview?.courses.slice(0, 8) || [];
+  const featuredCourses = overview?.courses || [];
   const teachers = overview?.teachers || [];
   const communityComments = commentsData?.comments || [];
   const suggestions = suggestionsData?.suggestions || [];
@@ -429,10 +362,10 @@ export function HomePage({
       <section className="border-b border-[#E5DEC9] dark:border-[#233C63] bg-white dark:bg-[#0F213E]">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-8 grid grid-cols-2 md:grid-cols-4 gap-6">
           {[
-            { val: overview?.stats.students ?? 3, label: t.statsStudents, suffix: '+' },
-            { val: overview?.stats.teachers ?? 3, label: t.statsTeachers, suffix: '' },
-            { val: overview?.stats.courses ?? 10, label: t.statsCourses, suffix: '' },
-            { val: overview?.stats.lessons ?? 4, label: t.statsLessons, suffix: '+' },
+            { val: overview?.stats.students ?? 0, label: t.statsStudents, suffix: (overview?.stats.students ?? 0) > 0 ? '+' : '' },
+            { val: overview?.stats.teachers ?? 0, label: t.statsTeachers, suffix: '' },
+            { val: overview?.stats.courses ?? 0, label: t.statsCourses, suffix: '' },
+            { val: overview?.stats.lessons ?? 0, label: t.statsLessons, suffix: (overview?.stats.lessons ?? 0) > 0 ? '+' : '' },
           ].map((stat, i) => (
             <div key={i} className="text-center md:text-start space-y-1">
               <div className="text-3xl sm:text-4xl font-extrabold text-[#0F213E] dark:text-[#F8F5EC]">
@@ -507,205 +440,155 @@ export function HomePage({
         </div>
       </section>
 
-      {/* 4. EDUCATIONAL SERVICES / ACADEMY TRACKS (قسم خدماتنا التعليمية - 8 مسارات) */}
+      {/* 4. LIVE ENROLLABLE COURSES (تظهر الدورات المضافة فعلياً فقط) */}
       <section className="bg-[#F2EFE6] dark:bg-[#0D1C36] border-y border-[#E5DEC9] dark:border-[#233C63] py-16">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 space-y-8">
           <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
             <div className="space-y-2 max-w-2xl">
-              <h2 className="text-2xl sm:text-3xl font-extrabold">
-                {lang === 'ar' ? 'خدماتنا التعليمية وبرامج الأكاديمية' : 'Our Educational Services & Programs'}
-              </h2>
-              <p className="text-sm sm:text-base text-slate-600 dark:text-slate-300">
-                {lang === 'ar'
-                  ? 'ثمانية مسارات تعليمية متكاملة تجمع بين القرآن الكريم واللغة العربية واللغات والمناهج الدولية وتنمية المهارات.'
-                  : 'Eight comprehensive tracks spanning Quran, Arabic, world languages, international curricula, mental math, and skill building.'}
-              </p>
+              <h2 className="text-2xl sm:text-3xl font-extrabold">{t.coursesTitle}</h2>
+              <p className="text-sm sm:text-base text-slate-600 dark:text-slate-300">{t.coursesSubtitle}</p>
             </div>
-            <button
-              onClick={() => onNavigate('/courses')}
-              className="text-sm font-bold text-[#0F766E] dark:text-[#2DD4BF] hover:underline whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              {lang === 'ar' ? 'استعراض كافة الدورات والأسعار ←' : 'Browse All Courses & Fees →'}
-            </button>
+            <div className="flex flex-wrap items-center gap-3 shrink-0">
+              <div className="inline-flex rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] p-1 text-xs font-bold">
+                {(
+                  [
+                    { id: 'BOTH', ar: 'ج.م + ر.س', en: 'EGP + SAR' },
+                    { id: 'EGP', ar: 'ج.م', en: 'EGP' },
+                    { id: 'SAR', ar: 'ر.س', en: 'SAR' },
+                  ] as Array<{ id: DisplayCurrency; ar: string; en: string }>
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setCurrency(opt.id)}
+                    className={`px-2.5 py-1 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                      currency === opt.id
+                        ? 'bg-[#0F213E] text-white dark:bg-[#C98A1E]'
+                        : 'text-slate-600 dark:text-slate-300 hover:text-[#0F213E]'
+                    }`}
+                  >
+                    {lang === 'ar' ? opt.ar : opt.en}
+                  </button>
+                ))}
+              </div>
+              <button
+                onClick={() => onNavigate('/courses')}
+                className="text-sm font-bold text-[#0F766E] dark:text-[#2DD4BF] hover:underline whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                {lang === 'ar' ? 'عرض كل الدورات ←' : 'View All Courses →'}
+              </button>
+            </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
-            {EDUCATIONAL_SERVICES.map((svc, idx) => {
-              const matchedCourse = overview?.courses.find((c) => c.title_ar.includes(svc.courseMatchKeyword));
-              return (
-                <FadeUp key={idx} delay={idx * 0.04}>
-                  <Card className="overflow-hidden h-full flex flex-col justify-between hover:-translate-y-1 transition-transform duration-200">
+          {featuredCourses.length === 0 ? (
+            <Card className="p-8 sm:p-10 text-center space-y-3 bg-white dark:bg-[#0F213E]">
+              <BookOpen className="w-8 h-8 text-[#C98A1E] mx-auto" />
+              <h3 className="text-lg font-bold">
+                {lang === 'ar' ? 'لا توجد دورات منشورة حالياً' : 'No Published Courses Yet'}
+              </h3>
+              <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 max-w-lg mx-auto leading-relaxed">
+                {lang === 'ar'
+                  ? 'ستظهر الدورات هنا تلقائياً فور إضافتها من لوحة تحكم الإدارة.'
+                  : 'Courses added from the Academy Admin Dashboard will automatically appear here.'}
+              </p>
+            </Card>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+              {featuredCourses.map((course, idx) => (
+                <FadeUp key={course.id} delay={idx * 0.05}>
+                  <Card className="overflow-hidden h-full flex flex-col justify-between hover:-translate-y-1 transition-transform duration-200 bg-white dark:bg-[#0F213E]">
                     <div>
                       <div className="aspect-[16/10] bg-[#FAF8F3] dark:bg-[#13284A] overflow-hidden">
                         <ResilientImage
-                          src={matchedCourse ? getCourseImageUrl(matchedCourse.title_ar, matchedCourse.cover_url) : svc.image}
-                          alt={lang === 'ar' ? svc.title_ar : svc.title_en}
+                          src={getCourseImageUrl(course.title_ar, course.cover_url)}
+                          alt={tField(course as unknown as Record<string, unknown>, 'title', lang)}
                           className="w-full h-full object-cover"
                         />
                       </div>
-                      <div className="p-4 space-y-1.5">
-                        <h3 className="text-base font-bold">
-                          {lang === 'ar' ? svc.title_ar : svc.title_en}
+                      <div className="p-5 pb-2 space-y-2.5">
+                        <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                          {[
+                            tField(course as unknown as Record<string, unknown>, 'level_name', lang),
+                            tField(course as unknown as Record<string, unknown>, 'teacher_name', lang),
+                          ]
+                            .filter(Boolean)
+                            .join(' · ')}
+                        </div>
+                        <h3 className="text-base font-bold leading-snug">
+                          {tField(course as unknown as Record<string, unknown>, 'title', lang)}
                         </h3>
-                        <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
-                          {lang === 'ar' ? svc.desc_ar : svc.desc_en}
+                        <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 line-clamp-3 leading-relaxed">
+                          {tField(course as unknown as Record<string, unknown>, 'description', lang)}
                         </p>
                       </div>
                     </div>
-                    <div className="px-4 pb-4 pt-2 flex items-center justify-between gap-2 text-xs">
-                      {matchedCourse ? (
+
+                    <div className="p-5 pt-4 mt-2 border-t border-[#EFEAD8] dark:border-[#1D355B] space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
+                        <span>{tField(course as unknown as Record<string, unknown>, 'schedule', lang)}</span>
+                        <span className="font-bold text-sm text-[#0F213E] dark:text-[#F8F5EC] tabular-nums">
+                          {formatCoursePriceSummary(course, lang, currency)}
+                        </span>
+                      </div>
+                      <div className="flex gap-2">
                         <button
-                          onClick={() => onNavigate(`/courses/${matchedCourse.id}`)}
-                          className="font-bold text-[#0F766E] dark:text-[#2DD4BF] hover:underline cursor-pointer"
+                          onClick={() => onNavigate(`/courses/${course.id}`)}
+                          className="flex-1 rounded-xl py-2 text-xs font-bold bg-[#F2EFE6] hover:bg-[#E5DEC9] dark:bg-[#162C4E] dark:hover:bg-[#1F3A66] transition-colors cursor-pointer"
                         >
-                          {lang === 'ar' ? 'تفاصيل المسار ←' : 'View Track →'}
+                          {lang === 'ar' ? 'تفاصيل الدورة' : 'Course Details'}
                         </button>
-                      ) : (
                         <button
-                          onClick={() => onNavigate('/courses')}
-                          className="font-bold text-[#0F766E] dark:text-[#2DD4BF] hover:underline cursor-pointer"
+                          onClick={() => onNavigate('/apply')}
+                          className="flex-1 rounded-xl py-2 text-xs font-bold bg-[#0F766E] hover:bg-[#0D625B] text-white transition-colors cursor-pointer"
                         >
-                          {lang === 'ar' ? 'التفاصيل ←' : 'Details →'}
+                          {t.navApply}
                         </button>
-                      )}
-                      <button
-                        onClick={() => onNavigate('/apply')}
-                        className="font-bold text-[#C98A1E] hover:underline cursor-pointer"
-                      >
-                        {t.navApply}
-                      </button>
+                      </div>
                     </div>
                   </Card>
                 </FadeUp>
-              );
-            })}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       </section>
 
-      {/* 5. LIVE ENROLLABLE COURSES */}
-      <section className="max-w-7xl mx-auto px-4 sm:px-6 py-16 space-y-8">
-        <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
-          <div className="space-y-2 max-w-2xl">
-            <h2 className="text-2xl sm:text-3xl font-extrabold">{t.coursesTitle}</h2>
-            <p className="text-sm sm:text-base text-slate-600 dark:text-slate-300">{t.coursesSubtitle}</p>
-          </div>
-          <div className="flex flex-wrap items-center gap-3 shrink-0">
-            <div className="inline-flex rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] p-1 text-xs font-bold">
-              {(
-                [
-                  { id: 'BOTH', ar: 'ج.م + ر.س', en: 'EGP + SAR' },
-                  { id: 'EGP', ar: 'ج.م', en: 'EGP' },
-                  { id: 'SAR', ar: 'ر.س', en: 'SAR' },
-                ] as Array<{ id: DisplayCurrency; ar: string; en: string }>
-              ).map((opt) => (
-                <button
-                  key={opt.id}
-                  type="button"
-                  onClick={() => setCurrency(opt.id)}
-                  className={`px-2.5 py-1 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                    currency === opt.id
-                      ? 'bg-[#0F213E] text-white dark:bg-[#C98A1E]'
-                      : 'text-slate-600 dark:text-slate-300 hover:text-[#0F213E]'
-                  }`}
-                >
-                  {lang === 'ar' ? opt.ar : opt.en}
-                </button>
-              ))}
-            </div>
-            <button
-              onClick={() => onNavigate('/courses')}
-              className="text-sm font-bold text-[#0F766E] dark:text-[#2DD4BF] hover:underline whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              {lang === 'ar' ? 'عرض كل الدورات ←' : 'View All Courses →'}
-            </button>
-          </div>
+      {/* 5. HOW WE WORK */}
+      <section className="max-w-7xl mx-auto px-4 sm:px-6 py-16 space-y-10">
+        <div className="space-y-2 max-w-2xl">
+          <h2 className="text-2xl sm:text-3xl font-extrabold">{t.howTitle}</h2>
+          <p className="text-sm sm:text-base text-slate-600 dark:text-slate-300">{t.howSubtitle}</p>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-          {featuredCourses.map((course, idx) => (
-            <FadeUp key={course.id} delay={idx * 0.05}>
-              <Card className="overflow-hidden h-full flex flex-col justify-between hover:-translate-y-1 transition-transform duration-200">
-                <div>
-                  <div className="aspect-[16/10] bg-[#FAF8F3] dark:bg-[#13284A] overflow-hidden">
-                    <ResilientImage
-                      src={getCourseImageUrl(course.title_ar, course.cover_url)}
-                      alt={tField(course as unknown as Record<string, unknown>, 'title', lang)}
-                      className="w-full h-full object-cover"
-                    />
-                  </div>
-                  <div className="p-5 pb-2 space-y-2.5">
-                    <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
-                      {tField(course as unknown as Record<string, unknown>, 'level_name', lang)}
-                      {' · '}
-                      {tField(course as unknown as Record<string, unknown>, 'teacher_name', lang)}
-                    </div>
-                    <h3 className="text-base font-bold leading-snug">
-                      {tField(course as unknown as Record<string, unknown>, 'title', lang)}
-                    </h3>
-                    <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 line-clamp-3 leading-relaxed">
-                      {tField(course as unknown as Record<string, unknown>, 'description', lang)}
-                    </p>
-                  </div>
+        <div className="relative grid grid-cols-1 md:grid-cols-4 gap-6">
+          <motion.div
+            initial={{ scaleX: 0 }}
+            whileInView={{ scaleX: 1 }}
+            viewport={{ once: true }}
+            transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
+            style={{ transformOrigin: lang === 'ar' ? 'right' : 'left' }}
+            className="hidden md:block absolute top-6 inset-x-10 h-0.5 bg-[#C98A1E]/40"
+          />
+          {steps.map((s, idx) => (
+            <FadeUp key={s.num} delay={idx * 0.08}>
+              <div className="relative space-y-3 bg-white dark:bg-[#0F213E] rounded-2xl p-5 border border-[#E5DEC9] dark:border-[#233C63]">
+                <div className="w-10 h-10 rounded-xl bg-[#0F213E] dark:bg-[#C98A1E] text-white font-mono-tabular font-bold text-sm flex items-center justify-center">
+                  {s.num}
                 </div>
-
-                <div className="p-5 pt-4 mt-2 border-t border-[#EFEAD8] dark:border-[#1D355B] space-y-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
-                    <span>{tField(course as unknown as Record<string, unknown>, 'schedule', lang)}</span>
-                    <span className="font-bold text-sm text-[#0F213E] dark:text-[#F8F5EC] tabular-nums">
-                      {formatCoursePriceSummary(course, lang, currency)}
-                    </span>
-                  </div>
-                  <button
-                    onClick={() => onNavigate(`/courses/${course.id}`)}
-                    className="w-full rounded-xl py-2 text-xs font-bold bg-[#F2EFE6] hover:bg-[#E5DEC9] dark:bg-[#162C4E] dark:hover:bg-[#1F3A66] transition-colors cursor-pointer"
-                  >
-                    {lang === 'ar' ? 'تفاصيل الحلقة' : 'Course Details'}
-                  </button>
-                </div>
-              </Card>
+                <h3 className="text-base font-bold">{lang === 'ar' ? s.title_ar : s.title_en}</h3>
+                <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                  {lang === 'ar' ? s.desc_ar : s.desc_en}
+                </p>
+              </div>
             </FadeUp>
           ))}
         </div>
       </section>
 
-      {/* 6. HOW WE WORK */}
+      {/* 6. PARENTS & GUARDIANS SECTION (قسم أولياء الأمور) */}
       <section className="bg-[#F2EFE6] dark:bg-[#0D1C36] border-y border-[#E5DEC9] dark:border-[#233C63] py-16">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 space-y-10">
-          <div className="space-y-2 max-w-2xl">
-            <h2 className="text-2xl sm:text-3xl font-extrabold">{t.howTitle}</h2>
-            <p className="text-sm sm:text-base text-slate-600 dark:text-slate-300">{t.howSubtitle}</p>
-          </div>
-
-          <div className="relative grid grid-cols-1 md:grid-cols-4 gap-6">
-            <motion.div
-              initial={{ scaleX: 0 }}
-              whileInView={{ scaleX: 1 }}
-              viewport={{ once: true }}
-              transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
-              style={{ transformOrigin: lang === 'ar' ? 'right' : 'left' }}
-              className="hidden md:block absolute top-6 inset-x-10 h-0.5 bg-[#C98A1E]/40"
-            />
-            {steps.map((s, idx) => (
-              <FadeUp key={s.num} delay={idx * 0.08}>
-                <div className="relative space-y-3 bg-white dark:bg-[#0F213E] rounded-2xl p-5 border border-[#E5DEC9] dark:border-[#233C63]">
-                  <div className="w-10 h-10 rounded-xl bg-[#0F213E] dark:bg-[#C98A1E] text-white font-mono-tabular font-bold text-sm flex items-center justify-center">
-                    {s.num}
-                  </div>
-                  <h3 className="text-base font-bold">{lang === 'ar' ? s.title_ar : s.title_en}</h3>
-                  <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
-                    {lang === 'ar' ? s.desc_ar : s.desc_en}
-                  </p>
-                </div>
-              </FadeUp>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      {/* 7. PARENTS & GUARDIANS SECTION (قسم أولياء الأمور) */}
-      <section className="max-w-7xl mx-auto px-4 sm:px-6 py-16">
-        <Card className="p-6 sm:p-10 bg-white dark:bg-[#0F213E] grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6">
+          <Card className="p-6 sm:p-10 bg-white dark:bg-[#0F213E] grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
           <div className="lg:col-span-7 space-y-4">
             <div className="inline-flex items-center gap-2 text-xs font-bold text-[#C98A1E]">
               <Heart className="w-4 h-4" />
@@ -756,10 +639,11 @@ export function HomePage({
               </div>
             ))}
           </div>
-        </Card>
+          </Card>
+        </div>
       </section>
 
-      {/* 8. TEACHERS SHOWCASE */}
+      {/* 7. TEACHERS SHOWCASE */}
       <section className="max-w-7xl mx-auto px-4 sm:px-6 py-12 space-y-8">
         <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
           <div className="space-y-2 max-w-2xl">
@@ -774,44 +658,54 @@ export function HomePage({
           </button>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          {teachers.map((teacher, idx) => (
-            <FadeUp key={teacher.id} delay={idx * 0.08}>
-              <Card className="overflow-hidden flex flex-col h-full">
-                <div className="aspect-[4/3] bg-[#F2EFE6] dark:bg-[#13284A] overflow-hidden">
-                  <ResilientImage
-                    src={teacher.avatar_url}
-                    alt={tField(teacher as unknown as Record<string, unknown>, 'name', lang)}
-                    className="w-full h-full object-cover object-top"
-                    fallbackTitle={tField(teacher as unknown as Record<string, unknown>, 'name', lang)}
-                  />
-                </div>
-                <div className="p-5 space-y-2.5 flex-1 flex flex-col justify-between">
-                  <div className="space-y-2">
-                    <div className="text-xs font-semibold text-[#0F766E] dark:text-[#2DD4BF]">
-                      {tField(teacher as unknown as Record<string, unknown>, 'specialty', lang)}
-                    </div>
-                    <h3 className="text-lg font-bold">
-                      {tField(teacher as unknown as Record<string, unknown>, 'name', lang)}
-                    </h3>
-                    <p className="text-xs text-slate-500 dark:text-slate-400">
-                      {tField(teacher as unknown as Record<string, unknown>, 'qualifications', lang)}
-                    </p>
-                    <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed line-clamp-2">
-                      {tField(teacher as unknown as Record<string, unknown>, 'bio', lang)}
-                    </p>
+        {teachers.length === 0 ? (
+          <Card className="p-8 text-center space-y-2 bg-white dark:bg-[#0F213E]">
+            <p className="text-sm font-semibold text-slate-600 dark:text-slate-300">
+              {lang === 'ar'
+                ? 'سيتم عرض المعلمين المعتمدين هنا فور إضافتهم من لوحة الإدارة.'
+                : 'Approved teachers will appear here once added from the admin dashboard.'}
+            </p>
+          </Card>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {teachers.map((teacher, idx) => (
+              <FadeUp key={teacher.id} delay={idx * 0.08}>
+                <Card className="overflow-hidden flex flex-col h-full">
+                  <div className="aspect-[4/3] bg-[#F2EFE6] dark:bg-[#13284A] overflow-hidden">
+                    <ResilientImage
+                      src={teacher.avatar_url}
+                      alt={tField(teacher as unknown as Record<string, unknown>, 'name', lang)}
+                      className="w-full h-full object-cover object-top"
+                      fallbackTitle={tField(teacher as unknown as Record<string, unknown>, 'name', lang)}
+                    />
                   </div>
-                  <button
-                    onClick={() => onNavigate(`/teachers/${teacher.id}`)}
-                    className="mt-3 text-xs font-bold text-[#C98A1E] hover:underline text-start cursor-pointer"
-                  >
-                    {lang === 'ar' ? 'عرض السيرة والدورات ←' : 'View Profile & Courses →'}
-                  </button>
-                </div>
-              </Card>
-            </FadeUp>
-          ))}
-        </div>
+                  <div className="p-5 space-y-2.5 flex-1 flex flex-col justify-between">
+                    <div className="space-y-2">
+                      <div className="text-xs font-semibold text-[#0F766E] dark:text-[#2DD4BF]">
+                        {tField(teacher as unknown as Record<string, unknown>, 'specialty', lang)}
+                      </div>
+                      <h3 className="text-lg font-bold">
+                        {tField(teacher as unknown as Record<string, unknown>, 'name', lang)}
+                      </h3>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
+                        {tField(teacher as unknown as Record<string, unknown>, 'qualifications', lang)}
+                      </p>
+                      <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed line-clamp-2">
+                        {tField(teacher as unknown as Record<string, unknown>, 'bio', lang)}
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => onNavigate(`/teachers/${teacher.id}`)}
+                      className="mt-3 text-xs font-bold text-[#C98A1E] hover:underline text-start cursor-pointer"
+                    >
+                      {lang === 'ar' ? 'عرض السيرة والدورات ←' : 'View Profile & Courses →'}
+                    </button>
+                  </div>
+                </Card>
+              </FadeUp>
+            ))}
+          </div>
+        )}
       </section>
 
       {/* 9. INTERACTIVE GAMES PREVIEW */}

@@ -24,22 +24,33 @@ import {
   saveAdmissionMeta,
   getAdmissionMeta,
   listAdmissionMetas,
+  deleteAdmissionMeta,
   generateApplicationId,
   saveTeacherApplication,
   getTeacherApplication,
   listTeacherApplications,
+  deleteTeacherApplication,
   saveGuardianRequest,
   getGuardianRequest,
   listGuardianRequests,
+  deleteGuardianRequest,
+  hashVaultPassword,
+  verifyVaultPassword,
+  saveGuardianAuth,
+  getGuardianAuth,
+  deleteGuardianAuth,
+  listGuardianAuths,
   deletePendingAuthProfileIfSafe,
   saveCourseMeta,
   getCourseMeta,
+  deleteCourseMeta,
   listCourseMetas,
   uploadCourseCoverFile,
   removeCourseCoverFile,
   readCourseCoverFile,
   saveLessonMeta,
   getLessonMeta,
+  deleteLessonMeta,
   listLessonMetas,
   type LessonMetaRecord,
 } from './server/applicationVault.ts';
@@ -51,6 +62,8 @@ import {
   getExamAttempt,
   saveExamAttempt,
   deleteExamSubmissionRecord,
+  deleteExamDataForStudent,
+  deleteExamVaultData,
   listExamSubmissionsForExam,
   uploadExamBinaryFile,
   createExamSignedUrl,
@@ -84,10 +97,36 @@ import {
 dotenv.config();
 
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-const ALLOW_DEMO_LOGIN = false;
 
 if (IS_PRODUCTION && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 24)) {
   throw new Error('FATAL: SESSION_SECRET environment variable (min 24 chars) is required in production.');
+}
+
+const configuredAppUrl = process.env.APP_URL?.trim();
+if (IS_PRODUCTION && (!configuredAppUrl || configuredAppUrl === 'MY_APP_URL')) {
+  throw new Error('FATAL: APP_URL environment variable is required in production and must not equal "MY_APP_URL".');
+}
+
+function sendInternalError(
+  res: Response,
+  logContext: string,
+  err: unknown,
+  genericMessage = 'Internal server error',
+  status = 500
+) {
+  console.error(`[${logContext}]`, err);
+  const detail = err instanceof Error ? err.message : (err as { message?: string } | null)?.message;
+  res.status(status).json({
+    error: IS_PRODUCTION ? genericMessage : detail || genericMessage,
+  });
+}
+
+function parsePositiveIntParam(raw: unknown, label = 'ID'): number {
+  const value = Number(String(raw ?? '').trim());
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new AppError(400, `Invalid ${label}`);
+  }
+  return value;
 }
 
 const TOKEN_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
@@ -99,7 +138,9 @@ if (!process.env.SESSION_SECRET) {
 requireSupabaseAdmin();
 
 const app = express();
-app.set('trust proxy', 1);
+const parsedTrustProxyHops = Number.parseInt(String(process.env.TRUST_PROXY_HOPS ?? '1').trim(), 10);
+const TRUST_PROXY_HOPS = Number.isInteger(parsedTrustProxyHops) && parsedTrustProxyHops >= 0 ? parsedTrustProxyHops : 1;
+app.set('trust proxy', TRUST_PROXY_HOPS);
 app.disable('x-powered-by');
 const UPLOAD_JSON_SUFFIXES = ['/upload-material', '/question-file', '/submit-file', '/grade', '/cover'];
 const defaultJsonParser = express.json({ limit: '256kb' });
@@ -137,13 +178,74 @@ app.use('/api', (req, res, next) => {
   if (origin && allowedOrigins.has(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-CSRF-Token');
   }
   if (req.method === 'OPTIONS') {
     res.status(204).end();
     return;
   }
+  next();
+});
+
+// Explicit Origin, Fetch-Metadata & Double-Submit CSRF protection for state-changing /api requests
+const SAFE_HTTP_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+function resolveRequestExpectedOrigin(req: Request): string | null {
+  const host = String(req.headers['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim();
+  if (!host) return null;
+  const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+  return `${proto}://${host}`;
+}
+
+app.use('/api', (req, res, next) => {
+  if (SAFE_HTTP_METHODS.has(req.method.toUpperCase())) {
+    next();
+    return;
+  }
+
+  const fetchSite = String(req.headers['sec-fetch-site'] || '').trim().toLowerCase();
+  if (fetchSite === 'cross-site') {
+    res.status(403).json({ error: 'Forbidden: cross-site state-changing request rejected' });
+    return;
+  }
+
+  const expectedOrigin = resolveRequestExpectedOrigin(req);
+  const rawOrigin = typeof req.headers.origin === 'string' ? req.headers.origin.trim().replace(/\/+$/, '') : '';
+  const rawReferer = typeof req.headers.referer === 'string' ? req.headers.referer.trim() : '';
+
+  if (rawOrigin) {
+    if (rawOrigin !== expectedOrigin && !allowedOrigins.has(rawOrigin)) {
+      res.status(403).json({ error: 'Forbidden: invalid request origin' });
+      return;
+    }
+  } else if (rawReferer) {
+    try {
+      const refOrigin = new URL(rawReferer).origin;
+      if (refOrigin !== expectedOrigin && !allowedOrigins.has(refOrigin)) {
+        res.status(403).json({ error: 'Forbidden: invalid request referer' });
+        return;
+      }
+    } catch {
+      res.status(403).json({ error: 'Forbidden: malformed referer' });
+      return;
+    }
+  }
+
+  // Enforce double-submit CSRF token whenever a mutating request authenticates via session cookie
+  const hasBearer = Boolean(req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.slice(7).trim());
+  const cookies = parseCookies(req.headers.cookie);
+  if (!hasBearer && cookies[SESSION_COOKIE_NAME]) {
+    const cookieCsrf = cookies[CSRF_COOKIE_NAME] || '';
+    const headerCsrf = String(req.headers['x-csrf-token'] || '');
+    const a = Buffer.from(cookieCsrf);
+    const b = Buffer.from(headerCsrf);
+    if (!cookieCsrf || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      res.status(403).json({ error: 'CSRF validation failed. Please refresh the page and try again.' });
+      return;
+    }
+  }
+
   next();
 });
 
@@ -209,12 +311,12 @@ app.use((req, res, next) => {
 });
 
 // Lightweight In-Memory Sliding-Window Rate Limiter
-function createRateLimiter(windowMs: number, maxRequests: number) {
+function createRateLimiter(name: string, windowMs: number, maxRequests: number) {
   const buckets = new Map<string, number[]>();
   const MAX_BUCKETS = 5000;
   return (req: Request, res: Response, next: NextFunction) => {
     const ip = req.ip || req.socket.remoteAddress || 'unknown';
-    const key = `${req.path}:${ip}`;
+    const key = `${name}:${ip}`;
     const now = Date.now();
     const recent = (buckets.get(key) || []).filter((ts) => now - ts < windowMs);
     if (recent.length >= maxRequests) {
@@ -243,12 +345,12 @@ function createRateLimiter(windowMs: number, maxRequests: number) {
   };
 }
 
-const loginLimiter = createRateLimiter(15 * 60 * 1000, 30);
-const publicSubmitLimiter = createRateLimiter(15 * 60 * 1000, 15);
-const verifyLimiter = createRateLimiter(15 * 60 * 1000, 40);
-const guardianVerifyLimiter = createRateLimiter(15 * 60 * 1000, 6);
-const examUploadLimiter = createRateLimiter(15 * 60 * 1000, 25);
-const communityWriteLimiter = createRateLimiter(15 * 60 * 1000, 20);
+const loginLimiter = createRateLimiter('login', 15 * 60 * 1000, 30);
+const publicSubmitLimiter = createRateLimiter('public-submit', 15 * 60 * 1000, 15);
+const verifyLimiter = createRateLimiter('verify', 15 * 60 * 1000, 40);
+const guardianVerifyLimiter = createRateLimiter('guardian-verify', 15 * 60 * 1000, 6);
+const examUploadLimiter = createRateLimiter('exam-upload', 15 * 60 * 1000, 25);
+const communityWriteLimiter = createRateLimiter('community-write', 15 * 60 * 1000, 20);
 
 function generateTempPassword(): string {
   return `NB-${crypto.randomBytes(6).toString('base64url')}`;
@@ -312,6 +414,7 @@ interface AuthUser {
   role: 'student' | 'teacher' | 'admin' | 'guardian';
   is_active: boolean;
   preferred_lang: string;
+  guardian_id?: number;
 }
 
 interface AuthRequest extends Request {
@@ -319,6 +422,9 @@ interface AuthRequest extends Request {
 }
 
 const SESSION_COOKIE_NAME = 'nb_session';
+const CSRF_COOKIE_NAME = 'nb_csrf';
+const SESSION_TTL_SECONDS = 24 * 60 * 60;
+const SESSION_TTL_MS = SESSION_TTL_SECONDS * 1000;
 const revokedTokens = new Map<string, number>();
 
 function pruneRevokedTokens(now = Date.now()): void {
@@ -367,40 +473,74 @@ function extractRequestToken(req: Request): string | null {
   return cookies[SESSION_COOKIE_NAME] || null;
 }
 
+function issueCsrfCookie(req: Request, res: Response): void {
+  const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  const csrfToken = crypto.randomBytes(24).toString('base64url');
+  const csrfParts = [
+    `${CSRF_COOKIE_NAME}=${encodeURIComponent(csrfToken)}`,
+    'Path=/',
+    'SameSite=Lax',
+    `Max-Age=${SESSION_TTL_SECONDS}`,
+  ];
+  if (isHttps) csrfParts.push('Secure');
+  const existing = res.getHeader('Set-Cookie');
+  const prev = Array.isArray(existing) ? existing.map(String) : existing ? [String(existing)] : [];
+  res.setHeader('Set-Cookie', [...prev, csrfParts.join('; ')]);
+}
+
 function setSessionCookie(req: Request, res: Response, token: string): void {
   const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
-  const parts = [
+  const sessionParts = [
     `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
     'Path=/',
     'HttpOnly',
     'SameSite=Lax',
-    `Max-Age=${7 * 24 * 60 * 60}`,
+    `Max-Age=${SESSION_TTL_SECONDS}`,
   ];
-  if (isHttps) parts.push('Secure');
-  res.setHeader('Set-Cookie', parts.join('; '));
+  if (isHttps) sessionParts.push('Secure');
+
+  const csrfToken = crypto.randomBytes(24).toString('base64url');
+  const csrfParts = [
+    `${CSRF_COOKIE_NAME}=${encodeURIComponent(csrfToken)}`,
+    'Path=/',
+    'SameSite=Lax',
+    `Max-Age=${SESSION_TTL_SECONDS}`,
+  ];
+  if (isHttps) csrfParts.push('Secure');
+
+  res.setHeader('Set-Cookie', [sessionParts.join('; '), csrfParts.join('; ')]);
 }
 
 function clearSessionCookie(req: Request, res: Response): void {
   const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
-  const parts = [
+  const sessionParts = [
     `${SESSION_COOKIE_NAME}=`,
     'Path=/',
     'HttpOnly',
     'SameSite=Lax',
     'Max-Age=0',
   ];
-  if (isHttps) parts.push('Secure');
-  res.setHeader('Set-Cookie', parts.join('; '));
+  const csrfParts = [
+    `${CSRF_COOKIE_NAME}=`,
+    'Path=/',
+    'SameSite=Lax',
+    'Max-Age=0',
+  ];
+  if (isHttps) {
+    sessionParts.push('Secure');
+    csrfParts.push('Secure');
+  }
+  res.setHeader('Set-Cookie', [sessionParts.join('; '), csrfParts.join('; ')]);
 }
 
-function signToken(payload: { id: string; role: string; exp: number; jti?: string }): string {
+function signToken(payload: { id: string; role: string; guardianId?: number; exp: number; jti?: string }): string {
   const tokenPayload = { ...payload, jti: payload.jti || crypto.randomUUID() };
   const data = Buffer.from(JSON.stringify(tokenPayload)).toString('base64url');
   const sig = crypto.createHmac('sha256', TOKEN_SECRET).update(data).digest('base64url');
   return `${data}.${sig}`;
 }
 
-function verifyToken(token: string): { id: string; role: string; exp: number; jti?: string } | null {
+function verifyToken(token: string): { id: string; role: string; guardianId?: number; exp: number; jti?: string } | null {
   try {
     const [data, sig] = token.split('.');
     if (!data || !sig) return null;
@@ -411,6 +551,7 @@ function verifyToken(token: string): { id: string; role: string; exp: number; jt
     const parsed = JSON.parse(Buffer.from(data, 'base64url').toString('utf8')) as {
       id?: string;
       role?: string;
+      guardianId?: number;
       exp?: number;
       jti?: string;
     };
@@ -420,7 +561,7 @@ function verifyToken(token: string): { id: string; role: string; exp: number; jt
       if (exp > Date.now()) return null;
       revokedTokens.delete(parsed.jti);
     }
-    return parsed as { id: string; role: string; exp: number; jti?: string };
+    return parsed as { id: string; role: string; guardianId?: number; exp: number; jti?: string };
   } catch {
     return null;
   }
@@ -454,6 +595,83 @@ async function writeAuditLog(
   }
 }
 
+async function resolveSessionAuthUser(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  decoded: { id: string; role: string; guardianId?: number }
+): Promise<AuthUser | null> {
+  const { data: profile, error } = await sb
+    .from('profiles')
+    .select('id, email, full_name, role, is_active, preferred_lang')
+    .eq('id', String(decoded.id))
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (error || !profile || !profile.is_active) {
+    return null;
+  }
+
+  if (decoded.role === 'guardian' && decoded.guardianId) {
+    if (profile.role === 'admin' || profile.role === 'teacher') {
+      return null;
+    }
+    const { data: gRow } = await sb
+      .from('guardians')
+      .select('id, profile_id, full_name, email')
+      .eq('id', Number(decoded.guardianId))
+      .is('deleted_at', null)
+      .maybeSingle();
+    if (!gRow) {
+      return null;
+    }
+    if (profile.role === 'student') {
+      const gAuth = await getGuardianAuth(sb, Number(gRow.id));
+      if (!gAuth || gAuth.status !== 'approved') {
+        return null;
+      }
+      if (gRow.profile_id && gRow.profile_id !== profile.id) {
+        return null;
+      }
+    }
+    return {
+      id: profile.id,
+      email: gRow.email || profile.email,
+      full_name: gRow.full_name || profile.full_name,
+      role: 'guardian',
+      is_active: true,
+      preferred_lang: profile.preferred_lang,
+      guardian_id: Number(gRow.id),
+    };
+  }
+
+  return profile as AuthUser;
+}
+
+async function findGuardianForUser(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  user: AuthUser
+): Promise<{ id: number; profile_id: string | null; full_name: string; phone: string; email: string; relation: string } | null> {
+  if (user.guardian_id) {
+    const { data } = await sb
+      .from('guardians')
+      .select('id, profile_id, full_name, phone, email, relation')
+      .eq('id', user.guardian_id)
+      .is('deleted_at', null)
+      .maybeSingle();
+    if (data) {
+      return data as { id: number; profile_id: string | null; full_name: string; phone: string; email: string; relation: string };
+    }
+  }
+  const { data } = await sb
+    .from('guardians')
+    .select('id, profile_id, full_name, phone, email, relation')
+    .eq('profile_id', user.id)
+    .is('deleted_at', null)
+    .order('id', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  return (data as { id: number; profile_id: string | null; full_name: string; phone: string; email: string; relation: string } | null) || null;
+}
+
 const authenticate = asyncHandler<AuthRequest>(async (req, res, next) => {
   const token = extractRequestToken(req);
   if (!token) {
@@ -467,18 +685,12 @@ const authenticate = asyncHandler<AuthRequest>(async (req, res, next) => {
   }
 
   const sb = requireSupabaseAdmin();
-  const { data: profile, error } = await sb
-    .from('profiles')
-    .select('id, email, full_name, role, is_active, preferred_lang')
-    .eq('id', String(decoded.id))
-    .is('deleted_at', null)
-    .maybeSingle();
-
-  if (error || !profile || !profile.is_active) {
+  const user = await resolveSessionAuthUser(sb, decoded);
+  if (!user) {
     res.status(403).json({ error: 'Account inactive or not found' });
     return;
   }
-  req.user = profile as AuthUser;
+  req.user = user;
   next();
 });
 
@@ -503,23 +715,106 @@ async function tryAuthenticateOptional(req: Request): Promise<AuthUser | null> {
     const decoded = verifyToken(token);
     if (!decoded) return null;
     const sb = requireSupabaseAdmin();
-    const { data: profile } = await sb
-      .from('profiles')
-      .select('id, email, full_name, role, is_active, preferred_lang')
-      .eq('id', String(decoded.id))
-      .is('deleted_at', null)
-      .maybeSingle();
-    if (!profile || !profile.is_active) return null;
-    return profile as AuthUser;
+    return await resolveSessionAuthUser(sb, decoded);
   } catch {
     return null;
+  }
+}
+
+const UPDATED_LEVELS_CATALOG = [
+  {
+    id: 1,
+    code: 'LEVEL-1',
+    name_ar: 'المستوى الأول — التأسيس والمهارات الأساسية',
+    name_en: 'Level 1 — Foundations & Core Skills',
+    description_ar:
+      'مرحلة البداية لبناء المهارات الأساسية في القراءة والكتابة، التأسيس الأكاديمي، ومبادئ المواد واللغات والحساب بأسلوب تفاعلي مبسط.',
+    description_en:
+      'Entry stage building core foundations in reading, writing, early numeracy, languages, and core subjects through interactive guidance.',
+    age_range: '4 – 7 سنوات',
+    criteria_ar: 'الانتقال عند إتقان المهارات التأسيسية واجتياز التقييم الأولي بنجاح.',
+    criteria_en: 'Advance upon mastering foundational skills and passing the initial assessment.',
+  },
+  {
+    id: 2,
+    code: 'LEVEL-2',
+    name_ar: 'المستوى الثاني — الطلاقة والتطبيق المتوسط',
+    name_en: 'Level 2 — Fluency & Intermediate Track',
+    description_ar:
+      'تطوير الطلاقة القرائية واللغوية، تعميق الفهم في المواد الدراسية والعلوم الإسلامية، وتنمية مهارات التفكير والحساب الذهني.',
+    description_en:
+      'Developing reading and language fluency, strengthening school subjects and Islamic studies, and building mental math & thinking skills.',
+    age_range: '8 – 11 سنة',
+    criteria_ar: 'الانتقال عند تحقيق نسبة 85% فأكثر في التقييمات الدورية والمشاركة الصفية.',
+    criteria_en: 'Advance after achieving 85%+ across periodic assessments and class participation.',
+  },
+  {
+    id: 3,
+    code: 'LEVEL-3',
+    name_ar: 'المستوى الثالث — التقدّم والتميّز الأكاديمي',
+    name_en: 'Level 3 — Advanced & Academic Mastery',
+    description_ar:
+      'تطبيق المهارات المتقدمة في جميع المسارات: الإتقان القرائي والتجويدي، اللغات والمناهج الدولية، وحل المسائل العليا بتفوّق.',
+    description_en:
+      'Advanced mastery across tracks: fluent recitation, international curricula, languages, and higher-order problem solving.',
+    age_range: '12 – 18 سنة',
+    criteria_ar: 'إتمام متطلبات المسار المتقدم والاختبار النهائي بنجاح لاستلام شهادة المستوى.',
+    criteria_en: 'Complete advanced track requirements and pass the final assessment for level certification.',
+  },
+] as const;
+
+async function ensureUpdatedLevelsCatalog(): Promise<void> {
+  try {
+    const sb = requireSupabaseAdmin();
+    const { data: rows } = await sb.from('levels').select('id, code, name_ar').in('id', [1, 2, 3]);
+    if (!rows || !rows.length) return;
+    let changed = false;
+    for (const target of UPDATED_LEVELS_CATALOG) {
+      const cur = rows.find((r: { id: number; code?: string; name_ar?: string }) => Number(r.id) === target.id);
+      if (!cur) continue;
+      const needsUpdate =
+        cur.code === 'L1-BRAEM' ||
+        cur.code === 'L2-NOOR' ||
+        cur.code === 'L3-TAJWEED' ||
+        String(cur.name_ar || '').includes('البراعم') ||
+        String(cur.name_ar || '').includes('الإتقان') ||
+        String(cur.name_ar || '').includes('المستوى الأساسي');
+      if (needsUpdate) {
+        const { error } = await sb
+          .from('levels')
+          .update({
+            code: target.code,
+            name_ar: target.name_ar,
+            name_en: target.name_en,
+            description_ar: target.description_ar,
+            description_en: target.description_en,
+            age_range: target.age_range,
+            criteria_ar: target.criteria_ar,
+            criteria_en: target.criteria_en,
+          })
+          .eq('id', target.id);
+        if (!error) changed = true;
+      }
+    }
+    if (changed) {
+      overviewCache = null;
+      console.log('[levels] Updated legacy levels (1–3) to generic academic level names.');
+    }
+  } catch (err) {
+    console.warn('[levels] startup catalog sync warning:', err instanceof Error ? err.message : err);
   }
 }
 
 // ============================================================================
 // HEALTH CHECK (Liveness & Supabase Readiness for Hosting Probes)
 // ============================================================================
-app.get('/api/health', asyncHandler(async (_req, res) => {
+app.get('/api/health', asyncHandler(async (req, res) => {
+  const authUser = await tryAuthenticateOptional(req);
+  if (!authUser || authUser.role !== 'admin') {
+    res.status(200).json({ ok: true });
+    return;
+  }
+
   const db = await pingSupabaseDatabase();
   const payload = {
     status: db.connected ? 'ok' : 'degraded',
@@ -570,11 +865,15 @@ app.get('/api/public/overview', asyncHandler(async (_req, res) => {
       .order('id', { ascending: true }),
     sb
       .from('courses')
-      .select('*, levels(name_ar, name_en, code), teachers(name_ar, name_en, avatar_url)')
+      .select('*, levels(name_ar, name_en, code), teachers(id, name_ar, name_en, avatar_url, is_public, deleted_at)')
       .is('deleted_at', null)
       .order('is_featured', { ascending: false })
       .order('id', { ascending: true }),
-    sb.from('lessons').select('id', { count: 'exact', head: true }).is('deleted_at', null),
+    sb
+      .from('lessons')
+      .select('id, courses!inner(deleted_at)', { count: 'exact', head: true })
+      .is('deleted_at', null)
+      .is('courses.deleted_at', null),
     sb.from('levels').select('*').order('order_index', { ascending: true }),
     sb.from('games').select('*').eq('is_active', true).order('id', { ascending: true }),
     sb.from('legal_documents').select('doc_type, version, title_ar, title_en, content_ar, content_en, updated_at').order('id', { ascending: true }),
@@ -591,7 +890,15 @@ app.get('/api/public/overview', asyncHandler(async (_req, res) => {
 
   const courses = (coursesRes.data || []).map((c: Record<string, unknown>) => {
     const lvl = c.levels as { name_ar?: string; name_en?: string; code?: string } | null;
-    const tch = c.teachers as { name_ar?: string; name_en?: string; avatar_url?: string } | null;
+    const tch = c.teachers as {
+      id?: number;
+      name_ar?: string;
+      name_en?: string;
+      avatar_url?: string;
+      is_public?: boolean;
+      deleted_at?: string | null;
+    } | null;
+    const showPrimaryTeacher = Boolean(tch && tch.is_public !== false && !tch.deleted_at);
     const { levels: _l, teachers: _t, ...rest } = c;
     const cid = Number(rest.id);
     const meta = courseMetasMap.get(cid);
@@ -601,9 +908,9 @@ app.get('/api/public/overview', asyncHandler(async (_req, res) => {
       level_name_ar: lvl?.name_ar ?? null,
       level_name_en: lvl?.name_en ?? null,
       level_code: lvl?.code ?? null,
-      teacher_name_ar: tch?.name_ar ?? null,
-      teacher_name_en: tch?.name_en ?? null,
-      teacher_avatar: tch?.avatar_url ?? null,
+      teacher_name_ar: showPrimaryTeacher ? tch?.name_ar ?? null : null,
+      teacher_name_en: showPrimaryTeacher ? tch?.name_en ?? null : null,
+      teacher_avatar: showPrimaryTeacher ? tch?.avatar_url ?? null : null,
       cover_url: meta?.cover_url ?? null,
       price_monthly_sar: meta?.price_monthly_sar ?? null,
       co_teacher_ids: coIds,
@@ -659,10 +966,10 @@ app.get('/api/public/course-covers/:id', asyncHandler(async (req, res) => {
 
 app.get('/api/public/courses/:id', asyncHandler(async (req, res) => {
   const sb = requireSupabaseAdmin();
-  const courseId = Number(req.params.id);
+  const courseId = parsePositiveIntParam(req.params.id, 'course id');
   const { data: c } = await sb
     .from('courses')
-    .select('*, levels(name_ar, name_en, age_range), teachers(id, name_ar, name_en, qualifications_ar, qualifications_en, avatar_url)')
+    .select('*, levels(name_ar, name_en, age_range), teachers(id, name_ar, name_en, qualifications_ar, qualifications_en, avatar_url, is_public, deleted_at)')
     .eq('id', courseId)
     .is('deleted_at', null)
     .maybeSingle();
@@ -680,13 +987,16 @@ app.get('/api/public/courses/:id', asyncHandler(async (req, res) => {
     qualifications_ar?: string;
     qualifications_en?: string;
     avatar_url?: string;
+    is_public?: boolean;
+    deleted_at?: string | null;
   } | null;
+  const showPrimaryTeacher = Boolean(tch && tch.is_public !== false && !tch.deleted_at);
   const { levels: _l, teachers: _t, ...rest } = c as Record<string, unknown>;
 
   const courseMeta = await getCourseMeta(sb, courseId);
   const coIds = (courseMeta?.co_teacher_ids || []).filter((id) => id !== Number(tch?.id ?? rest.teacher_id));
   const coTeachers = coIds.length
-    ? ((await sb.from('teachers').select('id, name_ar, name_en').in('id', coIds).is('deleted_at', null)).data || [])
+    ? ((await sb.from('teachers').select('id, name_ar, name_en').in('id', coIds).eq('is_public', true).is('deleted_at', null)).data || [])
     : [];
 
   const course = {
@@ -694,12 +1004,12 @@ app.get('/api/public/courses/:id', asyncHandler(async (req, res) => {
     level_name_ar: lvl?.name_ar ?? null,
     level_name_en: lvl?.name_en ?? null,
     age_range: lvl?.age_range ?? null,
-    teacher_id: tch?.id ?? rest.teacher_id ?? null,
-    teacher_name_ar: tch?.name_ar ?? null,
-    teacher_name_en: tch?.name_en ?? null,
-    teacher_qualifications_ar: tch?.qualifications_ar ?? null,
-    teacher_qualifications_en: tch?.qualifications_en ?? null,
-    teacher_avatar: tch?.avatar_url ?? null,
+    teacher_id: showPrimaryTeacher ? tch?.id ?? rest.teacher_id ?? null : null,
+    teacher_name_ar: showPrimaryTeacher ? tch?.name_ar ?? null : null,
+    teacher_name_en: showPrimaryTeacher ? tch?.name_en ?? null : null,
+    teacher_qualifications_ar: showPrimaryTeacher ? tch?.qualifications_ar ?? null : null,
+    teacher_qualifications_en: showPrimaryTeacher ? tch?.qualifications_en ?? null : null,
+    teacher_avatar: showPrimaryTeacher ? tch?.avatar_url ?? null : null,
     cover_url: courseMeta?.cover_url ?? null,
     price_monthly_sar: courseMeta?.price_monthly_sar ?? null,
     co_teacher_ids: coIds,
@@ -733,7 +1043,7 @@ app.get('/api/public/courses/:id', asyncHandler(async (req, res) => {
 
 app.get('/api/public/teachers/:id', asyncHandler(async (req, res) => {
   const sb = requireSupabaseAdmin();
-  const teacherId = Number(req.params.id);
+  const teacherId = parsePositiveIntParam(req.params.id, 'teacher id');
 
   const [{ data: teacher }, { data: courses }] = await Promise.all([
     sb
@@ -768,6 +1078,7 @@ app.get('/api/public/certificates/verify/:code', verifyLimiter, asyncHandler(asy
   const sb = requireSupabaseAdmin();
   const { data: rows, error } = await sb.rpc('verify_certificate', { p_code: code });
   if (error) {
+    console.error('[verify-certificate]', error);
     res.status(500).json({ valid: false, error: 'Verification query failed' });
     return;
   }
@@ -864,10 +1175,6 @@ app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req,
 
   const cleanStudentEmail = student_email.toLowerCase();
   const cleanGuardianEmail = guardian_email.toLowerCase();
-  if (cleanStudentEmail === cleanGuardianEmail) {
-    res.status(400).json({ error: 'Student login email and guardian email must be different so each portal stays separate.' });
-    return;
-  }
 
   const sb = requireSupabaseAdmin();
   const { data: existingProfile } = await sb
@@ -899,7 +1206,7 @@ app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req,
       user_metadata: { ...(existingAuth.user_metadata || {}), full_name: student_name, role: 'student' },
     });
     if (updErr || !upd.user) {
-      res.status(500).json({ error: updErr?.message || 'Failed to prepare student account' });
+      sendInternalError(res, 'admission-prepare-student', updErr, 'Failed to prepare student account');
       return;
     }
     authUserId = upd.user.id;
@@ -925,7 +1232,7 @@ app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req,
     if (!alreadyExisted) {
       await sb.auth.admin.deleteUser(authUserId).catch(() => {});
     }
-    res.status(500).json({ error: profErr.message });
+    sendInternalError(res, 'admission-create-profile', profErr, 'Failed to create student profile');
     return;
   }
 
@@ -1005,7 +1312,7 @@ app.post('/api/public/teacher-applications', publicSubmitLimiter, asyncHandler(a
       user_metadata: { ...(existingAuth.user_metadata || {}), full_name: name_ar, role: 'teacher' },
     });
     if (updErr || !upd.user) {
-      res.status(500).json({ error: updErr?.message || 'Failed to prepare teacher account' });
+      sendInternalError(res, 'teacher-app-prepare-account', updErr, 'Failed to prepare teacher account');
       return;
     }
     authUserId = upd.user.id;
@@ -1031,7 +1338,7 @@ app.post('/api/public/teacher-applications', publicSubmitLimiter, asyncHandler(a
     if (!alreadyExisted) {
       await sb.auth.admin.deleteUser(authUserId).catch(() => {});
     }
-    res.status(500).json({ error: profErr.message });
+    sendInternalError(res, 'teacher-app-create-profile', profErr, 'Failed to create teacher profile');
     return;
   }
 
@@ -1066,47 +1373,117 @@ app.post('/api/public/teacher-applications', publicSubmitLimiter, asyncHandler(a
 // ============================================================================
 app.get('/api/auth/config', (_req, res) => {
   res.json({
-    demoEnabled: ALLOW_DEMO_LOGIN,
     googleOAuthEnabled: Boolean(process.env.VITE_SUPABASE_URL && process.env.VITE_SUPABASE_ANON_KEY),
   });
 });
 
 app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
-  const { email, password, demoRole } = req.body as { email?: string; password?: string; demoRole?: string };
+  const { email, password, portalRole } = req.body as {
+    email?: string;
+    password?: string;
+    portalRole?: 'student' | 'teacher' | 'guardian' | 'admin';
+  };
   const sb = requireSupabaseAdmin();
   let profile: AuthUser | null = null;
+  let tokenGuardianId: number | undefined;
 
-  if (demoRole) {
-    if (!ALLOW_DEMO_LOGIN) {
-      res.status(403).json({ error: 'Demo login is disabled in production.' });
-      return;
-    }
-    const demoEmails: Record<string, string> = {
-      admin: 'admin@noorbayan.academy',
-      teacher1: 'fatima@noorbayan.academy',
-      teacher2: 'yusuf@noorbayan.academy',
-      student: 'omar.student@noorbayan.academy',
-      guardian: 'khaled.parent@noorbayan.academy',
-    };
-    const targetEmail = demoEmails[demoRole];
-    if (!targetEmail) {
-      res.status(400).json({ error: 'Unknown demo role' });
-      return;
-    }
-    const { data } = await sb
-      .from('profiles')
-      .select('id, email, full_name, role, is_active, preferred_lang')
-      .ilike('email', targetEmail)
+  if (!email || !password || typeof email !== 'string' || typeof password !== 'string') {
+    res.status(400).json({ error: 'Email and password are required' });
+    return;
+  }
+
+  const cleanEmail = email.trim().toLowerCase();
+
+  if (portalRole === 'guardian') {
+    const { data: guardianRows } = await sb
+      .from('guardians')
+      .select('id, profile_id, full_name, email')
+      .ilike('email', cleanEmail)
       .is('deleted_at', null)
-      .maybeSingle();
-    profile = data as AuthUser | null;
-  } else {
-    if (!email || !password || typeof email !== 'string' || typeof password !== 'string') {
-      res.status(400).json({ error: 'Email and password are required' });
-      return;
+      .order('id', { ascending: true });
+
+    const candidates = (guardianRows || []) as Array<{
+      id: number;
+      profile_id: string | null;
+      full_name: string;
+      email: string;
+    }>;
+
+    let matchedVault: { guardian: (typeof candidates)[number]; status: string; linkedProfileId: string | null } | null = null;
+    let anyVaultExists = false;
+
+    for (const g of candidates) {
+      const rec = await getGuardianAuth(sb, Number(g.id));
+      if (!rec) continue;
+      anyVaultExists = true;
+      if (verifyVaultPassword(password, rec.password_salt, rec.password_hash)) {
+        matchedVault = { guardian: g, status: rec.status, linkedProfileId: rec.linked_profile_id || g.profile_id };
+        if (rec.status === 'approved') break;
+      }
     }
 
-    const cleanEmail = email.trim().toLowerCase();
+    if (matchedVault) {
+      if (matchedVault.status === 'pending') {
+        res.status(403).json({
+          error: 'Your application is pending administrator approval. Please wait until your account is activated.',
+          code: 'APPLICATION_PENDING',
+        });
+        return;
+      }
+      if (matchedVault.status !== 'approved' || !matchedVault.linkedProfileId) {
+        res.status(403).json({ error: 'Guardian account is not active yet.' });
+        return;
+      }
+      const { data: linkedProfile } = await sb
+        .from('profiles')
+        .select('id, email, full_name, role, is_active, preferred_lang')
+        .eq('id', matchedVault.linkedProfileId)
+        .is('deleted_at', null)
+        .maybeSingle();
+
+      if (!linkedProfile || !linkedProfile.is_active) {
+        res.status(403).json({ error: 'Linked academy account is pending or disabled.' });
+        return;
+      }
+      profile = {
+        id: linkedProfile.id,
+        email: matchedVault.guardian.email || linkedProfile.email,
+        full_name: matchedVault.guardian.full_name || linkedProfile.full_name,
+        role: 'guardian',
+        is_active: true,
+        preferred_lang: linkedProfile.preferred_lang,
+        guardian_id: Number(matchedVault.guardian.id),
+      };
+      tokenGuardianId = Number(matchedVault.guardian.id);
+    } else if (!anyVaultExists) {
+      // Legacy separate-email guardian created before guardian-auth vault
+      const { data: profileRow } = await sb
+        .from('profiles')
+        .select('id, email, full_name, role, is_active, preferred_lang')
+        .ilike('email', cleanEmail)
+        .is('deleted_at', null)
+        .maybeSingle();
+
+      if (!profileRow || profileRow.role !== 'guardian') {
+        res.status(401).json({ error: 'Invalid credentials' });
+        return;
+      }
+
+      const anon = createEphemeralSupabaseAnon();
+      const { error: authErr } = await anon.auth.signInWithPassword({
+        email: profileRow.email,
+        password,
+      });
+      if (authErr) {
+        res.status(401).json({ error: 'Invalid credentials' });
+        return;
+      }
+      profile = profileRow as AuthUser;
+    } else {
+      res.status(401).json({ error: 'Invalid credentials' });
+      return;
+    }
+  } else {
     const { data: profileRow } = await sb
       .from('profiles')
       .select('id, email, full_name, role, is_active, preferred_lang')
@@ -1116,6 +1493,14 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
 
     if (!profileRow) {
       res.status(401).json({ error: 'Invalid credentials' });
+      return;
+    }
+
+    if (portalRole && profileRow.role !== portalRole) {
+      res.status(403).json({
+        error: 'This account is registered under a different portal role. Please select the matching role tab above.',
+        code: 'PORTAL_ROLE_MISMATCH',
+      });
       return;
     }
 
@@ -1169,7 +1554,12 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
     return;
   }
 
-  const token = signToken({ id: profile.id, role: profile.role, exp: Date.now() + 1000 * 60 * 60 * 24 * 7 });
+  const token = signToken({
+    id: profile.id,
+    role: profile.role,
+    ...(tokenGuardianId ? { guardianId: tokenGuardianId } : {}),
+    exp: Date.now() + SESSION_TTL_MS,
+  });
   setSessionCookie(req, res, token);
   res.json({
     token,
@@ -1179,6 +1569,7 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
       full_name: profile.full_name,
       role: profile.role,
       preferred_lang: profile.preferred_lang,
+      ...(tokenGuardianId ? { guardian_id: tokenGuardianId } : {}),
     },
   });
 }));
@@ -1203,19 +1594,17 @@ app.get('/api/auth/session', asyncHandler(async (req, res) => {
     return;
   }
   const sb = requireSupabaseAdmin();
-  const { data: profile, error } = await sb
-    .from('profiles')
-    .select('id, email, full_name, role, is_active, preferred_lang')
-    .eq('id', String(decoded.id))
-    .is('deleted_at', null)
-    .maybeSingle();
-
-  if (error || !profile || !profile.is_active) {
+  const resolved = await resolveSessionAuthUser(sb, decoded);
+  if (!resolved) {
     clearSessionCookie(req, res);
     res.json({ user: null });
     return;
   }
-  res.json({ user: profile });
+  const cookies = parseCookies(req.headers.cookie);
+  if (cookies[SESSION_COOKIE_NAME] && !cookies[CSRF_COOKIE_NAME]) {
+    issueCsrfCookie(req, res);
+  }
+  res.json({ user: resolved });
 }));
 
 app.get('/api/auth/me', authenticate, (req: AuthRequest, res) => {
@@ -1233,6 +1622,31 @@ app.post('/api/auth/change-password', authenticate, asyncHandler<AuthRequest>(as
     return;
   }
   const { currentPassword, newPassword } = parsed.data;
+  const sb = requireSupabaseAdmin();
+
+  if (req.user!.role === 'guardian' && req.user!.guardian_id) {
+    const gAuth = await getGuardianAuth(sb, req.user!.guardian_id);
+    if (gAuth) {
+      if (!verifyVaultPassword(currentPassword, gAuth.password_salt, gAuth.password_hash)) {
+        res.status(401).json({ error: 'Current password is incorrect.' });
+        return;
+      }
+      const { salt, hash } = hashVaultPassword(newPassword);
+      await saveGuardianAuth(sb, {
+        ...gAuth,
+        password_salt: salt,
+        password_hash: hash,
+        updated_at: new Date().toISOString(),
+      });
+      const { data: prof } = await sb.from('profiles').select('role').eq('id', req.user!.id).maybeSingle();
+      if (prof?.role === 'guardian') {
+        await sb.auth.admin.updateUserById(req.user!.id, { password: newPassword }).catch(() => {});
+      }
+      await writeAuditLog(req.user!.id, req.user!.full_name, 'CHANGE_PASSWORD', 'guardian', req.user!.guardian_id, {});
+      res.json({ ok: true });
+      return;
+    }
+  }
 
   const anon = createEphemeralSupabaseAnon();
   const { error: verifyErr } = await anon.auth.signInWithPassword({
@@ -1244,12 +1658,11 @@ app.post('/api/auth/change-password', authenticate, asyncHandler<AuthRequest>(as
     return;
   }
 
-  const sb = requireSupabaseAdmin();
   const { error: updateErr } = await sb.auth.admin.updateUserById(req.user!.id, {
     password: newPassword,
   });
   if (updateErr) {
-    res.status(500).json({ error: updateErr.message });
+    sendInternalError(res, 'auth-change-password', updateErr, 'Failed to update password');
     return;
   }
 
@@ -1316,7 +1729,7 @@ app.post('/api/auth/complete-password-reset', loginLimiter, asyncHandler(async (
     password: parsed.data.newPassword,
   });
   if (updateErr) {
-    res.status(500).json({ error: updateErr.message });
+    sendInternalError(res, 'auth-complete-password-reset', updateErr, 'Failed to reset password');
     return;
   }
 
@@ -1350,13 +1763,15 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
 
   const { data: studentRow } = await sb
     .from('students')
-    .select('id, student_code, full_name_ar, guardian_id, guardians(id, profile_id, full_name, email, phone)')
+    .select('id, profile_id, student_code, full_name_ar, guardian_id, profiles(id, email, role, is_active), guardians(id, profile_id, full_name, email, phone)')
     .ilike('student_code', cleanCode)
     .is('deleted_at', null)
     .maybeSingle();
 
   if (!studentRow) {
-    res.status(404).json({ error: 'Student code not found. Please check the code from your child profile or administration.' });
+    res.status(400).json({
+      error: 'Unable to match this student code with the provided email. Please verify both details or contact Academy administration.',
+    });
     return;
   }
 
@@ -1369,23 +1784,38 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
     phone: string;
   } | null;
 
+  const rawStudentProfile = Array.isArray(studentRow.profiles) ? studentRow.profiles[0] : studentRow.profiles;
+  const studentProfile = (rawStudentProfile ?? null) as unknown as {
+    id: string;
+    email: string;
+    role: string;
+    is_active: boolean;
+  } | null;
+
   const registeredGuardianEmail = guardianRecord?.email?.trim().toLowerCase() || '';
-  if (!guardianRecord || !registeredGuardianEmail || registeredGuardianEmail !== cleanEmail) {
-    res.status(403).json({
-      error: 'Email does not match the registered guardian email for this student code. Contact Academy administration to update it.',
+  const studentProfileEmail = studentProfile?.email?.trim().toLowerCase() || '';
+
+  if (!guardianRecord || (!registeredGuardianEmail && !studentProfileEmail) || (cleanEmail !== registeredGuardianEmail && cleanEmail !== studentProfileEmail)) {
+    res.status(400).json({
+      error: 'Unable to match this student code with the provided email. Please verify both details or contact Academy administration.',
     });
     return;
   }
 
-  if (guardianRecord.profile_id) {
+  const existingGuardianAuth = await getGuardianAuth(sb, guardianRecord.id);
+  if (guardianRecord.profile_id || existingGuardianAuth?.status === 'approved') {
     res.status(409).json({
-      error: 'This student is already linked to a guardian account. Please sign in with that account or contact administration.',
+      error: 'This student is already linked to a guardian account. Please sign in with your guardian password or contact administration.',
     });
     return;
   }
 
   const existingPending = (await listGuardianRequests(sb)).find(
-    (r) => r.status === 'pending' && (r.student_code.toUpperCase() === cleanCode || r.email.toLowerCase() === cleanEmail)
+    (r) =>
+      r.status === 'pending' &&
+      (r.student_code.toUpperCase() === cleanCode ||
+        r.guardian_id === guardianRecord.id ||
+        r.email.toLowerCase() === cleanEmail)
   );
   if (existingPending) {
     res.status(409).json({
@@ -1396,73 +1826,98 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
 
   const { data: existingProfile } = await sb
     .from('profiles')
-    .select('id, role')
+    .select('id, role, is_active')
     .ilike('email', cleanEmail)
     .is('deleted_at', null)
     .maybeSingle();
 
-  if (existingProfile) {
-    res.status(409).json({
-      error:
-        existingProfile.role === 'guardian'
-          ? 'A guardian account with this email already exists or is awaiting review.'
-          : 'This email is already registered under another academy account role.',
-    });
-    return;
-  }
-
-  const existingAuth = await findSupabaseAuthUserByEmail(cleanEmail);
   let userId: string;
   let alreadyExisted = false;
+  let sharedStudentEmail = false;
 
-  if (existingAuth) {
-    const verifiedGoogle = parsed.data.google_access_token
-      ? await verifyVerifiedGoogleToken(sb, parsed.data.google_access_token)
-      : null;
-    if (!verifiedGoogle || verifiedGoogle.email !== cleanEmail) {
+  if (existingProfile) {
+    if (existingProfile.role === 'student') {
+      sharedStudentEmail = true;
+      userId = existingProfile.id;
+    } else if (existingProfile.role === 'guardian') {
       res.status(409).json({
-        error: 'An authentication account already exists for this email. Verify with Google Sign-In or contact Academy administration.',
+        error: 'A guardian account with this email already exists or is awaiting review.',
+      });
+      return;
+    } else {
+      res.status(409).json({
+        error: 'This email is already registered under a teacher or administrator role.',
       });
       return;
     }
-    const { data: upd, error: updErr } = await sb.auth.admin.updateUserById(existingAuth.id, {
-      password: parsed.data.password,
-      email_confirm: true,
-      user_metadata: { ...(existingAuth.user_metadata || {}), full_name: parsed.data.full_name, role: 'guardian' },
-    });
-    if (updErr || !upd.user) {
-      res.status(500).json({ error: updErr?.message || 'Failed to prepare guardian account' });
+  } else {
+    const existingAuth = await findSupabaseAuthUserByEmail(cleanEmail);
+    if (existingAuth) {
+      const verifiedGoogle = parsed.data.google_access_token
+        ? await verifyVerifiedGoogleToken(sb, parsed.data.google_access_token)
+        : null;
+      if (!verifiedGoogle || verifiedGoogle.email !== cleanEmail) {
+        res.status(409).json({
+          error: 'An authentication account already exists for this email. Verify with Google Sign-In or contact Academy administration.',
+        });
+        return;
+      }
+      const { data: upd, error: updErr } = await sb.auth.admin.updateUserById(existingAuth.id, {
+        password: parsed.data.password,
+        email_confirm: true,
+        user_metadata: { ...(existingAuth.user_metadata || {}), full_name: parsed.data.full_name, role: 'guardian' },
+      });
+      if (updErr || !upd.user) {
+        sendInternalError(res, 'guardian-register-prepare', updErr, 'Failed to prepare guardian account');
+        return;
+      }
+      userId = upd.user.id;
+      alreadyExisted = true;
+    } else {
+      const provisioned = await provisionSupabaseAuthUser(cleanEmail, parsed.data.password, parsed.data.full_name, 'guardian');
+      userId = provisioned.user.id;
+      alreadyExisted = provisioned.alreadyExisted;
+    }
+
+    const { error: profErr } = await sb.from('profiles').upsert(
+      {
+        id: userId,
+        email: cleanEmail,
+        full_name: parsed.data.full_name,
+        role: 'guardian',
+        is_active: false,
+        preferred_lang: 'ar',
+      },
+      { onConflict: 'id' }
+    );
+    if (profErr) {
+      if (!alreadyExisted) {
+        await sb.auth.admin.deleteUser(userId).catch(() => {});
+      }
+      sendInternalError(res, 'guardian-register-profile', profErr, 'Failed to create guardian profile');
       return;
     }
-    userId = upd.user.id;
-    alreadyExisted = true;
-  } else {
-    const provisioned = await provisionSupabaseAuthUser(cleanEmail, parsed.data.password, parsed.data.full_name, 'guardian');
-    userId = provisioned.user.id;
-    alreadyExisted = provisioned.alreadyExisted;
   }
 
-  const { error: profErr } = await sb.from('profiles').upsert(
-    {
-      id: userId,
+  const nowIso = new Date().toISOString();
+  const { salt, hash } = hashVaultPassword(parsed.data.password);
+  const reqId = generateApplicationId();
+
+  try {
+    await saveGuardianAuth(sb, {
+      guardian_id: guardianRecord.id,
       email: cleanEmail,
       full_name: parsed.data.full_name,
-      role: 'guardian',
-      is_active: false,
-      preferred_lang: 'ar',
-    },
-    { onConflict: 'id' }
-  );
-  if (profErr) {
-    if (!alreadyExisted) {
-      await sb.auth.admin.deleteUser(userId).catch(() => {});
-    }
-    res.status(500).json({ error: profErr.message });
-    return;
-  }
+      phone: parsed.data.phone || guardianRecord.phone || '',
+      relation: parsed.data.relation || 'ولي أمر',
+      linked_profile_id: userId,
+      password_salt: salt,
+      password_hash: hash,
+      status: 'pending',
+      created_at: nowIso,
+      updated_at: nowIso,
+    });
 
-  const reqId = generateApplicationId();
-  try {
     await saveGuardianRequest(sb, {
       id: reqId,
       profile_id: userId,
@@ -1475,10 +1930,14 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
       phone: parsed.data.phone || guardianRecord.phone || '',
       relation: parsed.data.relation || 'ولي أمر',
       status: 'pending',
-      created_at: new Date().toISOString(),
+      shared_student_email: sharedStudentEmail,
+      created_at: nowIso,
     });
   } catch (err) {
-    await deletePendingAuthProfileIfSafe(sb, userId);
+    await deleteGuardianAuth(sb, guardianRecord.id);
+    if (!sharedStudentEmail) {
+      await deletePendingAuthProfileIfSafe(sb, userId);
+    }
     throw err;
   }
 
@@ -1486,6 +1945,7 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
     request_id: reqId,
     student_id: studentRow.id,
     student_code: studentRow.student_code,
+    shared_student_email: sharedStudentEmail,
   });
   void broadcastRealtimeEvent('admission:created', { kind: 'guardian_request' });
 
@@ -1500,7 +1960,7 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
 // Ephemeral single-use OAuth handoff store for cross-site iframe / COOP popup fallback
 const oauthHandoffMap = new Map<string, { access_token?: string; error?: string; expiresAt: number }>();
 const OAUTH_HANDOFF_TTL_MS = 120_000;
-const oauthHandoffReadLimiter = createRateLimiter(5 * 60 * 1000, 180);
+const oauthHandoffReadLimiter = createRateLimiter('oauth-handoff-read', 5 * 60 * 1000, 180);
 
 function pruneOauthHandoffMap() {
   const now = Date.now();
@@ -1598,6 +2058,7 @@ app.get('/auth/google-callback.js', (_req, res) => {
   } catch (e) {}
   try {
     localStorage.setItem('nb_google_oauth_result', JSON.stringify({ state: state, access_token: accessToken, error: payload.error, ts: Date.now() }));
+    setTimeout(function(){ try { localStorage.removeItem('nb_google_oauth_result'); } catch(e){} }, 5000);
   } catch (e) {}
 
   if (state && /^[a-zA-Z0-9_-]{16,96}$/.test(state)) {
@@ -1647,6 +2108,7 @@ app.post('/api/auth/google', loginLimiter, asyncHandler(async (req, res) => {
   const schema = z.object({
     access_token: z.string().min(20).max(8192),
     intent: z.enum(['login', 'prefill']).default('login'),
+    portalRole: z.enum(['student', 'teacher', 'guardian', 'admin']).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -1693,6 +2155,22 @@ app.post('/api/auth/google', loginLimiter, asyncHandler(async (req, res) => {
     return;
   }
 
+  if (parsed.data.portalRole === 'guardian' && profile.role === 'student') {
+    res.status(403).json({
+      error: 'Please sign in to the Guardian Portal using the dedicated Guardian password set during activation.',
+      code: 'GUARDIAN_PASSWORD_REQUIRED',
+    });
+    return;
+  }
+
+  if (parsed.data.portalRole && parsed.data.portalRole !== profile.role) {
+    res.status(403).json({
+      error: 'This account is registered under a different portal role. Please select the matching role tab above.',
+      code: 'PORTAL_ROLE_MISMATCH',
+    });
+    return;
+  }
+
   if (!profile.is_active) {
     if (profile.role === 'student' || profile.role === 'teacher' || profile.role === 'guardian') {
       const table =
@@ -1710,7 +2188,7 @@ app.post('/api/auth/google', loginLimiter, asyncHandler(async (req, res) => {
     return;
   }
 
-  const token = signToken({ id: profile.id, role: profile.role, exp: Date.now() + 1000 * 60 * 60 * 24 * 7 });
+  const token = signToken({ id: profile.id, role: profile.role, exp: Date.now() + SESSION_TTL_MS });
   setSessionCookie(req, res, token);
 
   await writeAuditLog(profile.id, profile.full_name, 'LOGIN_GOOGLE_OAUTH', 'profile', profile.id, {
@@ -2039,12 +2517,25 @@ app.get('/api/student/dashboard', authenticate, requireRole('student'), asyncHan
 }));
 
 app.post('/api/student/games/progress', authenticate, requireRole('student'), asyncHandler<AuthRequest>(async (req, res) => {
-  const { game_slug, score, stars, completed_levels } = req.body as {
-    game_slug: string;
-    score: number;
-    stars: number;
-    completed_levels: number;
-  };
+  const schema = z.object({
+    game_slug: z.string().trim().min(1).max(80).regex(/^[a-zA-Z0-9_-]+$/),
+    score: z.number().int().min(0).max(1000).optional().default(0),
+    stars: z.number().int().min(0).max(1000).optional().default(0),
+    completed_levels: z
+      .union([
+        z.number().int().min(0).max(1000),
+        z.array(z.union([z.number().int().min(0).max(1000), z.string().trim().max(64)])).max(100),
+      ])
+      .optional()
+      .default(1),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid game progress payload.' });
+    return;
+  }
+
+  const { game_slug, score, stars, completed_levels } = parsed.data;
   const sb = requireSupabaseAdmin();
   const [{ data: student }, { data: game }] = await Promise.all([
     sb.from('students').select('id').eq('profile_id', req.user!.id).is('deleted_at', null).maybeSingle(),
@@ -2056,9 +2547,9 @@ app.post('/api/student/games/progress', authenticate, requireRole('student'), as
     return;
   }
 
-  const nextScore = Number(score || 0);
-  const nextStars = Number(stars || 0);
-  const nextLevels = Number(completed_levels || 1);
+  const nextScore = score;
+  const nextStars = stars;
+  const nextLevels = Array.isArray(completed_levels) ? completed_levels.length : completed_levels;
 
   const { data: existing } = await sb
     .from('game_progress')
@@ -2096,12 +2587,7 @@ app.post('/api/student/games/progress', authenticate, requireRole('student'), as
 // ============================================================================
 app.get('/api/guardian/dashboard', authenticate, requireRole('guardian'), asyncHandler<AuthRequest>(async (req, res) => {
   const sb = requireSupabaseAdmin();
-  const { data: guardian } = await sb
-    .from('guardians')
-    .select('*')
-    .eq('profile_id', req.user!.id)
-    .is('deleted_at', null)
-    .maybeSingle();
+  const guardian = await findGuardianForUser(sb, req.user!);
 
   if (!guardian) {
     res.status(404).json({ error: 'Guardian profile not linked yet' });
@@ -2339,15 +2825,10 @@ app.post('/api/guardian/link-child', authenticate, requireRole('guardian'), guar
   const cleanUserEmail = req.user!.email.trim().toLowerCase();
   const sb = requireSupabaseAdmin();
 
-  let { data: myGuardian } = await sb
-    .from('guardians')
-    .select('id, email')
-    .eq('profile_id', req.user!.id)
-    .is('deleted_at', null)
-    .maybeSingle();
+  let myGuardian = await findGuardianForUser(sb, req.user!);
 
   if (!myGuardian) {
-    myGuardian = await insertRowSafe<{ id: number; email: string }>('guardians', {
+    myGuardian = await insertRowSafe<{ id: number; profile_id: string | null; full_name: string; phone: string; email: string; relation: string }>('guardians', {
       profile_id: req.user!.id,
       full_name: req.user!.full_name,
       phone: '',
@@ -2358,7 +2839,7 @@ app.post('/api/guardian/link-child', authenticate, requireRole('guardian'), guar
 
   const { data: studentRow } = await sb
     .from('students')
-    .select('id, student_code, full_name_ar, guardian_id, guardians(id, profile_id, email)')
+    .select('id, student_code, full_name_ar, guardian_id, profiles(email), guardians(id, profile_id, email)')
     .ilike('student_code', cleanCode)
     .is('deleted_at', null)
     .maybeSingle();
@@ -2374,9 +2855,11 @@ app.post('/api/guardian/link-child', authenticate, requireRole('guardian'), guar
     profile_id: string | null;
     email: string;
   } | null;
+  const rawStuProf = Array.isArray(studentRow.profiles) ? studentRow.profiles[0] : studentRow.profiles;
+  const stuProfEmail = (rawStuProf as { email?: string } | null)?.email?.trim().toLowerCase() || '';
   const studentGuardianEmail = currentGuardian?.email?.trim().toLowerCase() || '';
 
-  if (!studentGuardianEmail || studentGuardianEmail !== cleanUserEmail) {
+  if (cleanUserEmail !== studentGuardianEmail && cleanUserEmail !== stuProfEmail) {
     res.status(403).json({
       error: 'Your account email does not match the registered guardian email for this student.',
     });
@@ -2705,7 +3188,7 @@ app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), asyncHan
 
 app.get('/api/teacher/students/:studentId', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
   const teacher = await getTeacherByProfile(req.user!.id);
-  const studentId = Number(req.params.studentId);
+  const studentId = parsePositiveIntParam(req.params.studentId, 'student id');
   if (!teacher || !(await assertTeacherTeachesStudent(teacher.id, studentId))) {
     res.status(403).json({ error: 'Forbidden: student is not enrolled in any of your courses' });
     return;
@@ -2974,17 +3457,27 @@ app.put('/api/teacher/payout-details', authenticate, requireRole('teacher'), asy
     res.status(404).json({ error: 'Teacher not found' });
     return;
   }
-  const { account_holder_name, bank_name, iban } = req.body as { account_holder_name: string; bank_name: string; iban: string };
-  if (!account_holder_name || !bank_name || !iban || iban.trim().length < 10) {
-    res.status(400).json({ error: 'Valid account holder, bank name, and IBAN are required (no card numbers or CVV)' });
-    return;
-  }
-  if (/^\d{13,19}$/.test(iban.replace(/\s+/g, ''))) {
-    res.status(400).json({ error: 'Card numbers are prohibited. Please enter a valid IBAN starting with country letters.' });
+  const payoutSchema = z.object({
+    account_holder_name: z.string().trim().min(2).max(120),
+    bank_name: z.string().trim().min(2).max(120),
+    iban: z
+      .string()
+      .max(64)
+      .transform((v) => v.replace(/\s+/g, '').toUpperCase())
+      .refine((v) => !/^\d{13,19}$/.test(v), 'Card numbers are prohibited. Please enter a valid IBAN starting with country letters.')
+      .refine((v) => /^[A-Z0-9]{15,34}$/.test(v), 'IBAN must be 15 to 34 alphanumeric characters.'),
+  });
+
+  const parsed = payoutSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const firstMsg = parsed.error.issues[0]?.message;
+    res.status(400).json({
+      error: firstMsg || 'Valid account holder, bank name, and IBAN are required (no card numbers or CVV)',
+    });
     return;
   }
 
-  const cleanIban = iban.trim().toUpperCase();
+  const { account_holder_name, bank_name, iban: cleanIban } = parsed.data;
   const sb = requireSupabaseAdmin();
   const { data: existing } = await sb.from('teacher_payout_details').select('id').eq('teacher_id', teacher.id).maybeSingle();
 
@@ -2992,8 +3485,8 @@ app.put('/api/teacher/payout-details', authenticate, requireRole('teacher'), asy
     await sb
       .from('teacher_payout_details')
       .update({
-        account_holder_name: account_holder_name.trim(),
-        bank_name: bank_name.trim(),
+        account_holder_name,
+        bank_name,
         iban: cleanIban,
         updated_at: new Date().toISOString(),
       })
@@ -3001,8 +3494,8 @@ app.put('/api/teacher/payout-details', authenticate, requireRole('teacher'), asy
   } else {
     await insertRowSafe('teacher_payout_details', {
       teacher_id: teacher.id,
-      account_holder_name: account_holder_name.trim(),
-      bank_name: bank_name.trim(),
+      account_holder_name,
+      bank_name,
       iban: cleanIban,
       updated_at: new Date().toISOString(),
     });
@@ -3022,6 +3515,66 @@ const ALLOWED_MATERIAL_EXTENSIONS = new Set([
 ]);
 const DISALLOWED_VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'mkv', 'avi', 'webm', 'wmv', 'flv', 'm4v']);
 
+function verifyLessonMaterialFile(ext: string, buffer: Buffer): string {
+  const isPdf = buffer.length >= 5 && buffer.subarray(0, 5).toString('ascii') === '%PDF-';
+  const isPng =
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47 &&
+    buffer[4] === 0x0d && buffer[5] === 0x0a && buffer[6] === 0x1a && buffer[7] === 0x0a;
+  const isJpeg = buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+  const isWebp =
+    buffer.length >= 12 &&
+    buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    buffer.subarray(8, 12).toString('ascii') === 'WEBP';
+  const isZip =
+    buffer.length >= 4 &&
+    buffer[0] === 0x50 && buffer[1] === 0x4b && (buffer[2] === 0x03 || buffer[2] === 0x05 || buffer[2] === 0x07);
+  const isOle2 =
+    buffer.length >= 8 &&
+    buffer[0] === 0xd0 && buffer[1] === 0xcf && buffer[2] === 0x11 && buffer[3] === 0xe0 &&
+    buffer[4] === 0xa1 && buffer[5] === 0xb1 && buffer[6] === 0x1a && buffer[7] === 0xe1;
+  const isMp3 =
+    (buffer.length >= 3 && buffer.subarray(0, 3).toString('ascii') === 'ID3') ||
+    (buffer.length >= 2 && buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0);
+  const isM4a = buffer.length >= 8 && buffer.subarray(4, 8).toString('ascii') === 'ftyp';
+
+  switch (ext) {
+    case 'pdf':
+      if (!isPdf) throw new AppError(400, 'Invalid PDF file signature.');
+      return 'application/pdf';
+    case 'png':
+      if (!isPng) throw new AppError(400, 'Invalid PNG image signature.');
+      return 'image/png';
+    case 'jpg':
+    case 'jpeg':
+      if (!isJpeg) throw new AppError(400, 'Invalid JPEG image signature.');
+      return 'image/jpeg';
+    case 'webp':
+      if (!isWebp) throw new AppError(400, 'Invalid WEBP image signature.');
+      return 'image/webp';
+    case 'doc':
+      if (!isOle2) throw new AppError(400, 'Invalid DOC file signature.');
+      return 'application/msword';
+    case 'ppt':
+      if (!isOle2) throw new AppError(400, 'Invalid PPT file signature.');
+      return 'application/vnd.ms-powerpoint';
+    case 'docx':
+      if (!isZip) throw new AppError(400, 'Invalid DOCX file signature.');
+      return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    case 'pptx':
+      if (!isZip) throw new AppError(400, 'Invalid PPTX file signature.');
+      return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+    case 'mp3':
+      if (!isMp3) throw new AppError(400, 'Invalid MP3 audio signature.');
+      return 'audio/mpeg';
+    case 'm4a':
+      if (!isM4a) throw new AppError(400, 'Invalid M4A audio signature.');
+      return 'audio/mp4';
+    default:
+      throw new AppError(400, 'Unsupported file type.');
+  }
+}
+
 async function ensureMaterialsBucket(sb: ReturnType<typeof requireSupabaseAdmin>) {
   const { data: bucket } = await sb.storage.getBucket(LESSON_MATERIALS_BUCKET);
   if (!bucket) {
@@ -3030,7 +3583,11 @@ async function ensureMaterialsBucket(sb: ReturnType<typeof requireSupabaseAdmin>
       fileSizeLimit: MAX_MATERIAL_BYTES,
     });
     if (error && !String(error.message || '').toLowerCase().includes('already exists')) {
-      throw new AppError(500, `Storage bucket initialization failed: ${error.message}`);
+      console.error('[materials-bucket]', error);
+      throw new AppError(
+        500,
+        IS_PRODUCTION ? 'Storage bucket initialization failed' : `Storage bucket initialization failed: ${error.message}`
+      );
     }
   }
 }
@@ -3102,12 +3659,7 @@ async function assertCanAccessLesson(user: AuthUser, lessonId: number) {
   }
 
   if (user.role === 'guardian') {
-    const { data: guardian } = await sb
-      .from('guardians')
-      .select('id')
-      .eq('profile_id', user.id)
-      .is('deleted_at', null)
-      .maybeSingle();
+    const guardian = await findGuardianForUser(sb, user);
     if (guardian) {
       const { data: children } = await sb
         .from('students')
@@ -3132,7 +3684,7 @@ async function assertCanAccessLesson(user: AuthUser, lessonId: number) {
 }
 
 app.post('/api/lessons/:lessonId/links', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
-  const lessonId = Number(req.params.lessonId);
+  const lessonId = parsePositiveIntParam(req.params.lessonId, 'lesson id');
   await assertCanManageLesson(req.user!, lessonId);
 
   const schema = z.object({
@@ -3173,16 +3725,17 @@ app.post('/api/lessons/:lessonId/links', authenticate, requireRole('admin', 'tea
 
 app.post(
   '/api/lessons/:lessonId/upload-material',
-  express.json({ limit: '14mb' }),
+  examUploadLimiter,
   authenticate,
   requireRole('admin', 'teacher'),
+  express.json({ limit: '14mb' }),
   asyncHandler<AuthRequest>(async (req, res) => {
-    const lessonId = Number(req.params.lessonId);
+    const lessonId = parsePositiveIntParam(req.params.lessonId, 'lesson id');
     const { sb } = await assertCanManageLesson(req.user!, lessonId);
 
     const schema = z.object({
       fileName: z.string().trim().min(1).max(180),
-      mimeType: z.string().trim().min(1).max(120),
+      mimeType: z.string().trim().max(120).optional(),
       base64Data: z.string().min(1),
       title_ar: z.string().trim().max(160).optional(),
     });
@@ -3216,6 +3769,8 @@ app.post(
       return;
     }
 
+    const verifiedMime = verifyLessonMaterialFile(ext, buffer);
+
     await ensureMaterialsBucket(sb);
     const safeBase = rawName.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || `file.${ext}`;
     const objectPath = `lessons/${lessonId}/${Date.now()}-${crypto.randomBytes(3).toString('hex')}-${safeBase}`;
@@ -3223,12 +3778,12 @@ app.post(
     const { error: uploadErr } = await sb.storage
       .from(LESSON_MATERIALS_BUCKET)
       .upload(objectPath, buffer, {
-        contentType: parsed.data.mimeType,
+        contentType: verifiedMime,
         upsert: false,
       });
 
     if (uploadErr) {
-      res.status(500).json({ error: `Upload failed: ${uploadErr.message}` });
+      sendInternalError(res, 'lesson-upload-material', uploadErr, 'Material upload failed');
       return;
     }
 
@@ -3255,7 +3810,7 @@ app.post(
 );
 
 app.delete('/api/lesson-links/:id', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
-  const linkId = Number(req.params.id);
+  const linkId = parsePositiveIntParam(req.params.id, 'lesson link id');
   const sb = requireSupabaseAdmin();
   const { data: linkRow } = await sb.from('lesson_links').select('*').eq('id', linkId).maybeSingle();
   if (!linkRow) {
@@ -3279,7 +3834,7 @@ app.delete('/api/lesson-links/:id', authenticate, requireRole('admin', 'teacher'
 }));
 
 app.get('/api/lesson-links/:id/access', authenticate, asyncHandler<AuthRequest>(async (req, res) => {
-  const linkId = Number(req.params.id);
+  const linkId = parsePositiveIntParam(req.params.id, 'lesson link id');
   const sb = requireSupabaseAdmin();
   const { data: linkRow } = await sb.from('lesson_links').select('*').eq('id', linkId).maybeSingle();
   if (!linkRow) {
@@ -3293,7 +3848,7 @@ app.get('/api/lesson-links/:id/access', authenticate, asyncHandler<AuthRequest>(
     const objectPath = linkRow.url.slice(STORAGE_PREFIX.length);
     const { data, error } = await sb.storage.from(LESSON_MATERIALS_BUCKET).createSignedUrl(objectPath, 300);
     if (error || !data?.signedUrl) {
-      res.status(500).json({ error: error?.message || 'Unable to generate download link' });
+      sendInternalError(res, 'lesson-link-access', error, 'Unable to generate download link');
       return;
     }
     res.json({ url: data.signedUrl });
@@ -3306,6 +3861,30 @@ app.get('/api/lesson-links/:id/access', authenticate, asyncHandler<AuthRequest>(
 // ============================================================================
 // HARDENED HYBRID EXAM SYSTEM (PDF/Image Vault + Auto-Graded Online Quizzes)
 // ============================================================================
+async function insertNotificationsBulk(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  profileIds: Iterable<string>,
+  titleAr: string,
+  titleEn: string,
+  bodyAr: string,
+  bodyEn: string
+) {
+  const uniqueIds = Array.from(new Set(Array.from(profileIds).map((id) => String(id || '').trim()).filter(Boolean)));
+  if (!uniqueIds.length) return;
+  const rows = uniqueIds.map((pid) => ({
+    profile_id: pid,
+    title_ar: titleAr,
+    title_en: titleEn,
+    body_ar: bodyAr,
+    body_en: bodyEn,
+  }));
+  for (let i = 0; i < rows.length; i += 200) {
+    await sb.from('notifications').insert(rows.slice(i, i + 200)).then(({ error }) => {
+      if (error) console.error('[notifications-bulk]', error);
+    });
+  }
+}
+
 async function notifyStudentAndGuardian(
   sb: ReturnType<typeof requireSupabaseAdmin>,
   studentId: number,
@@ -3328,15 +3907,41 @@ async function notifyStudentAndGuardian(
   const gObj = rawG as { profile_id?: string | null } | null;
   if (gObj?.profile_id) profileIds.add(String(gObj.profile_id));
 
-  for (const pid of profileIds) {
-    await insertRowSafe('notifications', {
-      profile_id: pid,
-      title_ar: titleAr,
-      title_en: titleEn,
-      body_ar: bodyAr,
-      body_en: bodyEn,
-    }).catch(() => {});
+  await insertNotificationsBulk(sb, profileIds, titleAr, titleEn, bodyAr, bodyEn);
+}
+
+async function notifyCourseStudentsAndGuardians(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  courseId: number,
+  titleAr: string,
+  titleEn: string,
+  bodyAr: string,
+  bodyEn: string
+): Promise<number> {
+  const { data: enrolls } = await sb
+    .from('enrollments')
+    .select('student_id, students!inner(profile_id, deleted_at, guardians(profile_id))')
+    .eq('course_id', courseId)
+    .eq('status', 'active')
+    .is('deleted_at', null)
+    .is('students.deleted_at', null);
+
+  const profileIds = new Set<string>();
+  let studentCount = 0;
+  for (const row of enrolls || []) {
+    studentCount += 1;
+    const rawS = Array.isArray((row as { students?: unknown }).students)
+      ? ((row as { students: unknown[] }).students[0])
+      : (row as { students?: unknown }).students;
+    const stu = rawS as { profile_id?: string | null; guardians?: unknown } | null;
+    if (stu?.profile_id) profileIds.add(String(stu.profile_id));
+    const rawG = Array.isArray(stu?.guardians) ? stu?.guardians[0] : stu?.guardians;
+    const gObj = rawG as { profile_id?: string | null } | null;
+    if (gObj?.profile_id) profileIds.add(String(gObj.profile_id));
   }
+
+  await insertNotificationsBulk(sb, profileIds, titleAr, titleEn, bodyAr, bodyEn);
+  return studentCount;
 }
 
 async function notifyCourseExamPublished(
@@ -3345,23 +3950,14 @@ async function notifyCourseExamPublished(
   examTitleAr: string,
   examTitleEn: string
 ) {
-  const { data: enrolls } = await sb
-    .from('enrollments')
-    .select('student_id')
-    .eq('course_id', courseId)
-    .eq('status', 'active')
-    .is('deleted_at', null);
-
-  for (const row of enrolls || []) {
-    await notifyStudentAndGuardian(
-      sb,
-      Number((row as { student_id: number }).student_id),
-      `امتحان جديد: ${examTitleAr}`,
-      `New Exam Published: ${examTitleEn}`,
-      'تم نشر امتحان جديد في حلقتك. يرجى مراجعة تبويب الامتحانات والالتزام بموعد التسليم.',
-      'A new exam has been published for your course. Please check the Exams tab.'
-    );
-  }
+  await notifyCourseStudentsAndGuardians(
+    sb,
+    courseId,
+    `امتحان جديد: ${examTitleAr}`,
+    `New Exam Published: ${examTitleEn}`,
+    'تم نشر امتحان جديد في حلقتك. يرجى مراجعة تبويب الامتحانات والالتزام بموعد التسليم.',
+    'A new exam has been published for your course. Please check the Exams tab.'
+  );
   void broadcastRealtimeEvent('notification:created', { kind: 'exam' });
 }
 
@@ -3374,25 +3970,14 @@ async function notifyCourseLessonPublished(
   lessonTitleEn: string,
   scheduleHint: string
 ): Promise<number> {
-  const { data: enrolls } = await sb
-    .from('enrollments')
-    .select('student_id')
-    .eq('course_id', courseId)
-    .eq('status', 'active')
-    .is('deleted_at', null);
-
-  let count = 0;
-  for (const row of enrolls || []) {
-    await notifyStudentAndGuardian(
-      sb,
-      Number((row as { student_id: number }).student_id),
-      `تم نشر درس جديد: ${lessonTitleAr}`,
-      `New Lesson Published: ${lessonTitleEn}`,
-      `تم نشر درس جديد في كورس "${courseTitleAr}" (${scheduleHint}). يمكنك الآن فتح المرفقات وملف الـ PDF ورابط الحصة من تبويب الدروس.`,
-      `A new lesson in "${courseTitleEn}" (${scheduleHint}) has been published with its links and PDF materials.`
-    );
-    count += 1;
-  }
+  const count = await notifyCourseStudentsAndGuardians(
+    sb,
+    courseId,
+    `تم نشر درس جديد: ${lessonTitleAr}`,
+    `New Lesson Published: ${lessonTitleEn}`,
+    `تم نشر درس جديد في كورس "${courseTitleAr}" (${scheduleHint}). يمكنك الآن فتح المرفقات وملف الـ PDF ورابط الحصة من تبويب الدروس.`,
+    `A new lesson in "${courseTitleEn}" (${scheduleHint}) has been published with its links and PDF materials.`
+  );
   void broadcastRealtimeEvent('notification:created', { kind: 'lesson' });
   return count;
 }
@@ -3463,12 +4048,7 @@ async function assertCanAccessExam(user: AuthUser, examId: number) {
   }
 
   if (user.role === 'guardian') {
-    const { data: guardian } = await sb
-      .from('guardians')
-      .select('id')
-      .eq('profile_id', user.id)
-      .is('deleted_at', null)
-      .maybeSingle();
+    const guardian = await findGuardianForUser(sb, user);
     if (guardian) {
       const { data: children } = await sb
         .from('students')
@@ -3610,7 +4190,7 @@ app.post('/api/exams', authenticate, requireRole('admin', 'teacher'), asyncHandl
 }));
 
 app.patch('/api/exams/:examId', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
-  const examId = Number(req.params.examId);
+  const examId = parsePositiveIntParam(req.params.examId, 'exam id');
   const { sb, exam } = await assertCanManageExam(req.user!, examId);
 
   const partialSchema = examCreateOrUpdateSchema.partial().omit({ course_id: true, notify_students: true });
@@ -3664,10 +4244,10 @@ app.patch('/api/exams/:examId', authenticate, requireRole('admin', 'teacher'), a
 }));
 
 app.delete('/api/exams/:examId', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
-  const examId = Number(req.params.examId);
+  const examId = parsePositiveIntParam(req.params.examId, 'exam id');
   const { sb } = await assertCanManageExam(req.user!, examId);
-  await sb.from('exams').update({ deleted_at: new Date().toISOString() }).eq('id', examId);
-  invalidateExamCache(examId);
+  await deleteExamVaultData(sb, examId);
+  await sb.from('exams').delete().eq('id', examId);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'DELETE_EXAM', 'exam', examId, {});
   void broadcastRealtimeEvent('academic:updated', { kind: 'exam' });
   res.json({ ok: true });
@@ -3675,12 +4255,12 @@ app.delete('/api/exams/:examId', authenticate, requireRole('admin', 'teacher'), 
 
 app.post(
   '/api/exams/:examId/question-file',
-  express.json({ limit: '14mb' }),
+  examUploadLimiter,
   authenticate,
   requireRole('admin', 'teacher'),
-  examUploadLimiter,
+  express.json({ limit: '14mb' }),
   asyncHandler<AuthRequest>(async (req, res) => {
-    const examId = Number(req.params.examId);
+    const examId = parsePositiveIntParam(req.params.examId, 'exam id');
     const { sb } = await assertCanManageExam(req.user!, examId);
 
     const schema = z.object({
@@ -3721,7 +4301,7 @@ app.post(
 );
 
 app.delete('/api/exams/:examId/question-file', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
-  const examId = Number(req.params.examId);
+  const examId = parsePositiveIntParam(req.params.examId, 'exam id');
   const { sb } = await assertCanManageExam(req.user!, examId);
   const cfg = await getExamVaultConfig(sb, examId);
   if (cfg.question_file?.path) {
@@ -3732,7 +4312,7 @@ app.delete('/api/exams/:examId/question-file', authenticate, requireRole('admin'
 }));
 
 app.get('/api/exams/:examId/question-file', authenticate, asyncHandler<AuthRequest>(async (req, res) => {
-  const examId = Number(req.params.examId);
+  const examId = parsePositiveIntParam(req.params.examId, 'exam id');
   const { sb } = await assertCanAccessExam(req.user!, examId);
   const cfg = await getExamVaultConfig(sb, examId);
 
@@ -3752,7 +4332,7 @@ app.get('/api/exams/:examId/question-file', authenticate, asyncHandler<AuthReque
 }));
 
 app.get('/api/exams/:examId/submissions', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
-  const examId = Number(req.params.examId);
+  const examId = parsePositiveIntParam(req.params.examId, 'exam id');
   const { sb, exam } = await assertCanManageExam(req.user!, examId);
 
   const [enrollRes, resultsRes, subs] = await Promise.all([
@@ -3803,12 +4383,12 @@ app.get('/api/exams/:examId/submissions', authenticate, requireRole('admin', 'te
 
 app.post(
   '/api/exams/:examId/submit-file',
-  express.json({ limit: '14mb' }),
+  examUploadLimiter,
   authenticate,
   requireRole('student'),
-  examUploadLimiter,
+  express.json({ limit: '14mb' }),
   asyncHandler<AuthRequest>(async (req, res) => {
-    const examId = Number(req.params.examId);
+    const examId = parsePositiveIntParam(req.params.examId, 'exam id');
     const { sb, exam, studentId } = await assertCanAccessExam(req.user!, examId);
     if (!studentId) {
       res.status(403).json({ error: 'Student profile is not linked.' });
@@ -3914,7 +4494,7 @@ app.post(
   authenticate,
   requireRole('student'),
   asyncHandler<AuthRequest>(async (req, res) => {
-    const examId = Number(req.params.examId);
+    const examId = parsePositiveIntParam(req.params.examId, 'exam id');
     const { sb, studentId } = await assertCanAccessExam(req.user!, examId);
     if (!studentId) {
       res.status(403).json({ error: 'Student profile is not linked.' });
@@ -3986,7 +4566,7 @@ app.post(
   requireRole('student'),
   examUploadLimiter,
   asyncHandler<AuthRequest>(async (req, res) => {
-    const examId = Number(req.params.examId);
+    const examId = parsePositiveIntParam(req.params.examId, 'exam id');
     const { sb, exam, studentId } = await assertCanAccessExam(req.user!, examId);
     if (!studentId) {
       res.status(403).json({ error: 'Student profile is not linked.' });
@@ -4172,12 +4752,12 @@ app.post(
 
 app.post(
   '/api/exams/:examId/grade',
-  express.json({ limit: '14mb' }),
+  examUploadLimiter,
   authenticate,
   requireRole('admin', 'teacher'),
-  examUploadLimiter,
+  express.json({ limit: '14mb' }),
   asyncHandler<AuthRequest>(async (req, res) => {
-    const examId = Number(req.params.examId);
+    const examId = parsePositiveIntParam(req.params.examId, 'exam id');
     const { sb, exam } = await assertCanManageExam(req.user!, examId);
 
     const schema = z.object({
@@ -4302,8 +4882,8 @@ app.post(
 );
 
 app.get('/api/exams/:examId/submissions/:studentId/file', authenticate, asyncHandler<AuthRequest>(async (req, res) => {
-  const examId = Number(req.params.examId);
-  const targetStudentId = Number(req.params.studentId);
+  const examId = parsePositiveIntParam(req.params.examId, 'exam id');
+  const targetStudentId = parsePositiveIntParam(req.params.studentId, 'student id');
   const kind = req.query.kind === 'graded' ? 'graded' : 'solution';
 
   const sb = requireSupabaseAdmin();
@@ -4324,14 +4904,14 @@ app.get('/api/exams/:examId/submissions/:studentId/file', authenticate, asyncHan
     authorized = true;
   } else if (req.user!.role === 'teacher') {
     const teacher = await getTeacherByProfile(req.user!.id);
-    const rawC = Array.isArray(exam.courses) ? exam.courses[0] : exam.courses;
-    const course = rawC as { teacher_id?: number | null } | null;
-    if (teacher && course?.teacher_id === teacher.id) authorized = true;
+    if (teacher && (await assertTeacherOwnsCourse(teacher.id, Number(exam.course_id)))) {
+      authorized = true;
+    }
   } else if (req.user!.role === 'student') {
     const { data: stu } = await sb.from('students').select('id').eq('profile_id', req.user!.id).is('deleted_at', null).maybeSingle();
     if (stu && Number(stu.id) === targetStudentId) authorized = true;
   } else if (req.user!.role === 'guardian') {
-    const { data: guard } = await sb.from('guardians').select('id').eq('profile_id', req.user!.id).is('deleted_at', null).maybeSingle();
+    const guard = await findGuardianForUser(sb, req.user!);
     if (guard) {
       const { data: stu } = await sb
         .from('students')
@@ -4362,8 +4942,8 @@ app.get('/api/exams/:examId/submissions/:studentId/file', authenticate, asyncHan
 }));
 
 app.post('/api/exams/:examId/submissions/:studentId/reset', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
-  const examId = Number(req.params.examId);
-  const targetStudentId = Number(req.params.studentId);
+  const examId = parsePositiveIntParam(req.params.examId, 'exam id');
+  const targetStudentId = parsePositiveIntParam(req.params.studentId, 'student id');
   const { sb } = await assertCanManageExam(req.user!, examId);
 
   await sb.from('exam_results').delete().eq('exam_id', examId).eq('student_id', targetStudentId);
@@ -4414,8 +4994,9 @@ app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler
       .order('id', { ascending: false }),
     sb
       .from('lessons')
-      .select('*, courses(title_ar)')
+      .select('*, courses!inner(title_ar, deleted_at)')
       .is('deleted_at', null)
+      .is('courses.deleted_at', null)
       .order('lesson_date', { ascending: false }),
     sb.from('lesson_links').select('*'),
     sb
@@ -4433,8 +5014,9 @@ app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler
       .order('created_at', { ascending: false }),
     sb
       .from('exams')
-      .select('*, courses(title_ar)')
+      .select('*, courses!inner(title_ar, deleted_at)')
       .is('deleted_at', null)
+      .is('courses.deleted_at', null)
       .order('exam_date', { ascending: false }),
     sb
       .from('certificates')
@@ -4625,6 +5207,27 @@ function sanitizeCourseCoverUrlInput(raw?: string | null): string | null {
 }
 
 app.post('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const schema = z.object({
+    title_ar: z.string().trim().min(2).max(180),
+    title_en: z.string().trim().max(180).optional(),
+    description_ar: z.string().trim().max(2500).optional(),
+    description_en: z.string().trim().max(2500).optional(),
+    level_id: z.coerce.number().int().positive(),
+    teacher_id: z.union([z.coerce.number().int().positive(), z.literal(''), z.null()]).optional().transform((v) => (v === '' || v === null || v === undefined ? null : v)),
+    schedule_ar: z.string().trim().min(1).max(180),
+    schedule_en: z.string().trim().max(180).optional(),
+    price_monthly: z.coerce.number().min(0).max(100000),
+    price_monthly_sar: z.union([z.coerce.number().min(0).max(100000), z.literal(''), z.null()]).optional().transform((v) => (v === '' || v === null || v === undefined ? null : v)),
+    capacity: z.coerce.number().int().min(1).max(500).optional().default(10),
+    cover_url: z.string().trim().max(600).nullable().optional(),
+    co_teacher_ids: z.array(z.coerce.number().int().positive()).max(20).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid course creation payload' });
+    return;
+  }
+
   const {
     title_ar,
     title_en,
@@ -4639,38 +5242,39 @@ app.post('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler<
     capacity,
     cover_url,
     co_teacher_ids,
-  } = req.body;
-  const parsedSar =
-    price_monthly_sar !== undefined && price_monthly_sar !== null && price_monthly_sar !== ''
-      ? Number(price_monthly_sar)
-      : null;
-  const cleanSar = parsedSar !== null && Number.isFinite(parsedSar) && parsedSar >= 0 ? parsedSar : null;
+  } = parsed.data;
+
+  const sb = requireSupabaseAdmin();
+  const { data: levelRow } = await sb.from('levels').select('id').eq('id', level_id).maybeSingle();
+  if (!levelRow) {
+    res.status(400).json({ error: 'Selected level does not exist' });
+    return;
+  }
 
   const inserted = await insertRowSafe<{ id: number }>('courses', {
     title_ar,
-    title_en: title_en || title_ar,
-    description_ar,
-    description_en: description_en || description_ar,
-    level_id: Number(level_id),
-    teacher_id: Number(teacher_id),
+    title_en: title_en?.trim() || title_ar,
+    description_ar: description_ar || '',
+    description_en: description_en?.trim() || description_ar || '',
+    level_id,
+    teacher_id,
     schedule_ar,
-    schedule_en: schedule_en || schedule_ar,
-    price_monthly: Number(price_monthly),
-    capacity: Number(capacity || 10),
+    schedule_en: schedule_en?.trim() || schedule_ar,
+    price_monthly,
+    capacity,
     is_featured: true,
   });
 
-  const sb = requireSupabaseAdmin();
   const cleanCover = sanitizeCourseCoverUrlInput(cover_url);
   const cleanCoTeachers = Array.isArray(co_teacher_ids)
-    ? co_teacher_ids.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0 && id !== Number(teacher_id))
+    ? Array.from(new Set(co_teacher_ids.filter((tid) => tid !== (teacher_id || 0))))
     : [];
-  if (cleanCover || cleanCoTeachers.length > 0 || cleanSar !== null) {
+  if (cleanCover || cleanCoTeachers.length > 0 || price_monthly_sar !== null) {
     await saveCourseMeta(sb, {
       course_id: inserted.id,
       cover_url: cleanCover,
       co_teacher_ids: cleanCoTeachers,
-      price_monthly_sar: cleanSar,
+      price_monthly_sar,
       updated_at: new Date().toISOString(),
     });
   }
@@ -4681,14 +5285,14 @@ app.post('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler<
 }));
 
 app.patch('/api/admin/courses/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = Number(req.params.id);
+  const id = parsePositiveIntParam(req.params.id, 'course id');
   const schema = z.object({
     title_ar: z.string().trim().min(1).max(180).optional(),
     title_en: z.string().trim().min(1).max(180).optional(),
     description_ar: z.string().trim().max(2000).optional(),
     description_en: z.string().trim().max(2000).optional(),
     level_id: z.coerce.number().int().positive().optional(),
-    teacher_id: z.coerce.number().int().positive().optional(),
+    teacher_id: z.union([z.coerce.number().int().positive(), z.literal(''), z.null()]).optional().transform((v) => (v === '' || v === null || v === undefined ? (v === undefined ? undefined : null) : v)),
     schedule_ar: z.string().trim().min(1).max(180).optional(),
     schedule_en: z.string().trim().min(1).max(180).optional(),
     price_monthly: z.coerce.number().min(0).max(100000).optional(),
@@ -4708,7 +5312,7 @@ app.patch('/api/admin/courses/:id', authenticate, requireRole('admin'), asyncHan
   if (Object.keys(courseUpdates).length > 0) {
     const { error } = await sb.from('courses').update(courseUpdates).eq('id', id).is('deleted_at', null);
     if (error) {
-      res.status(500).json({ error: error.message });
+      sendInternalError(res, 'admin-update-course', error, 'Failed to update course');
       return;
     }
   }
@@ -4764,11 +5368,24 @@ function detectImageMagicMime(buffer: Buffer): { mime: 'image/png' | 'image/jpeg
 
 app.post(
   '/api/admin/courses/:id/cover',
-  express.json({ limit: '8mb' }),
+  examUploadLimiter,
   authenticate,
   requireRole('admin'),
+  express.json({ limit: '8mb' }),
   asyncHandler<AuthRequest>(async (req, res) => {
-    const id = Number(req.params.id);
+    const id = parsePositiveIntParam(req.params.id, 'course id');
+    const schema = z
+      .object({
+        presetUrl: z.string().trim().max(600).optional(),
+        base64Data: z.string().min(1).optional(),
+      })
+      .refine((v) => Boolean(v.presetUrl || v.base64Data), 'Cover URL or image file is required.');
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid cover upload payload.' });
+      return;
+    }
+
     const sb = requireSupabaseAdmin();
     const { data: course } = await sb.from('courses').select('id').eq('id', id).is('deleted_at', null).maybeSingle();
     if (!course) {
@@ -4776,7 +5393,7 @@ app.post(
       return;
     }
 
-    const { presetUrl, base64Data } = req.body as { presetUrl?: string; base64Data?: string };
+    const { presetUrl, base64Data } = parsed.data;
     const existingMeta = await getCourseMeta(sb, id);
 
     if (presetUrl) {
@@ -4802,12 +5419,7 @@ app.post(
       return;
     }
 
-    if (!base64Data || typeof base64Data !== 'string') {
-      res.status(400).json({ error: 'Please select an image file (PNG, JPG, or WEBP).' });
-      return;
-    }
-
-    const base64Clean = base64Data.includes(',') ? base64Data.split(',').pop() || '' : base64Data;
+    const base64Clean = base64Data!.includes(',') ? base64Data!.split(',').pop() || '' : base64Data!;
     const buffer = Buffer.from(base64Clean, 'base64');
     if (!buffer.length || buffer.length > 5 * 1024 * 1024) {
       res.status(400).json({ error: 'Image file must be under 5 MB.' });
@@ -4841,18 +5453,82 @@ app.post(
   })
 );
 
+async function hardDeleteLessonCascade(sb: ReturnType<typeof requireSupabaseAdmin>, lessonId: number): Promise<boolean> {
+  const { data: lesson } = await sb.from('lessons').select('id').eq('id', lessonId).maybeSingle();
+  if (!lesson) return false;
+  const { data: materials } = await sb.from('lesson_materials').select('storage_path').eq('lesson_id', lessonId);
+  const storagePaths = (materials || [])
+    .map((m: { storage_path?: string | null }) => m.storage_path)
+    .filter((p): p is string => Boolean(p && p.trim()))
+    .map((p) => (p.startsWith(STORAGE_PREFIX) ? p.slice(STORAGE_PREFIX.length) : p));
+  if (storagePaths.length > 0) {
+    await sb.storage.from(LESSON_MATERIALS_BUCKET).remove(storagePaths).catch(() => {});
+  }
+  await deleteLessonMeta(sb, lessonId);
+  await sb.from('lessons').delete().eq('id', lessonId);
+  return true;
+}
+
+async function hardDeleteCourseCascade(sb: ReturnType<typeof requireSupabaseAdmin>, courseId: number): Promise<boolean> {
+  const { data: course } = await sb.from('courses').select('id').eq('id', courseId).maybeSingle();
+  if (!course) return false;
+
+  const [courseMeta, lessonsRes, examsRes] = await Promise.all([
+    getCourseMeta(sb, courseId),
+    sb.from('lessons').select('id').eq('course_id', courseId),
+    sb.from('exams').select('id').eq('course_id', courseId),
+  ]);
+
+  for (const l of (lessonsRes.data || []) as Array<{ id: number }>) {
+    await hardDeleteLessonCascade(sb, Number(l.id));
+  }
+  for (const e of (examsRes.data || []) as Array<{ id: number }>) {
+    await deleteExamVaultData(sb, Number(e.id));
+  }
+  if (courseMeta?.cover_storage_path) {
+    await removeCourseCoverFile(sb, courseMeta.cover_storage_path);
+  }
+  await deleteCourseMeta(sb, courseId);
+  await sb.from('courses').delete().eq('id', courseId);
+  return true;
+}
+
 app.delete('/api/admin/courses/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = Number(req.params.id);
+  const id = parsePositiveIntParam(req.params.id, 'course id');
   const sb = requireSupabaseAdmin();
-  await sb.from('courses').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+  const deleted = await hardDeleteCourseCascade(sb, id);
+  if (!deleted) {
+    res.status(404).json({ error: 'Course not found' });
+    return;
+  }
   invalidateOverviewCache();
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'SOFT_DELETE_COURSE', 'course', id, {});
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'DELETE_COURSE', 'course', id, {});
   res.json({ ok: true });
 }));
 
 app.post('/api/admin/lessons', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const schema = z.object({
+    course_id: z.coerce.number().int().positive(),
+    title_ar: z.string().trim().min(1).max(180),
+    title_en: z.string().trim().max(180).optional(),
+    lesson_date: z.string().trim().min(4).max(30),
+    start_time: z.string().trim().min(2).max(20),
+    duration_min: z.coerce.number().int().min(10).max(360).optional().default(45),
+    objectives_ar: z.string().trim().max(1500).optional(),
+    objectives_en: z.string().trim().max(1500).optional(),
+    live_url: z.string().trim().max(600).optional(),
+    weekday_ar: z.string().trim().max(80).optional(),
+    is_published: z.boolean().optional(),
+    publish_and_notify: z.boolean().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid lesson payload' });
+    return;
+  }
+
   const {
-    course_id,
+    course_id: courseIdNum,
     title_ar,
     title_en,
     lesson_date,
@@ -4864,30 +5540,41 @@ app.post('/api/admin/lessons', authenticate, requireRole('admin'), asyncHandler<
     weekday_ar,
     is_published,
     publish_and_notify,
-  } = req.body;
-  const courseIdNum = Number(course_id);
+  } = parsed.data;
+
+  const sb = requireSupabaseAdmin();
+  const { data: courseRow } = await sb
+    .from('courses')
+    .select('id, title_ar, title_en')
+    .eq('id', courseIdNum)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (!courseRow) {
+    res.status(404).json({ error: 'Target course not found' });
+    return;
+  }
+
   const lesson = await insertRowSafe<{ id: number }>('lessons', {
     course_id: courseIdNum,
     title_ar,
-    title_en: title_en || title_ar,
+    title_en: title_en?.trim() || title_ar,
     lesson_date,
     start_time,
-    duration_min: Number(duration_min || 45),
+    duration_min,
     objectives_ar: objectives_ar || '',
     objectives_en: objectives_en || '',
   });
 
-  if (live_url && /^https?:\/\//i.test(String(live_url).trim())) {
+  if (live_url && /^https?:\/\//i.test(live_url)) {
     await insertRowSafe('lesson_links', {
       lesson_id: lesson.id,
       title_ar: 'رابط الحصة المباشرة',
       title_en: 'Live Session Link',
-      url: String(live_url).trim(),
-      link_type: String(live_url).includes('meet.google') ? 'meet' : 'zoom',
+      url: live_url,
+      link_type: live_url.includes('meet.google') ? 'meet' : 'zoom',
     });
   }
 
-  const sb = requireSupabaseAdmin();
   const shouldPublish = publish_and_notify !== undefined ? Boolean(publish_and_notify) : is_published !== undefined ? Boolean(is_published) : true;
   const cleanWeekday = String(weekday_ar || '').trim();
   await saveLessonMeta(sb, {
@@ -4899,15 +5586,14 @@ app.post('/api/admin/lessons', authenticate, requireRole('admin'), asyncHandler<
 
   let notifiedStudents = 0;
   if (publish_and_notify === true) {
-    const { data: courseRow } = await sb.from('courses').select('title_ar, title_en').eq('id', courseIdNum).maybeSingle();
     const scheduleHint = [cleanWeekday, lesson_date, start_time].filter(Boolean).join(' · ');
     notifiedStudents = await notifyCourseLessonPublished(
       sb,
       courseIdNum,
-      String(courseRow?.title_ar || ''),
-      String(courseRow?.title_en || courseRow?.title_ar || ''),
-      String(title_ar || ''),
-      String(title_en || title_ar || ''),
+      String(courseRow.title_ar || ''),
+      String(courseRow.title_en || courseRow.title_ar || ''),
+      title_ar,
+      title_en?.trim() || title_ar,
       scheduleHint
     );
   }
@@ -4922,7 +5608,7 @@ app.post('/api/admin/lessons', authenticate, requireRole('admin'), asyncHandler<
 }));
 
 app.post('/api/admin/lessons/:id/publish', authenticate, requireRole('admin', 'teacher'), asyncHandler<AuthRequest>(async (req, res) => {
-  const lessonId = Number(req.params.id);
+  const lessonId = parsePositiveIntParam(req.params.id, 'lesson id');
   const { sb } = await assertCanManageLesson(req.user!, lessonId);
   const { data: lessonRow } = await sb
     .from('lessons')
@@ -4964,7 +5650,7 @@ app.post('/api/admin/lessons/:id/publish', authenticate, requireRole('admin', 't
 }));
 
 app.patch('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = Number(req.params.id);
+  const id = parsePositiveIntParam(req.params.id, 'lesson id');
   const schema = z.object({
     course_id: z.coerce.number().int().positive().optional(),
     title_ar: z.string().trim().min(1).max(180).optional(),
@@ -4987,7 +5673,7 @@ app.patch('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHan
   if (Object.keys(lessonUpdates).length > 0) {
     const { error } = await sb.from('lessons').update(lessonUpdates).eq('id', id).is('deleted_at', null);
     if (error) {
-      res.status(500).json({ error: error.message });
+      sendInternalError(res, 'admin-update-lesson', error, 'Failed to update lesson');
       return;
     }
   }
@@ -5009,23 +5695,40 @@ app.patch('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHan
 }));
 
 app.delete('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = Number(req.params.id);
+  const id = parsePositiveIntParam(req.params.id, 'lesson id');
   const sb = requireSupabaseAdmin();
-  await sb.from('lessons').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+  const deleted = await hardDeleteLessonCascade(sb, id);
+  if (!deleted) {
+    res.status(404).json({ error: 'Lesson not found' });
+    return;
+  }
   invalidateOverviewCache();
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'SOFT_DELETE_LESSON', 'lesson', id, {});
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'DELETE_LESSON', 'lesson', id, {});
   res.json({ ok: true });
 }));
 
 app.post('/api/admin/teachers', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const { email, name_ar, name_en, bio_ar, bio_en, qualifications_ar, qualifications_en, specialty_ar, specialty_en, hourly_rate } = req.body;
-  if (!email || !name_ar) {
-    res.status(400).json({ error: 'Teacher email and Arabic name are required' });
+  const schema = z.object({
+    email: z.string().trim().email().max(160),
+    name_ar: z.string().trim().min(2).max(160),
+    name_en: z.string().trim().max(160).optional(),
+    bio_ar: z.string().trim().max(2000).optional(),
+    bio_en: z.string().trim().max(2000).optional(),
+    qualifications_ar: z.string().trim().max(500).optional(),
+    qualifications_en: z.string().trim().max(500).optional(),
+    specialty_ar: z.string().trim().max(200).optional(),
+    specialty_en: z.string().trim().max(200).optional(),
+    hourly_rate: z.coerce.number().min(0).max(50000).optional().default(180),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Valid teacher email, Arabic name, and hourly rate are required' });
     return;
   }
 
-  const cleanEmail = String(email).trim().toLowerCase();
-  const cleanName = String(name_ar).trim();
+  const { email, name_ar, name_en, bio_ar, bio_en, qualifications_ar, qualifications_en, specialty_ar, specialty_en, hourly_rate } = parsed.data;
+  const cleanEmail = email.toLowerCase();
+  const cleanName = name_ar;
   const tempPassword = generateTempPassword();
   const sb = requireSupabaseAdmin();
 
@@ -5042,14 +5745,14 @@ app.post('/api/admin/teachers', authenticate, requireRole('admin'), asyncHandler
     { onConflict: 'id' }
   );
   if (pErr) {
-    res.status(500).json({ error: pErr.message });
+    sendInternalError(res, 'admin-create-teacher-profile', pErr, 'Failed to save teacher profile');
     return;
   }
 
   const teacher = await insertRowSafe<{ id: number }>('teachers', {
     profile_id: user.id,
     name_ar: cleanName,
-    name_en: name_en || cleanName,
+    name_en: name_en?.trim() || cleanName,
     bio_ar: bio_ar || '',
     bio_en: bio_en || '',
     qualifications_ar: qualifications_ar || '',
@@ -5057,7 +5760,7 @@ app.post('/api/admin/teachers', authenticate, requireRole('admin'), asyncHandler
     specialty_ar: specialty_ar || '',
     specialty_en: specialty_en || '',
     avatar_url: '/assets/images/teacher_portrait_1.webp',
-    hourly_rate: Number(hourly_rate || 180),
+    hourly_rate,
   });
 
   invalidateOverviewCache();
@@ -5066,7 +5769,7 @@ app.post('/api/admin/teachers', authenticate, requireRole('admin'), asyncHandler
 }));
 
 app.patch('/api/admin/teachers/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = Number(req.params.id);
+  const id = parsePositiveIntParam(req.params.id, 'teacher id');
   const schema = z.object({
     name_ar: z.string().trim().min(1).max(160).optional(),
     name_en: z.string().trim().min(1).max(160).optional(),
@@ -5087,7 +5790,7 @@ app.patch('/api/admin/teachers/:id', authenticate, requireRole('admin'), asyncHa
   const sb = requireSupabaseAdmin();
   const { error } = await sb.from('teachers').update(parsed.data).eq('id', id).is('deleted_at', null);
   if (error) {
-    res.status(500).json({ error: error.message });
+    sendInternalError(res, 'admin-update-teacher', error, 'Failed to update teacher');
     return;
   }
   invalidateOverviewCache();
@@ -5095,24 +5798,226 @@ app.patch('/api/admin/teachers/:id', authenticate, requireRole('admin'), asyncHa
   res.json({ ok: true });
 }));
 
+async function purgeEmailTraces(sb: ReturnType<typeof requireSupabaseAdmin>, rawEmails: Array<string | null | undefined>, matchedProfileIds: Array<string | null | undefined> = []) {
+  const emailSet = new Set(rawEmails.map((e) => String(e || '').trim().toLowerCase()).filter(Boolean));
+  const profileSet = new Set(matchedProfileIds.map((p) => String(p || '').trim()).filter(Boolean));
+  if (!emailSet.size && !profileSet.size) return;
+
+  for (const email of emailSet) {
+    try {
+      await sb.from('consents').delete().ilike('email', email);
+    } catch {
+      // ignore
+    }
+  }
+
+  const [admMetas, teacherApps, guardianReqs, admRowsRes] = await Promise.all([
+    listAdmissionMetas(sb),
+    listTeacherApplications(sb),
+    listGuardianRequests(sb),
+    sb.from('admission_requests').select('id, guardian_email'),
+  ]);
+
+  const admIdsToDelete = new Set<number>();
+  for (const [admId, meta] of admMetas.entries()) {
+    if (emailSet.has((meta.student_email || '').toLowerCase()) || (meta.pending_profile_id && profileSet.has(meta.pending_profile_id))) {
+      admIdsToDelete.add(admId);
+    }
+  }
+  for (const row of (admRowsRes.data || []) as Array<{ id: number; guardian_email?: string | null }>) {
+    if (emailSet.has(String(row.guardian_email || '').trim().toLowerCase())) {
+      admIdsToDelete.add(Number(row.id));
+    }
+  }
+  for (const admId of admIdsToDelete) {
+    await deleteAdmissionMeta(sb, admId);
+    try {
+      await sb.from('admission_requests').delete().eq('id', admId);
+    } catch {
+      // ignore
+    }
+  }
+
+  for (const appRec of teacherApps) {
+    if (emailSet.has((appRec.email || '').toLowerCase()) || (appRec.profile_id && profileSet.has(appRec.profile_id))) {
+      await deleteTeacherApplication(sb, appRec.id);
+    }
+  }
+
+  for (const gReq of guardianReqs) {
+    if (emailSet.has((gReq.email || '').toLowerCase()) || (gReq.profile_id && profileSet.has(gReq.profile_id))) {
+      await deleteGuardianRequest(sb, gReq.id);
+    }
+  }
+}
+
+async function purgeNonAdminProfileAndAuth(sb: ReturnType<typeof requireSupabaseAdmin>, profileId: string | null | undefined): Promise<string | null> {
+  if (!profileId) return null;
+  const { data: prof } = await sb.from('profiles').select('id, email, role').eq('id', profileId).maybeSingle();
+  if (prof?.role === 'admin') {
+    return prof.email || null;
+  }
+  const email = prof?.email ? String(prof.email).trim().toLowerCase() : null;
+  try {
+    await sb.from('notifications').delete().eq('profile_id', profileId);
+  } catch {
+    // ignore
+  }
+  try {
+    await sb.from('profiles').delete().eq('id', profileId);
+  } catch {
+    // ignore
+  }
+  await sb.auth.admin.deleteUser(profileId).catch(() => {});
+  if (email) {
+    const leftover = await findSupabaseAuthUserByEmail(email).catch(() => null);
+    if (leftover && leftover.id !== profileId) {
+      await sb.auth.admin.deleteUser(leftover.id).catch(() => {});
+    }
+  }
+  return email;
+}
+
+async function hardDeleteTeacherCascade(sb: ReturnType<typeof requireSupabaseAdmin>, teacherId: number): Promise<{ deleted: boolean; name_ar?: string; email?: string | null }> {
+  const { data: teacher } = await sb
+    .from('teachers')
+    .select('id, profile_id, name_ar')
+    .eq('id', teacherId)
+    .maybeSingle();
+  if (!teacher) return { deleted: false };
+
+  let profileEmail: string | null = null;
+  if (teacher.profile_id) {
+    const { data: p } = await sb.from('profiles').select('email').eq('id', teacher.profile_id).maybeSingle();
+    profileEmail = p?.email ?? null;
+  }
+
+  await sb.from('courses').update({ teacher_id: null }).eq('teacher_id', teacherId);
+  const metas = await listCourseMetas(sb);
+  for (const [cid, meta] of metas.entries()) {
+    if (meta.co_teacher_ids?.includes(teacherId)) {
+      await saveCourseMeta(sb, {
+        ...meta,
+        course_id: cid,
+        co_teacher_ids: meta.co_teacher_ids.filter((tid) => tid !== teacherId),
+        updated_at: new Date().toISOString(),
+      });
+    }
+  }
+
+  await sb.from('payroll').delete().eq('teacher_id', teacherId);
+  await sb.from('teacher_payout_details').delete().eq('teacher_id', teacherId);
+  await sb.from('teachers').delete().eq('id', teacherId);
+
+  const purgedEmail = await purgeNonAdminProfileAndAuth(sb, teacher.profile_id);
+  const finalEmail = purgedEmail || profileEmail;
+  await purgeEmailTraces(sb, [finalEmail], [teacher.profile_id]);
+  return { deleted: true, name_ar: teacher.name_ar, email: finalEmail };
+}
+
+async function hardDeleteStudentCascade(sb: ReturnType<typeof requireSupabaseAdmin>, studentId: number): Promise<{ deleted: boolean; name_ar?: string; email?: string | null }> {
+  const { data: student } = await sb
+    .from('students')
+    .select('id, profile_id, guardian_id, student_code, full_name_ar')
+    .eq('id', studentId)
+    .maybeSingle();
+  if (!student) return { deleted: false };
+
+  let studentEmail: string | null = null;
+  if (student.profile_id) {
+    const { data: p } = await sb.from('profiles').select('email').eq('id', student.profile_id).maybeSingle();
+    studentEmail = p?.email ?? null;
+  }
+
+  await deleteExamDataForStudent(sb, studentId);
+  await sb.from('students').delete().eq('id', studentId);
+
+  const guardianReqs = await listGuardianRequests(sb);
+  for (const gr of guardianReqs) {
+    if (gr.student_id === studentId || gr.student_code.toUpperCase() === String(student.student_code || '').toUpperCase()) {
+      await deleteGuardianRequest(sb, gr.id);
+    }
+  }
+
+  const emailsToPurge: Array<string | null> = [studentEmail];
+  const profileIdsToPurge: Array<string | null> = [student.profile_id];
+
+  if (student.guardian_id) {
+    const { count: remainingSiblings } = await sb
+      .from('students')
+      .select('id', { count: 'exact', head: true })
+      .eq('guardian_id', student.guardian_id);
+
+    if ((remainingSiblings || 0) === 0) {
+      const { data: guardian } = await sb
+        .from('guardians')
+        .select('id, profile_id, email')
+        .eq('id', student.guardian_id)
+        .maybeSingle();
+
+      await deleteGuardianAuth(sb, student.guardian_id);
+      await sb.from('guardians').delete().eq('id', student.guardian_id);
+
+      if (guardian?.email) emailsToPurge.push(guardian.email);
+      if (guardian?.profile_id && guardian.profile_id !== student.profile_id) {
+        const [{ count: otherG }, { count: otherS }, { count: otherT }] = await Promise.all([
+          sb.from('guardians').select('id', { count: 'exact', head: true }).eq('profile_id', guardian.profile_id),
+          sb.from('students').select('id', { count: 'exact', head: true }).eq('profile_id', guardian.profile_id),
+          sb.from('teachers').select('id', { count: 'exact', head: true }).eq('profile_id', guardian.profile_id),
+        ]);
+        if ((otherG || 0) === 0 && (otherS || 0) === 0 && (otherT || 0) === 0) {
+          profileIdsToPurge.push(guardian.profile_id);
+          const gEmail = await purgeNonAdminProfileAndAuth(sb, guardian.profile_id);
+          if (gEmail) emailsToPurge.push(gEmail);
+        }
+      }
+    }
+  }
+
+  const purgedStuEmail = await purgeNonAdminProfileAndAuth(sb, student.profile_id);
+  if (purgedStuEmail) emailsToPurge.push(purgedStuEmail);
+  await purgeEmailTraces(sb, emailsToPurge, profileIdsToPurge);
+
+  return { deleted: true, name_ar: student.full_name_ar, email: purgedStuEmail || studentEmail };
+}
+
 app.delete('/api/admin/teachers/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = Number(req.params.id);
+  const id = parsePositiveIntParam(req.params.id, 'teacher id');
   const sb = requireSupabaseAdmin();
-  await sb.from('teachers').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+  const result = await hardDeleteTeacherCascade(sb, id);
+  if (!result.deleted) {
+    res.status(404).json({ error: 'Teacher not found' });
+    return;
+  }
   invalidateOverviewCache();
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'SOFT_DELETE_TEACHER', 'teacher', id, {});
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'HARD_DELETE_TEACHER', 'teacher', id, {
+    name_ar: result.name_ar,
+    email: result.email,
+  });
   res.json({ ok: true });
 }));
 
 app.post('/api/admin/students', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const { email, full_name_ar, full_name_en, age, level_id, guardian_name, guardian_phone, guardian_email, course_id } = req.body;
-  if (!email || !full_name_ar || !age) {
-    res.status(400).json({ error: 'Student email, name, and age are required' });
+  const schema = z.object({
+    email: z.string().trim().email().max(160),
+    full_name_ar: z.string().trim().min(2).max(160),
+    full_name_en: z.string().trim().max(160).optional(),
+    age: z.coerce.number().int().min(3).max(25),
+    level_id: z.coerce.number().int().positive().optional().default(1),
+    guardian_name: z.string().trim().max(140).optional(),
+    guardian_phone: z.string().trim().max(32).optional(),
+    guardian_email: z.union([z.string().trim().email().max(160), z.literal('')]).optional(),
+    course_id: z.union([z.coerce.number().int().positive(), z.literal(''), z.null()]).optional().transform((v) => (v === '' || v === null || v === undefined ? undefined : v)),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Valid student email, name, and age (3-25) are required' });
     return;
   }
 
-  const cleanEmail = String(email).trim().toLowerCase();
-  const cleanName = String(full_name_ar).trim();
+  const { email, full_name_ar, full_name_en, age, level_id, guardian_name, guardian_phone, guardian_email, course_id } = parsed.data;
+  const cleanEmail = email.toLowerCase();
+  const cleanName = full_name_ar;
   const tempPassword = generateTempPassword();
   const sb = requireSupabaseAdmin();
 
@@ -5129,14 +6034,14 @@ app.post('/api/admin/students', authenticate, requireRole('admin'), asyncHandler
     { onConflict: 'id' }
   );
   if (pErr) {
-    res.status(500).json({ error: pErr.message });
+    sendInternalError(res, 'admin-create-student-profile', pErr, 'Failed to save student profile');
     return;
   }
 
   const guardian = await insertRowSafe<{ id: number }>('guardians', {
     full_name: guardian_name || 'ولي أمر',
     phone: guardian_phone || '',
-    email: (guardian_email || cleanEmail).trim().toLowerCase(),
+    email: (guardian_email || cleanEmail).toLowerCase(),
     relation: 'ولي أمر',
   });
 
@@ -5146,16 +6051,16 @@ app.post('/api/admin/students', authenticate, requireRole('admin'), asyncHandler
     guardian_id: guardian.id,
     student_code: code,
     full_name_ar: cleanName,
-    full_name_en: full_name_en || cleanName,
-    age: Number(age),
-    level_id: Number(level_id || 1),
+    full_name_en: full_name_en?.trim() || cleanName,
+    age,
+    level_id,
     status: 'active',
   });
 
   if (course_id) {
     await insertRowSafe('enrollments', {
       student_id: student.id,
-      course_id: Number(course_id),
+      course_id,
       status: 'active',
     });
   }
@@ -5166,7 +6071,7 @@ app.post('/api/admin/students', authenticate, requireRole('admin'), asyncHandler
 }));
 
 app.patch('/api/admin/students/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = Number(req.params.id);
+  const id = parsePositiveIntParam(req.params.id, 'student id');
   const schema = z.object({
     full_name_ar: z.string().trim().min(1).max(160).optional(),
     full_name_en: z.string().trim().min(1).max(160).optional(),
@@ -5221,6 +6126,9 @@ app.patch('/api/admin/students/:id', authenticate, requireRole('admin'), asyncHa
   if (Object.keys(guardianUpdates).length) {
     if (studentRow.guardian_id) {
       await sb.from('guardians').update(guardianUpdates).eq('id', studentRow.guardian_id);
+      if (parsed.data.unlink_guardian_account) {
+        await deleteGuardianAuth(sb, studentRow.guardian_id);
+      }
     } else if (guardianUpdates.email || guardianUpdates.full_name) {
       const createdGuardian = await insertRowSafe<{ id: number }>('guardians', {
         full_name: String(guardianUpdates.full_name || 'ولي أمر'),
@@ -5237,27 +6145,64 @@ app.patch('/api/admin/students/:id', authenticate, requireRole('admin'), asyncHa
 }));
 
 app.patch('/api/admin/students/:id/level', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = Number(req.params.id);
-  const { level_id } = req.body;
+  const id = parsePositiveIntParam(req.params.id, 'student id');
+  const schema = z.object({ level_id: z.coerce.number().int().positive() });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Valid level_id is required' });
+    return;
+  }
   const sb = requireSupabaseAdmin();
-  await sb.from('students').update({ level_id: Number(level_id) }).eq('id', id);
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_STUDENT_LEVEL', 'student', id, { level_id });
+  const [{ data: stu }, { data: lvl }] = await Promise.all([
+    sb.from('students').select('id').eq('id', id).is('deleted_at', null).maybeSingle(),
+    sb.from('levels').select('id').eq('id', parsed.data.level_id).maybeSingle(),
+  ]);
+  if (!stu || !lvl) {
+    res.status(404).json({ error: 'Student or level not found' });
+    return;
+  }
+  await sb.from('students').update({ level_id: parsed.data.level_id }).eq('id', id);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_STUDENT_LEVEL', 'student', id, { level_id: parsed.data.level_id });
   res.json({ ok: true });
 }));
 
 app.delete('/api/admin/students/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = Number(req.params.id);
+  const id = parsePositiveIntParam(req.params.id, 'student id');
   const sb = requireSupabaseAdmin();
-  await sb.from('students').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+  const result = await hardDeleteStudentCascade(sb, id);
+  if (!result.deleted) {
+    res.status(404).json({ error: 'Student not found' });
+    return;
+  }
   invalidateOverviewCache();
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'SOFT_DELETE_STUDENT', 'student', id, {});
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'HARD_DELETE_STUDENT', 'student', id, {
+    name_ar: result.name_ar,
+    email: result.email,
+  });
   res.json({ ok: true });
 }));
 
 app.post('/api/admin/enrollments', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const studentId = Number(req.body.student_id);
-  const courseId = Number(req.body.course_id);
+  const schema = z.object({
+    student_id: z.coerce.number().int().positive(),
+    course_id: z.coerce.number().int().positive(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Valid student_id and course_id are required' });
+    return;
+  }
+  const { student_id: studentId, course_id: courseId } = parsed.data;
   const sb = requireSupabaseAdmin();
+
+  const [{ data: stu }, { data: crs }] = await Promise.all([
+    sb.from('students').select('id').eq('id', studentId).is('deleted_at', null).maybeSingle(),
+    sb.from('courses').select('id').eq('id', courseId).is('deleted_at', null).maybeSingle(),
+  ]);
+  if (!stu || !crs) {
+    res.status(404).json({ error: 'Student or course not found' });
+    return;
+  }
 
   const { data: existing } = await sb
     .from('enrollments')
@@ -5280,7 +6225,7 @@ app.post('/api/admin/enrollments', authenticate, requireRole('admin'), asyncHand
 }));
 
 app.delete('/api/admin/enrollments/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = Number(req.params.id);
+  const id = parsePositiveIntParam(req.params.id, 'enrollment id');
   const sb = requireSupabaseAdmin();
   await sb.from('enrollments').update({ deleted_at: new Date().toISOString() }).eq('id', id);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'REMOVE_ENROLLMENT', 'enrollment', id, {});
@@ -5288,12 +6233,17 @@ app.delete('/api/admin/enrollments/:id', authenticate, requireRole('admin'), asy
 }));
 
 app.post('/api/admin/admissions/:id/decision', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = Number(req.params.id);
-  const { decision, student_email } = req.body as { decision: 'approved' | 'rejected'; student_email?: string };
-  if (decision !== 'approved' && decision !== 'rejected') {
-    res.status(400).json({ error: 'Invalid decision' });
+  const id = parsePositiveIntParam(req.params.id, 'admission id');
+  const schema = z.object({
+    decision: z.enum(['approved', 'rejected']),
+    student_email: z.union([z.string().trim().email().max(160), z.literal('')]).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid admission decision payload' });
     return;
   }
+  const { decision, student_email } = parsed.data;
   const sb = requireSupabaseAdmin();
 
   const { data: reqRow } = await sb.from('admission_requests').select('*').eq('id', id).maybeSingle();
@@ -5404,7 +6354,7 @@ app.post('/api/admin/admissions/:id/decision', authenticate, requireRole('admin'
 }));
 
 app.post('/api/admin/teacher-applications/:id/decision', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = Number(req.params.id);
+  const id = parsePositiveIntParam(req.params.id, 'teacher application id');
   const schema = z.object({
     decision: z.enum(['approved', 'rejected']),
     hourly_rate: z.coerce.number().min(0).max(50000).optional(),
@@ -5485,7 +6435,7 @@ app.post('/api/admin/teacher-applications/:id/decision', authenticate, requireRo
 }));
 
 app.post('/api/admin/guardian-requests/:id/decision', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = Number(req.params.id);
+  const id = parsePositiveIntParam(req.params.id, 'guardian request id');
   const schema = z.object({ decision: z.enum(['approved', 'rejected']) });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -5517,7 +6467,13 @@ app.post('/api/admin/guardian-requests/:id/decision', authenticate, requireRole(
       return;
     }
 
-    await sb.from('profiles').update({ is_active: true, role: 'guardian' }).eq('id', reqRecord.profile_id);
+    const { data: targetProfile } = await sb.from('profiles').select('id, role').eq('id', reqRecord.profile_id).maybeSingle();
+    const isSharedStudentProfile = Boolean(reqRecord.shared_student_email || targetProfile?.role === 'student');
+
+    if (!isSharedStudentProfile) {
+      await sb.from('profiles').update({ is_active: true, role: 'guardian' }).eq('id', reqRecord.profile_id);
+    }
+
     await sb
       .from('guardians')
       .update({
@@ -5529,12 +6485,22 @@ app.post('/api/admin/guardian-requests/:id/decision', authenticate, requireRole(
       })
       .eq('id', reqRecord.guardian_id);
 
+    const existingAuthRec = await getGuardianAuth(sb, reqRecord.guardian_id);
+    if (existingAuthRec) {
+      await saveGuardianAuth(sb, {
+        ...existingAuthRec,
+        linked_profile_id: reqRecord.profile_id,
+        status: 'approved',
+        updated_at: new Date().toISOString(),
+      });
+    }
+
     await insertRowSafe('notifications', {
       profile_id: reqRecord.profile_id,
       title_ar: 'تم تفعيل حساب ولي الأمر بنجاح',
       title_en: 'Guardian Account Approved',
-      body_ar: `تمت الموافقة على ربط حسابك بالطالب (${reqRecord.student_name} — ${reqRecord.student_code}). يمكنك الآن تسجيل الدخول ومتابعة التقارير.`,
-      body_en: `Your guardian portal link to ${reqRecord.student_code} is now active. You may sign in anytime.`,
+      body_ar: `تمت الموافقة على ربط حسابك بالطالب (${reqRecord.student_name} — ${reqRecord.student_code}). يمكنك الآن تسجيل الدخول ببوابة ولي الأمر باستخدام كلمة المرور الخاصة بولي الأمر.`,
+      body_en: `Your guardian portal link to ${reqRecord.student_code} is now active. You may sign in via the Guardian tab using your dedicated guardian password.`,
     });
 
     await saveGuardianRequest(sb, {
@@ -5546,6 +6512,7 @@ app.post('/api/admin/guardian-requests/:id/decision', authenticate, requireRole(
     await writeAuditLog(req.user!.id, req.user!.full_name, 'GUARDIAN_APP_APPROVED', 'guardian', reqRecord.guardian_id, {
       email: reqRecord.email,
       student_code: reqRecord.student_code,
+      shared_student_email: isSharedStudentProfile,
     });
     void broadcastRealtimeEvent('academic:updated', { kind: 'guardian' });
     res.json({ ok: true, email: reqRecord.email, student_code: reqRecord.student_code });
@@ -5558,7 +6525,10 @@ app.post('/api/admin/guardian-requests/:id/decision', authenticate, requireRole(
     reviewed_by: req.user!.id,
     reviewed_at: new Date().toISOString(),
   });
-  await deletePendingAuthProfileIfSafe(sb, reqRecord.profile_id);
+  await deleteGuardianAuth(sb, reqRecord.guardian_id);
+  if (!reqRecord.shared_student_email) {
+    await deletePendingAuthProfileIfSafe(sb, reqRecord.profile_id);
+  }
   await writeAuditLog(req.user!.id, req.user!.full_name, 'GUARDIAN_APP_REJECTED', 'guardian_request', id, {
     email: reqRecord.email,
     student_code: reqRecord.student_code,
@@ -5567,72 +6537,103 @@ app.post('/api/admin/guardian-requests/:id/decision', authenticate, requireRole(
 }));
 
 app.post('/api/admin/announcements', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const { title_ar, title_en, body_ar, body_en, target_scope, target_course_id, student_ids } = req.body as {
-    title_ar: string;
-    title_en?: string;
-    body_ar: string;
-    body_en?: string;
-    target_scope: 'all_students' | 'course' | 'specific_students';
-    target_course_id?: number;
-    student_ids?: number[];
-  };
+  const schema = z.object({
+    title_ar: z.string().trim().min(1).max(200),
+    title_en: z.string().trim().max(200).optional(),
+    body_ar: z.string().trim().min(1).max(4000),
+    body_en: z.string().trim().max(4000).optional(),
+    target_scope: z.enum(['all_students', 'course', 'specific_students']),
+    target_course_id: z.coerce.number().int().positive().optional(),
+    student_ids: z.array(z.coerce.number().int().positive()).max(500).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid announcement payload' });
+    return;
+  }
+  const { title_ar, title_en, body_ar, body_en, target_scope, target_course_id, student_ids } = parsed.data;
   const sb = requireSupabaseAdmin();
 
   const ann = await insertRowSafe<{ id: number }>('announcements', {
     title_ar,
-    title_en: title_en || title_ar,
+    title_en: title_en?.trim() || title_ar,
     body_ar,
-    body_en: body_en || body_ar,
+    body_en: body_en?.trim() || body_ar,
     target_scope,
-    target_course_id: target_course_id ? Number(target_course_id) : null,
+    target_course_id: target_scope === 'course' && target_course_id ? target_course_id : null,
     created_by: req.user!.id,
   });
 
-  if (target_scope === 'specific_students' && Array.isArray(student_ids) && student_ids.length) {
-    for (const sid of student_ids) {
-      await insertRowSafe('announcement_targets', { announcement_id: ann.id, student_id: Number(sid) });
-    }
+  if (target_scope === 'specific_students' && student_ids && student_ids.length) {
+    const uniqueSids = Array.from(new Set(student_ids));
+    await sb.from('announcement_targets').insert(
+      uniqueSids.map((sid) => ({ announcement_id: ann.id, student_id: sid }))
+    );
   }
 
-  let targetProfileIds: string[] = [];
+  const targetProfiles = new Set<string>();
+  const collectStudentAndGuardianProfiles = (rows: Array<Record<string, unknown>>) => {
+    for (const row of rows) {
+      if (row.profile_id) targetProfiles.add(String(row.profile_id));
+      const rawG = Array.isArray(row.guardians) ? row.guardians[0] : row.guardians;
+      const gObj = rawG as { profile_id?: string | null } | null;
+      if (gObj?.profile_id) targetProfiles.add(String(gObj.profile_id));
+    }
+  };
+
   if (target_scope === 'all_students') {
-    const { data } = await sb.from('students').select('profile_id').not('profile_id', 'is', null).is('deleted_at', null);
-    targetProfileIds = (data || []).map((r: { profile_id: string }) => r.profile_id);
+    const { data } = await sb.from('students').select('profile_id, guardians(profile_id)').is('deleted_at', null);
+    collectStudentAndGuardianProfiles((data || []) as Array<Record<string, unknown>>);
   } else if (target_scope === 'course' && target_course_id) {
     const { data } = await sb
       .from('enrollments')
-      .select('students!inner(profile_id, deleted_at)')
-      .eq('course_id', Number(target_course_id))
+      .select('students!inner(profile_id, deleted_at, guardians(profile_id))')
+      .eq('course_id', target_course_id)
       .is('deleted_at', null)
       .is('students.deleted_at', null);
-    const set = new Set<string>();
+    const studentsList: Array<Record<string, unknown>> = [];
     for (const row of data || []) {
-      const s = (row as { students?: { profile_id?: string | null } }).students;
-      if (s?.profile_id) set.add(s.profile_id);
+      const s = Array.isArray((row as { students?: unknown }).students)
+        ? (row as { students: unknown[] }).students[0]
+        : (row as { students?: unknown }).students;
+      if (s && typeof s === 'object') studentsList.push(s as Record<string, unknown>);
     }
-    targetProfileIds = Array.from(set);
-  } else if (target_scope === 'specific_students' && Array.isArray(student_ids) && student_ids.length) {
+    collectStudentAndGuardianProfiles(studentsList);
+  } else if (target_scope === 'specific_students' && student_ids && student_ids.length) {
     const { data } = await sb
       .from('students')
-      .select('profile_id')
-      .in('id', student_ids.map(Number))
-      .not('profile_id', 'is', null);
-    targetProfileIds = (data || []).map((r: { profile_id: string }) => r.profile_id);
+      .select('profile_id, guardians(profile_id)')
+      .in('id', student_ids)
+      .is('deleted_at', null);
+    collectStudentAndGuardianProfiles((data || []) as Array<Record<string, unknown>>);
   }
 
-  for (const pid of targetProfileIds) {
-    await insertRowSafe('notifications', {
-      profile_id: pid,
-      title_ar,
-      title_en: title_en || title_ar,
-      body_ar,
-      body_en: body_en || body_ar,
-    });
-  }
+  await insertNotificationsBulk(
+    sb,
+    targetProfiles,
+    title_ar,
+    title_en?.trim() || title_ar,
+    body_ar,
+    body_en?.trim() || body_ar
+  );
 
   void broadcastRealtimeEvent('notification:created', { kind: 'notification' });
 
   res.status(201).json({ id: ann.id });
+}));
+
+app.delete('/api/admin/announcements/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const id = parsePositiveIntParam(req.params.id, 'announcement id');
+  const sb = requireSupabaseAdmin();
+  const { data: ann } = await sb.from('announcements').select('id, title_ar').eq('id', id).maybeSingle();
+  if (!ann) {
+    res.status(404).json({ error: 'Announcement not found' });
+    return;
+  }
+  await sb.from('announcement_targets').delete().eq('announcement_id', id);
+  await sb.from('announcements').delete().eq('id', id);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'DELETE_ANNOUNCEMENT', 'announcement', id, { title_ar: ann.title_ar });
+  res.json({ ok: true });
 }));
 
 app.post('/api/admin/exams', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
@@ -5685,14 +6686,36 @@ app.post('/api/admin/exams', authenticate, requireRole('admin'), asyncHandler<Au
 }));
 
 app.post('/api/admin/certificates', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const { student_id, course_id, title_ar, title_en, grade_label } = req.body;
+  const schema = z.object({
+    student_id: z.coerce.number().int().positive(),
+    course_id: z.coerce.number().int().positive(),
+    title_ar: z.string().trim().min(2).max(200),
+    title_en: z.string().trim().max(200).optional(),
+    grade_label: z.string().trim().min(1).max(80),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid certificate payload' });
+    return;
+  }
+  const { student_id, course_id, title_ar, title_en, grade_label } = parsed.data;
+  const sb = requireSupabaseAdmin();
+  const [{ data: stu }, { data: crs }] = await Promise.all([
+    sb.from('students').select('id').eq('id', student_id).is('deleted_at', null).maybeSingle(),
+    sb.from('courses').select('id').eq('id', course_id).is('deleted_at', null).maybeSingle(),
+  ]);
+  if (!stu || !crs) {
+    res.status(404).json({ error: 'Student or course not found' });
+    return;
+  }
+
   const code = generateCertificateCode();
   const inserted = await insertRowSafe<{ id: number }>('certificates', {
     verification_code: code,
-    student_id: Number(student_id),
-    course_id: Number(course_id),
+    student_id,
+    course_id,
     title_ar,
-    title_en: title_en || title_ar,
+    title_en: title_en?.trim() || title_ar,
     grade_label,
     issued_by: req.user!.id,
   });
@@ -5707,22 +6730,62 @@ app.post('/api/admin/certificates', authenticate, requireRole('admin'), asyncHan
 }));
 
 app.post('/api/admin/certificates/:id/revoke', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = Number(req.params.id);
+  const id = parsePositiveIntParam(req.params.id, 'certificate id');
   const sb = requireSupabaseAdmin();
   await sb.from('certificates').update({ revoked_at: new Date().toISOString() }).eq('id', id);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'REVOKE_CERTIFICATE', 'certificate', id, {});
   res.json({ ok: true });
 }));
 
+app.delete('/api/admin/certificates/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const id = parsePositiveIntParam(req.params.id, 'certificate id');
+  const sb = requireSupabaseAdmin();
+  const { data: cert } = await sb
+    .from('certificates')
+    .select('id, verification_code, revoked_at')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (!cert) {
+    res.status(404).json({ error: 'Certificate not found' });
+    return;
+  }
+  if (!cert.revoked_at) {
+    res.status(400).json({ error: 'Only revoked certificates can be deleted. Revoke the certificate first.' });
+    return;
+  }
+  await sb.from('certificates').delete().eq('id', id);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'DELETE_REVOKED_CERTIFICATE', 'certificate', id, {
+    verification_code: cert.verification_code,
+  });
+  res.json({ ok: true });
+}));
+
 app.post('/api/admin/payroll', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const { teacher_id, month_year, base_amount, bonus_amount, deduction_amount } = req.body;
-  const net = Number(base_amount) + Number(bonus_amount || 0) - Number(deduction_amount || 0);
+  const schema = z.object({
+    teacher_id: z.coerce.number().int().positive(),
+    month_year: z.string().trim().regex(/^\d{4}-(0[1-9]|1[0-2])$/, 'Month must follow YYYY-MM format'),
+    base_amount: z.coerce.number().min(0).max(500000),
+    bonus_amount: z.coerce.number().min(0).max(500000).optional().default(0),
+    deduction_amount: z.coerce.number().min(0).max(500000).optional().default(0),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payroll payload' });
+    return;
+  }
+  const { teacher_id, month_year, base_amount, bonus_amount, deduction_amount } = parsed.data;
+  const net = base_amount + bonus_amount - deduction_amount;
+  if (net < 0) {
+    res.status(400).json({ error: 'Deductions cannot exceed base plus bonus amount.' });
+    return;
+  }
   const inserted = await insertRowSafe<{ id: number }>('payroll', {
-    teacher_id: Number(teacher_id),
+    teacher_id,
     month_year,
-    base_amount: Number(base_amount),
-    bonus_amount: Number(bonus_amount || 0),
-    deduction_amount: Number(deduction_amount || 0),
+    base_amount,
+    bonus_amount,
+    deduction_amount,
     net_amount: net,
     status: 'pending',
     created_by: req.user!.id,
@@ -5739,16 +6802,67 @@ app.post('/api/admin/payroll', authenticate, requireRole('admin'), asyncHandler<
 }));
 
 app.patch('/api/admin/payroll/:id/pay', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = Number(req.params.id);
+  const id = parsePositiveIntParam(req.params.id, 'payroll id');
   const sb = requireSupabaseAdmin();
   await sb.from('payroll').update({ status: 'paid', paid_at: new Date().toISOString() }).eq('id', id);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'MARK_PAYROLL_PAID', 'payroll', id, {});
   res.json({ ok: true });
 }));
 
+app.delete('/api/admin/payroll/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const id = parsePositiveIntParam(req.params.id, 'payroll id');
+  const sb = requireSupabaseAdmin();
+  const { data: row } = await sb
+    .from('payroll')
+    .select('id, teacher_id, month_year, net_amount, status')
+    .eq('id', id)
+    .maybeSingle();
+  if (!row) {
+    res.status(404).json({ error: 'Payroll record not found' });
+    return;
+  }
+  await sb.from('payroll').delete().eq('id', id);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'DELETE_PAYROLL', 'payroll', id, {
+    teacher_id: row.teacher_id,
+    month_year: row.month_year,
+    status: row.status,
+  });
+  res.json({ ok: true });
+}));
+
+app.delete('/api/admin/audit-logs/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const id = parsePositiveIntParam(req.params.id, 'audit log id');
+  const sb = requireSupabaseAdmin();
+  await sb.from('audit_logs').delete().eq('id', id);
+  res.json({ ok: true });
+}));
+
+app.delete('/api/admin/audit-logs', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const sb = requireSupabaseAdmin();
+  await sb.from('audit_logs').delete().gte('id', 0);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'CLEAR_AUDIT_LOGS', 'audit_logs', 'all', {});
+  res.json({ ok: true });
+}));
+
 app.put('/api/admin/legal/:docType', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const docType = String(req.params.docType);
-  const { version, title_ar, title_en, content_ar, content_en } = req.body;
+  const docType = String(req.params.docType || '').trim();
+  if (!['terms', 'privacy', 'refund'].includes(docType)) {
+    res.status(400).json({ error: 'Invalid legal document type' });
+    return;
+  }
+  const schema = z.object({
+    version: z.string().trim().min(1).max(32).optional(),
+    title_ar: z.string().trim().min(1).max(200),
+    title_en: z.string().trim().min(1).max(200),
+    content_ar: z.string().trim().min(1).max(25000),
+    content_en: z.string().trim().min(1).max(25000),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid legal document payload' });
+    return;
+  }
+  const { version, title_ar, title_en, content_ar, content_en } = parsed.data;
   const sb = requireSupabaseAdmin();
   await sb
     .from('legal_documents')
@@ -5762,7 +6876,7 @@ app.put('/api/admin/legal/:docType', authenticate, requireRole('admin'), asyncHa
     })
     .eq('doc_type', docType);
   invalidateOverviewCache();
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_LEGAL_DOC', 'legal_document', docType, { version });
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_LEGAL_DOC', 'legal_document', docType, { version: version || '1.1' });
   res.json({ ok: true });
 }));
 
@@ -5813,7 +6927,7 @@ app.post('/api/admin/admins', authenticate, requireRole('admin'), asyncHandler<A
   );
   if (profErr) {
     await sb.auth.admin.deleteUser(user.id).catch(() => {});
-    res.status(500).json({ error: profErr.message });
+    sendInternalError(res, 'admin-create-admin-profile', profErr, 'Failed to create administrator profile');
     return;
   }
 
@@ -5906,11 +7020,83 @@ app.post('/api/admin/users/:id/reset-password', authenticate, requireRole('admin
     email_confirm: true,
   });
   if (updErr) {
-    res.status(500).json({ error: updErr.message });
+    sendInternalError(res, 'admin-reset-user-password', updErr, 'Failed to reset user password');
     return;
   }
 
   await writeAuditLog(req.user!.id, req.user!.full_name, 'ADMIN_RESET_USER_PASSWORD', 'profile', id, {
+    email: target.email,
+    role: target.role,
+  });
+  res.json({ ok: true });
+}));
+
+app.delete('/api/admin/users/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const id = String(req.params.id);
+  if (id === String(req.user!.id)) {
+    res.status(400).json({ error: 'You cannot delete your own administrator account.' });
+    return;
+  }
+
+  const sb = requireSupabaseAdmin();
+  const { data: target } = await sb
+    .from('profiles')
+    .select('id, email, full_name, role, is_active')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (!target) {
+    res.status(404).json({ error: 'User not found' });
+    return;
+  }
+
+  if (target.role === 'admin' && target.is_active) {
+    const { count } = await sb
+      .from('profiles')
+      .select('id', { count: 'exact', head: true })
+      .eq('role', 'admin')
+      .eq('is_active', true)
+      .is('deleted_at', null);
+    if ((count || 0) <= 1) {
+      res.status(400).json({ error: 'Cannot delete the last active administrator account.' });
+      return;
+    }
+  }
+
+  const [{ data: linkedTeachers }, { data: linkedStudents }, { data: linkedGuardians }] = await Promise.all([
+    sb.from('teachers').select('id').eq('profile_id', id),
+    sb.from('students').select('id').eq('profile_id', id),
+    sb.from('guardians').select('id, email').eq('profile_id', id),
+  ]);
+
+  for (const t of linkedTeachers || []) {
+    await hardDeleteTeacherCascade(sb, Number((t as { id: number }).id));
+  }
+  for (const s of linkedStudents || []) {
+    await hardDeleteStudentCascade(sb, Number((s as { id: number }).id));
+  }
+  for (const g of linkedGuardians || []) {
+    const gid = Number((g as { id: number }).id);
+    await deleteGuardianAuth(sb, gid);
+    const { count: remStu } = await sb.from('students').select('id', { count: 'exact', head: true }).eq('guardian_id', gid);
+    if ((remStu || 0) === 0) {
+      await sb.from('guardians').delete().eq('id', gid);
+    } else {
+      await sb.from('guardians').update({ profile_id: null }).eq('id', gid);
+    }
+  }
+
+  try {
+    await sb.from('notifications').delete().eq('profile_id', id);
+  } catch {
+    // ignore
+  }
+  await sb.from('profiles').delete().eq('id', id);
+  await sb.auth.admin.deleteUser(id).catch(() => {});
+  await purgeEmailTraces(sb, [target.email, ...(linkedGuardians || []).map((g: { email?: string }) => g.email)], [id]);
+
+  invalidateOverviewCache();
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'HARD_DELETE_USER', 'profile', id, {
     email: target.email,
     role: target.role,
   });
@@ -6188,10 +7374,10 @@ app.get('/api/my/community', authenticate, asyncHandler<AuthRequest>(async (req,
   const sb = requireSupabaseAdmin();
   const [allComments, allSuggestions] = await Promise.all([listAllComments(sb), listAllSuggestions(sb)]);
   const myComments = allComments
-    .filter((c) => c.author_profile_id === req.user!.id)
+    .filter((c) => c.author_profile_id === req.user!.id && c.author_role === req.user!.role)
     .map((c) => sanitizeCommentForPublic(c, req.user!.id));
   const mySuggestions = allSuggestions
-    .filter((s) => s.author_profile_id === req.user!.id)
+    .filter((s) => s.author_profile_id === req.user!.id && s.author_role === req.user!.role)
     .map((s) => sanitizeSuggestionForPublic(s, req.user!.id));
   res.json({ comments: myComments, suggestions: mySuggestions });
 }));
@@ -6312,7 +7498,11 @@ app.post('/api/admin/supabase/sync-users', authenticate, requireRole('admin'), a
     .eq('is_active', true);
   const result = await syncUsersToSupabaseAuth((profiles || []) as Array<{ email: string; full_name: string; role: string }>).catch(
     (err: unknown) => {
-      throw new AppError(502, err instanceof Error ? err.message : 'Supabase sync failed');
+      console.error('[supabase-sync-users]', err);
+      throw new AppError(
+        502,
+        IS_PRODUCTION ? 'Supabase sync failed' : err instanceof Error ? err.message : 'Supabase sync failed'
+      );
     }
   );
   await writeAuditLog(req.user!.id, req.user!.full_name, 'SYNC_SUPABASE_AUTH', 'supabase', 'auth', result);
@@ -6328,9 +7518,20 @@ function resolvePublicBaseUrl(req: Request): string {
       // fall back to request host
     }
   }
-  const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
-  const host = String(req.headers['x-forwarded-host'] || req.get('host') || 'localhost:3000').split(',')[0].trim();
-  return `${proto}://${host}`;
+  const protoRaw = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim().toLowerCase();
+  const proto = protoRaw === 'http' || protoRaw === 'https' ? protoRaw : 'https';
+  const hostRaw = String(req.headers['x-forwarded-host'] || req.get('host') || 'localhost:3000').split(',')[0].trim();
+  const safeHost = /^[a-zA-Z0-9.-]+(:\d{1,5})?$/.test(hostRaw) ? hostRaw : 'localhost:3000';
+  return `${proto}://${safeHost}`;
+}
+
+function escapeXmlText(val: string): string {
+  return val
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
 }
 
 app.get('/robots.txt', (req, res) => {
@@ -6343,7 +7544,7 @@ app.get('/robots.txt', (req, res) => {
 });
 
 app.get('/sitemap.xml', asyncHandler(async (req, res) => {
-  const baseUrl = resolvePublicBaseUrl(req);
+  const baseUrl = escapeXmlText(resolvePublicBaseUrl(req));
   const staticPaths: Array<{ path: string; priority: string }> = [
     { path: '/', priority: '1.0' },
     { path: '/courses', priority: '0.9' },
@@ -6377,7 +7578,7 @@ app.get('/sitemap.xml', asyncHandler(async (req, res) => {
       dynamicUrls.push({ path: `/teachers/${t.id}`, priority: '0.7' });
     }
     for (const g of games || []) {
-      dynamicUrls.push({ path: `/games/${g.slug}`, priority: '0.7' });
+      dynamicUrls.push({ path: `/games/${encodeURIComponent(String(g.slug))}`, priority: '0.7' });
     }
   } catch {
     // Serve static URLs if DB query fails
@@ -6386,7 +7587,7 @@ app.get('/sitemap.xml', asyncHandler(async (req, res) => {
   const urls = [...staticPaths, ...dynamicUrls]
     .map(
       (u) =>
-        `  <url><loc>${baseUrl}${u.path}</loc><priority>${u.priority}</priority></url>`
+        `  <url><loc>${baseUrl}${escapeXmlText(u.path)}</loc><priority>${u.priority}</priority></url>`
     )
     .join('\n');
 
@@ -6428,10 +7629,13 @@ async function startServer() {
       express.static(distPath, {
         index: false,
         setHeaders: (res, filePath) => {
+          const relPath = path.relative(distPath, filePath).split(path.sep).join('/');
           if (filePath.endsWith('index.html')) {
             res.setHeader('Cache-Control', 'no-cache');
-          } else if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+          } else if (/^assets\/[^/]+\.(js|css)$/i.test(relPath)) {
             res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          } else if (relPath.startsWith('assets/')) {
+            res.setHeader('Cache-Control', 'public, max-age=86400');
           }
         },
       })
@@ -6462,6 +7666,7 @@ async function startServer() {
     console.log(
       `Noor & Bayan Academy (Supabase PostgreSQL, ${IS_PRODUCTION ? 'production' : 'development'}) running on http://0.0.0.0:${PORT}`
     );
+    void ensureUpdatedLevelsCatalog();
   });
 
   const gracefulShutdown = async (signal: string, exitCode = 0) => {
