@@ -40,7 +40,7 @@ import {
   GamesHubPage,
   InfoStaticPage,
 } from './pages/public/PublicSubpages';
-import { LoginPage } from './pages/auth/LoginPage';
+import { LoginPage, GoogleOAuthCallbackPage } from './pages/auth/LoginPage';
 import { DashboardShell, type NavTab } from './components/dashboard/DashboardShell';
 import { LoadingState } from './components/ui/CommonUI';
 import { ErrorBoundary } from './components/ui/ErrorBoundary';
@@ -425,6 +425,8 @@ function RouterContent() {
     '/legal/privacy',
     '/legal/refund',
     '/login',
+    '/auth/google-callback',
+    '/auth/google-callback/',
   ]);
   const isKnownPublicRoute = knownStaticPaths.has(path) || Boolean(courseMatch) || Boolean(teacherMatch);
 
@@ -532,6 +534,10 @@ function RouterContent() {
           }}
           onNavigateAdmission={(role) => navigate(role === 'teacher' ? '/apply-teacher' : '/apply')}
         />
+      )}
+
+      {(path === '/auth/google-callback' || path === '/auth/google-callback/') && (
+        <GoogleOAuthCallbackPage />
       )}
 
       {!isKnownPublicRoute && (

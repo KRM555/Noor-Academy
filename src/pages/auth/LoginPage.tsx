@@ -1034,3 +1034,142 @@ export function LoginPage({
     </div>
   );
 }
+
+export function GoogleOAuthCallbackPage() {
+  const { lang } = useApp();
+  const [status, setStatus] = useState<'processing' | 'success' | 'error'>('processing');
+  const [errorDetail, setErrorDetail] = useState<string>('');
+
+  useEffect(() => {
+    const hashParams = new URLSearchParams((window.location.hash || '').replace(/^#/, ''));
+    const queryParams = new URLSearchParams(window.location.search || '');
+    const state = queryParams.get('oauth_state') || '';
+    const accessToken = hashParams.get('access_token') || '';
+    const errMsg =
+      queryParams.get('error_description') ||
+      queryParams.get('error') ||
+      hashParams.get('error_description') ||
+      hashParams.get('error') ||
+      '';
+
+    const payload = {
+      type: 'NB_GOOGLE_OAUTH',
+      state,
+      access_token: accessToken,
+      error: errMsg || (!accessToken ? 'Missing access token from Google OAuth callback.' : ''),
+    };
+
+    if (errMsg) {
+      setStatus('error');
+      setErrorDetail(errMsg);
+    } else if (accessToken) {
+      setStatus('success');
+    } else {
+      setStatus('error');
+      setErrorDetail('Missing access token from Google OAuth callback.');
+    }
+
+    try {
+      if (window.opener && !window.opener.closed) {
+        window.opener.postMessage(payload, window.location.origin);
+      }
+    } catch {
+      // ignore cross-window restriction
+    }
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        const ch = new BroadcastChannel('nb_google_oauth');
+        ch.postMessage(payload);
+        ch.close();
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      localStorage.setItem(
+        'nb_google_oauth_result',
+        JSON.stringify({ state, access_token: accessToken, error: payload.error, ts: Date.now() })
+      );
+      window.setTimeout(() => {
+        try {
+          localStorage.removeItem('nb_google_oauth_result');
+        } catch {
+          // ignore
+        }
+      }, 5000);
+    } catch {
+      // ignore
+    }
+
+    if (state && /^[a-zA-Z0-9_-]{16,96}$/.test(state)) {
+      void apiFetch('/api/auth/oauth-handoff', {
+        method: 'POST',
+        body: JSON.stringify({
+          state,
+          ...(accessToken ? { access_token: accessToken } : {}),
+          ...(payload.error ? { error: payload.error } : {}),
+        }),
+      })
+        .catch(() => {})
+        .finally(() => {
+          window.setTimeout(() => {
+            try {
+              window.close();
+            } catch {
+              // ignore
+            }
+          }, 350);
+        });
+    } else {
+      window.setTimeout(() => {
+        try {
+          window.close();
+        } catch {
+          // ignore
+        }
+      }, 350);
+    }
+  }, []);
+
+  return (
+    <div className="max-w-md mx-auto px-4 py-16">
+      <Card className="p-6 text-center space-y-4">
+        <AcademyLogo className="w-11 h-11 mx-auto" />
+        <h1 className="text-lg font-extrabold">
+          {status === 'success'
+            ? lang === 'ar'
+              ? 'تم التحقق من حساب Google بنجاح'
+              : 'Google Account Verified'
+            : status === 'error'
+            ? lang === 'ar'
+              ? 'تعذر إتمام تسجيل الدخول عبر Google'
+              : 'Google Sign-In Failed'
+            : lang === 'ar'
+            ? 'جاري إتمام التحقق من حساب Google...'
+            : 'Completing Google Sign-In...'}
+        </h1>
+        <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+          {status === 'error'
+            ? errorDetail || (lang === 'ar' ? 'يرجى إغلاق النافذة والمحاولة مرة أخرى.' : 'Please close this window and try again.')
+            : lang === 'ar'
+            ? 'يمكنك العودة إلى نافذة المنصة أو إغلاق هذه النافذة.'
+            : 'You will be returned to the Academy portal automatically.'}
+        </p>
+        <PrimaryButton
+          type="button"
+          onClick={() => {
+            try {
+              window.close();
+            } catch {
+              // ignore
+            }
+          }}
+          className="mx-auto"
+        >
+          <span>{lang === 'ar' ? 'إغلاق النافذة' : 'Close Window'}</span>
+        </PrimaryButton>
+      </Card>
+    </div>
+  );
+}
+
