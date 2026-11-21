@@ -383,7 +383,7 @@ CREATE INDEX IF NOT EXISTS idx_certificates_student ON public.certificates(stude
 CREATE INDEX IF NOT EXISTS idx_payroll_teacher ON public.payroll(teacher_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON public.audit_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_admission_requests_status_created ON public.admission_requests(status, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_admission_requests_course ON public.admission_requests(course_id);
+CREATE INDEX IF NOT EXISTS idx_admission_requests_course ON public.admission_requests(preferred_course_id);
 CREATE INDEX IF NOT EXISTS idx_exams_course_date ON public.exams(course_id, exam_date DESC);
 CREATE INDEX IF NOT EXISTS idx_lessons_course_date ON public.lessons(course_id, lesson_date ASC);
 CREATE INDEX IF NOT EXISTS idx_announcements_created ON public.announcements(created_at DESC);
