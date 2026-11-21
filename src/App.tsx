@@ -298,6 +298,23 @@ function RouterContent() {
     document.querySelector('meta[name="description"]')?.setAttribute('content', nextDesc);
     document.querySelector('meta[property="og:title"]')?.setAttribute('content', nextTitle);
     document.querySelector('meta[property="og:description"]')?.setAttribute('content', nextDesc);
+
+    const canonicalHref = `${window.location.origin}${path === '/' ? '/' : path}`;
+    let canonicalLink = document.querySelector('link[rel="canonical"]') as HTMLLinkElement | null;
+    if (!canonicalLink) {
+      canonicalLink = document.createElement('link');
+      canonicalLink.setAttribute('rel', 'canonical');
+      document.head.appendChild(canonicalLink);
+    }
+    canonicalLink.setAttribute('href', canonicalHref);
+
+    let ogUrlMeta = document.querySelector('meta[property="og:url"]') as HTMLMetaElement | null;
+    if (!ogUrlMeta) {
+      ogUrlMeta = document.createElement('meta');
+      ogUrlMeta.setAttribute('property', 'og:url');
+      document.head.appendChild(ogUrlMeta);
+    }
+    ogUrlMeta.setAttribute('content', canonicalHref);
   }, [path, lang]);
 
   const exitGame = useCallback(() => {

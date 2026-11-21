@@ -18,6 +18,7 @@ import {
   syncUsersToSupabaseAuth,
   requestSupabasePasswordReset,
   broadcastRealtimeEvent,
+  verifyTurnstileToken,
 } from './server/supabaseClient.ts';
 import { AppError, asyncHandler, apiNotFoundHandler, globalErrorHandler } from './server/errorHandler.ts';
 import {
@@ -144,6 +145,7 @@ app.set('trust proxy', TRUST_PROXY_HOPS);
 app.disable('x-powered-by');
 const UPLOAD_JSON_SUFFIXES = ['/upload-material', '/question-file', '/submit-file', '/grade', '/cover'];
 const defaultJsonParser = express.json({ limit: '256kb' });
+const inFlightQuizSubmits = new Set<string>();
 app.use((req, res, next) => {
   if (UPLOAD_JSON_SUFFIXES.some((suffix) => req.path.endsWith(suffix))) {
     next();
@@ -254,6 +256,7 @@ app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  const turnstileEnabled = Boolean(process.env.TURNSTILE_SECRET_KEY && process.env.VITE_TURNSTILE_SITE_KEY);
   const frameAncestors =
     IS_PRODUCTION && process.env.ALLOW_IFRAME_EMBED !== 'true'
       ? "'self'"
@@ -261,15 +264,22 @@ app.use((req, res, next) => {
   const connectSrc = IS_PRODUCTION
     ? "connect-src 'self' https://*.supabase.co wss://*.supabase.co"
     : "connect-src 'self' https://*.supabase.co wss://*.supabase.co ws: wss:";
+  const scriptSrc = turnstileEnabled
+    ? "script-src 'self' https://challenges.cloudflare.com"
+    : "script-src 'self'";
+  const frameSrc = turnstileEnabled
+    ? "frame-src 'self' https://challenges.cloudflare.com"
+    : "frame-src 'self'";
   res.setHeader(
     'Content-Security-Policy',
     [
       "default-src 'self'",
-      "script-src 'self'",
+      scriptSrc,
       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
       "font-src 'self' https://fonts.gstatic.com data:",
-      "img-src 'self' data: blob: https:",
+      "img-src 'self' data: blob: https://*.supabase.co https://*.googleusercontent.com",
       connectSrc,
+      frameSrc,
       "worker-src 'self' blob:",
       "manifest-src 'self'",
       "object-src 'none'",
@@ -392,6 +402,7 @@ const admissionSchema = z.object({
   notes: z.string().trim().max(1000).optional(),
   consent_accepted: z.literal(true).or(z.literal(1)).or(z.boolean().refine((v) => v === true)),
   google_access_token: z.string().max(8192).optional(),
+  turnstileToken: z.string().max(4096).optional(),
 });
 
 const teacherApplicationSchema = z.object({
@@ -405,6 +416,7 @@ const teacherApplicationSchema = z.object({
   bio_ar: z.string().trim().max(1500).optional(),
   consent_accepted: z.literal(true).or(z.literal(1)).or(z.boolean().refine((v) => v === true)),
   google_access_token: z.string().max(8192).optional(),
+  turnstileToken: z.string().max(4096).optional(),
 });
 
 interface AuthUser {
@@ -533,14 +545,14 @@ function clearSessionCookie(req: Request, res: Response): void {
   res.setHeader('Set-Cookie', [sessionParts.join('; '), csrfParts.join('; ')]);
 }
 
-function signToken(payload: { id: string; role: string; guardianId?: number; exp: number; jti?: string }): string {
+function signToken(payload: { id: string; role: string; guardianId?: number; tv?: number; exp: number; jti?: string }): string {
   const tokenPayload = { ...payload, jti: payload.jti || crypto.randomUUID() };
   const data = Buffer.from(JSON.stringify(tokenPayload)).toString('base64url');
   const sig = crypto.createHmac('sha256', TOKEN_SECRET).update(data).digest('base64url');
   return `${data}.${sig}`;
 }
 
-function verifyToken(token: string): { id: string; role: string; guardianId?: number; exp: number; jti?: string } | null {
+function verifyToken(token: string): { id: string; role: string; guardianId?: number; tv?: number; exp: number; jti?: string } | null {
   try {
     const [data, sig] = token.split('.');
     if (!data || !sig) return null;
@@ -552,6 +564,7 @@ function verifyToken(token: string): { id: string; role: string; guardianId?: nu
       id?: string;
       role?: string;
       guardianId?: number;
+      tv?: number;
       exp?: number;
       jti?: string;
     };
@@ -561,16 +574,213 @@ function verifyToken(token: string): { id: string; role: string; guardianId?: nu
       if (exp > Date.now()) return null;
       revokedTokens.delete(parsed.jti);
     }
-    return parsed as { id: string; role: string; guardianId?: number; exp: number; jti?: string };
+    return parsed as { id: string; role: string; guardianId?: number; tv?: number; exp: number; jti?: string };
   } catch {
     return null;
   }
 }
 
+const IBAN_AES_KEY = crypto
+  .createHash('sha256')
+  .update(process.env.IBAN_ENCRYPTION_KEY?.trim() || `nb-iban:${TOKEN_SECRET}`)
+  .digest();
+
+function encryptIban(plainIban: string): string {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', IBAN_AES_KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(plainIban, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `enc:v1:${iv.toString('hex')}:${tag.toString('hex')}:${encrypted.toString('hex')}`;
+}
+
+function decryptIban(storedIban: string): string {
+  if (!storedIban || !storedIban.startsWith('enc:v1:')) {
+    return storedIban;
+  }
+  try {
+    const parts = storedIban.split(':');
+    if (parts.length !== 5) return storedIban;
+    const [, , ivHex, tagHex, cipherHex] = parts;
+    const iv = Buffer.from(ivHex, 'hex');
+    const tag = Buffer.from(tagHex, 'hex');
+    const data = Buffer.from(cipherHex, 'hex');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', IBAN_AES_KEY, iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
+  } catch {
+    return 'INVALID';
+  }
+}
+
 function maskIban(iban: string): string {
-  const clean = iban.replace(/\s+/g, '');
+  const plain = decryptIban(iban);
+  if (plain === 'INVALID') return '•••• ••••';
+  const clean = plain.replace(/\s+/g, '');
   if (clean.length <= 8) return '****' + clean.slice(-2);
   return clean.slice(0, 4) + ' •••• •••• ' + clean.slice(-4);
+}
+
+const tokenVersionFallback = new Map<string, number>();
+
+async function getProfileTokenVersion(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  profileId: string
+): Promise<number> {
+  try {
+    const { data, error } = await sb
+      .from('profiles')
+      .select('token_version')
+      .eq('id', profileId)
+      .maybeSingle();
+    if (!error && data && typeof (data as { token_version?: number }).token_version === 'number') {
+      const tv = Number((data as { token_version: number }).token_version);
+      tokenVersionFallback.set(profileId, tv);
+      return tv;
+    }
+  } catch {
+    // fallback safely if column not migrated yet
+  }
+  return tokenVersionFallback.get(profileId) ?? 1;
+}
+
+async function bumpProfileTokenVersion(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  profileId: string
+): Promise<number> {
+  const current = await getProfileTokenVersion(sb, profileId);
+  const next = current + 1;
+  tokenVersionFallback.set(profileId, next);
+  try {
+    await sb.from('profiles').update({ token_version: next }).eq('id', profileId);
+  } catch {
+    // fallback in memory until DB migration applied
+  }
+  return next;
+}
+
+const ACCOUNT_LOCKOUT_WINDOW_MS = 15 * 60 * 1000;
+const ACCOUNT_LOCKOUT_MAX_ATTEMPTS = 5;
+const loginAccountFailures = new Map<string, { count: number; lockedUntil: number; firstAt: number }>();
+
+function checkAccountLockout(key: string): { locked: boolean; retryAfterSec: number } {
+  const entry = loginAccountFailures.get(key);
+  if (!entry) return { locked: false, retryAfterSec: 0 };
+  const now = Date.now();
+  if (entry.lockedUntil > now) {
+    return { locked: true, retryAfterSec: Math.ceil((entry.lockedUntil - now) / 1000) };
+  }
+  if (now - entry.firstAt > ACCOUNT_LOCKOUT_WINDOW_MS) {
+    loginAccountFailures.delete(key);
+  }
+  return { locked: false, retryAfterSec: 0 };
+}
+
+function recordAccountFailure(key: string): void {
+  const now = Date.now();
+  if (loginAccountFailures.size > 5000) {
+    for (const [k, v] of loginAccountFailures.entries()) {
+      if (v.lockedUntil <= now && now - v.firstAt > ACCOUNT_LOCKOUT_WINDOW_MS) {
+        loginAccountFailures.delete(k);
+      }
+    }
+  }
+  const existing = loginAccountFailures.get(key);
+  if (!existing || now - existing.firstAt > ACCOUNT_LOCKOUT_WINDOW_MS) {
+    loginAccountFailures.set(key, { count: 1, lockedUntil: 0, firstAt: now });
+    return;
+  }
+  const nextCount = existing.count + 1;
+  const lockedUntil = nextCount >= ACCOUNT_LOCKOUT_MAX_ATTEMPTS ? now + ACCOUNT_LOCKOUT_WINDOW_MS : 0;
+  loginAccountFailures.set(key, { count: nextCount, lockedUntil, firstAt: existing.firstAt });
+}
+
+function clearAccountFailure(key: string): void {
+  loginAccountFailures.delete(key);
+}
+
+async function insertConsentSafe(
+  email: string,
+  docType: string,
+  docVersion: string,
+  ipAddress: string,
+  actorRole: string
+) {
+  const sb = requireSupabaseAdmin();
+  const resWithMeta = await sb
+    .from('consents')
+    .insert({
+      email: email.trim().toLowerCase(),
+      doc_type: docType,
+      doc_version: docVersion,
+      ip_address: ipAddress,
+      actor_role: actorRole,
+    });
+  if (!resWithMeta.error) return;
+  // Backwards-compatible fallback if live Supabase consents table lacks new columns yet
+  await insertRowSafe('consents', {
+    email: email.trim().toLowerCase(),
+    doc_type: docType,
+    doc_version: docVersion,
+  });
+}
+
+async function verifyAdminReauth(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  adminUser: AuthUser,
+  confirmPassword?: string,
+  confirmAction?: boolean
+): Promise<{ ok: boolean; status?: number; error?: string; code?: string }> {
+  const { data: uData } = await sb.auth.admin.getUserById(adminUser.id).catch(() => ({ data: { user: null } }));
+  const authUserObj = uData?.user;
+  const appProviders = Array.isArray(authUserObj?.app_metadata?.providers)
+    ? (authUserObj.app_metadata.providers as string[])
+    : [];
+  const identityProviders = Array.isArray(authUserObj?.identities)
+    ? authUserObj.identities.map((id) => id.provider).filter((p): p is string => Boolean(p))
+    : [];
+  const allProviders = new Set([...appProviders, ...identityProviders]);
+  const isGoogleOnlyAdmin = allProviders.has('google') && !allProviders.has('email');
+
+  if (isGoogleOnlyAdmin) {
+    if (confirmPassword && confirmPassword.trim().length > 0) {
+      const anon = createEphemeralSupabaseAnon();
+      const { error } = await anon.auth.signInWithPassword({ email: adminUser.email, password: confirmPassword });
+      if (!error) return { ok: true };
+    }
+    if (confirmAction === true) {
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      status: 401,
+      error: 'Explicit administrator confirmation is required for this sensitive action.',
+      code: 'REAUTH_CONFIRM_REQUIRED',
+    };
+  }
+
+  if (!confirmPassword || typeof confirmPassword !== 'string' || !confirmPassword.trim()) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'Please enter your administrator password to confirm this sensitive action.',
+      code: 'REAUTH_PASSWORD_REQUIRED',
+    };
+  }
+
+  const anon = createEphemeralSupabaseAnon();
+  const { error: verifyErr } = await anon.auth.signInWithPassword({
+    email: adminUser.email,
+    password: confirmPassword,
+  });
+  if (verifyErr) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'Administrator password confirmation failed.',
+      code: 'REAUTH_INVALID_PASSWORD',
+    };
+  }
+  return { ok: true };
 }
 
 async function writeAuditLog(
@@ -597,16 +807,40 @@ async function writeAuditLog(
 
 async function resolveSessionAuthUser(
   sb: ReturnType<typeof requireSupabaseAdmin>,
-  decoded: { id: string; role: string; guardianId?: number }
+  decoded: { id: string; role: string; guardianId?: number; tv?: number }
 ): Promise<AuthUser | null> {
-  const { data: profile, error } = await sb
+  let profile: (AuthUser & { token_version?: number }) | null = null;
+  const primaryRes = await sb
     .from('profiles')
-    .select('id, email, full_name, role, is_active, preferred_lang')
+    .select('id, email, full_name, role, is_active, preferred_lang, token_version')
     .eq('id', String(decoded.id))
     .is('deleted_at', null)
     .maybeSingle();
 
-  if (error || !profile || !profile.is_active) {
+  if (primaryRes.error && String(primaryRes.error.message || '').includes('token_version')) {
+    const fallbackRes = await sb
+      .from('profiles')
+      .select('id, email, full_name, role, is_active, preferred_lang')
+      .eq('id', String(decoded.id))
+      .is('deleted_at', null)
+      .maybeSingle();
+    if (fallbackRes.error || !fallbackRes.data) return null;
+    profile = fallbackRes.data as AuthUser;
+  } else if (primaryRes.error || !primaryRes.data) {
+    return null;
+  } else {
+    profile = primaryRes.data as AuthUser & { token_version?: number };
+  }
+
+  if (!profile || !profile.is_active) {
+    return null;
+  }
+
+  const effectiveTv =
+    typeof profile.token_version === 'number'
+      ? profile.token_version
+      : tokenVersionFallback.get(profile.id) ?? 1;
+  if (decoded.tv !== undefined && Number(decoded.tv) !== effectiveTv) {
     return null;
   }
 
@@ -643,7 +877,8 @@ async function resolveSessionAuthUser(
     };
   }
 
-  return profile as AuthUser;
+  const { token_version: _tv, ...safeProfile } = profile;
+  return safeProfile as AuthUser;
 }
 
 async function findGuardianForUser(
@@ -1171,7 +1406,14 @@ app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req,
     recommended_level_id,
     notes,
     google_access_token,
+    turnstileToken,
   } = parsed.data;
+
+  const captchaCheck = await verifyTurnstileToken(turnstileToken, req.ip);
+  if (!captchaCheck.ok) {
+    res.status(400).json({ error: captchaCheck.reason || 'CAPTCHA verification failed.' });
+    return;
+  }
 
   const cleanStudentEmail = student_email.toLowerCase();
   const cleanGuardianEmail = guardian_email.toLowerCase();
@@ -1180,7 +1422,7 @@ app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req,
   const { data: existingProfile } = await sb
     .from('profiles')
     .select('id')
-    .ilike('email', cleanStudentEmail)
+    .eq('email', cleanStudentEmail)
     .is('deleted_at', null)
     .maybeSingle();
   if (existingProfile) {
@@ -1188,33 +1430,31 @@ app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req,
     return;
   }
 
-  const existingAuth = await findSupabaseAuthUserByEmail(cleanStudentEmail);
-  let authUserId: string;
-  let alreadyExisted = false;
+  const verifiedGoogle = google_access_token ? await verifyVerifiedGoogleToken(sb, google_access_token) : null;
+  const googleVerifiedForEmail = Boolean(verifiedGoogle && verifiedGoogle.email === cleanStudentEmail);
+  const provisioned = await provisionSupabaseAuthUser(cleanStudentEmail, student_password, student_name, 'student', {
+    emailConfirm: googleVerifiedForEmail,
+  });
+  let authUserId = provisioned.user.id;
+  const alreadyExisted = provisioned.alreadyExisted;
 
-  if (existingAuth) {
-    const verifiedGoogle = google_access_token ? await verifyVerifiedGoogleToken(sb, google_access_token) : null;
-    if (!verifiedGoogle || verifiedGoogle.email !== cleanStudentEmail) {
+  if (alreadyExisted) {
+    if (!googleVerifiedForEmail) {
       res.status(409).json({
         error: 'An authentication account already exists for this email. Verify ownership using Fill with Google or use another email.',
       });
       return;
     }
-    const { data: upd, error: updErr } = await sb.auth.admin.updateUserById(existingAuth.id, {
+    const { data: upd, error: updErr } = await sb.auth.admin.updateUserById(authUserId, {
       password: student_password,
       email_confirm: true,
-      user_metadata: { ...(existingAuth.user_metadata || {}), full_name: student_name, role: 'student' },
+      user_metadata: { ...(provisioned.user.user_metadata || {}), full_name: student_name, role: 'student' },
     });
     if (updErr || !upd.user) {
       sendInternalError(res, 'admission-prepare-student', updErr, 'Failed to prepare student account');
       return;
     }
     authUserId = upd.user.id;
-    alreadyExisted = true;
-  } else {
-    const provisioned = await provisionSupabaseAuthUser(cleanStudentEmail, student_password, student_name, 'student');
-    authUserId = provisioned.user.id;
-    alreadyExisted = provisioned.alreadyExisted;
   }
 
   const { error: profErr } = await sb.from('profiles').upsert(
@@ -1262,9 +1502,10 @@ app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req,
     throw err;
   }
 
+  const clientIp = req.ip || '';
   await Promise.all([
-    insertRowSafe('consents', { email: cleanGuardianEmail, doc_type: 'terms', doc_version: '1.0' }),
-    insertRowSafe('consents', { email: cleanStudentEmail, doc_type: 'privacy', doc_version: '1.0' }),
+    insertConsentSafe(cleanGuardianEmail, 'terms', '1.0', clientIp, 'guardian'),
+    insertConsentSafe(cleanGuardianEmail, 'privacy', '1.0', clientIp, 'guardian'),
   ]);
 
   void broadcastRealtimeEvent('admission:created', { kind: 'admission' });
@@ -1279,14 +1520,20 @@ app.post('/api/public/teacher-applications', publicSubmitLimiter, asyncHandler(a
     return;
   }
 
-  const { name_ar, name_en, email, password, phone, specialty_ar, qualifications_ar, bio_ar, google_access_token } = parsed.data;
+  const { name_ar, name_en, email, password, phone, specialty_ar, qualifications_ar, bio_ar, google_access_token, turnstileToken } = parsed.data;
+  const captchaCheck = await verifyTurnstileToken(turnstileToken, req.ip);
+  if (!captchaCheck.ok) {
+    res.status(400).json({ error: captchaCheck.reason || 'CAPTCHA verification failed.' });
+    return;
+  }
+
   const cleanEmail = email.toLowerCase();
   const sb = requireSupabaseAdmin();
 
   const { data: existingProfile } = await sb
     .from('profiles')
     .select('id')
-    .ilike('email', cleanEmail)
+    .eq('email', cleanEmail)
     .is('deleted_at', null)
     .maybeSingle();
   if (existingProfile) {
@@ -1294,33 +1541,31 @@ app.post('/api/public/teacher-applications', publicSubmitLimiter, asyncHandler(a
     return;
   }
 
-  const existingAuth = await findSupabaseAuthUserByEmail(cleanEmail);
-  let authUserId: string;
-  let alreadyExisted = false;
+  const verifiedGoogle = google_access_token ? await verifyVerifiedGoogleToken(sb, google_access_token) : null;
+  const googleVerifiedForEmail = Boolean(verifiedGoogle && verifiedGoogle.email === cleanEmail);
+  const provisioned = await provisionSupabaseAuthUser(cleanEmail, password, name_ar, 'teacher', {
+    emailConfirm: googleVerifiedForEmail,
+  });
+  let authUserId = provisioned.user.id;
+  const alreadyExisted = provisioned.alreadyExisted;
 
-  if (existingAuth) {
-    const verifiedGoogle = google_access_token ? await verifyVerifiedGoogleToken(sb, google_access_token) : null;
-    if (!verifiedGoogle || verifiedGoogle.email !== cleanEmail) {
+  if (alreadyExisted) {
+    if (!googleVerifiedForEmail) {
       res.status(409).json({
         error: 'An authentication account already exists for this email. Verify ownership using Fill with Google or use another email.',
       });
       return;
     }
-    const { data: upd, error: updErr } = await sb.auth.admin.updateUserById(existingAuth.id, {
+    const { data: upd, error: updErr } = await sb.auth.admin.updateUserById(authUserId, {
       password,
       email_confirm: true,
-      user_metadata: { ...(existingAuth.user_metadata || {}), full_name: name_ar, role: 'teacher' },
+      user_metadata: { ...(provisioned.user.user_metadata || {}), full_name: name_ar, role: 'teacher' },
     });
     if (updErr || !upd.user) {
       sendInternalError(res, 'teacher-app-prepare-account', updErr, 'Failed to prepare teacher account');
       return;
     }
     authUserId = upd.user.id;
-    alreadyExisted = true;
-  } else {
-    const provisioned = await provisionSupabaseAuthUser(cleanEmail, password, name_ar, 'teacher');
-    authUserId = provisioned.user.id;
-    alreadyExisted = provisioned.alreadyExisted;
   }
 
   const { error: profErr } = await sb.from('profiles').upsert(
@@ -1362,7 +1607,7 @@ app.post('/api/public/teacher-applications', publicSubmitLimiter, asyncHandler(a
     throw err;
   }
 
-  await insertRowSafe('consents', { email: cleanEmail, doc_type: 'terms', doc_version: '1.0' });
+  await insertConsentSafe(cleanEmail, 'terms', '1.0', req.ip || '', 'teacher');
   void broadcastRealtimeEvent('admission:created', { kind: 'teacher_application' });
 
   res.status(201).json({ id: appId, status: 'pending', email: cleanEmail });
@@ -1374,14 +1619,17 @@ app.post('/api/public/teacher-applications', publicSubmitLimiter, asyncHandler(a
 app.get('/api/auth/config', (_req, res) => {
   res.json({
     googleOAuthEnabled: Boolean(process.env.VITE_SUPABASE_URL && process.env.VITE_SUPABASE_ANON_KEY),
+    turnstileEnabled: Boolean(process.env.TURNSTILE_SECRET_KEY && process.env.VITE_TURNSTILE_SITE_KEY),
+    turnstileSiteKey: process.env.VITE_TURNSTILE_SITE_KEY || null,
   });
 });
 
 app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
-  const { email, password, portalRole } = req.body as {
+  const { email, password, portalRole, turnstileToken } = req.body as {
     email?: string;
     password?: string;
     portalRole?: 'student' | 'teacher' | 'guardian' | 'admin';
+    turnstileToken?: string;
   };
   const sb = requireSupabaseAdmin();
   let profile: AuthUser | null = null;
@@ -1392,13 +1640,28 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
     return;
   }
 
+  const captchaCheck = await verifyTurnstileToken(turnstileToken, req.ip);
+  if (!captchaCheck.ok) {
+    res.status(400).json({ error: captchaCheck.reason || 'CAPTCHA verification failed.' });
+    return;
+  }
+
   const cleanEmail = email.trim().toLowerCase();
+  const lockoutKey = `${portalRole || 'any'}:${cleanEmail}`;
+  const lockStatus = checkAccountLockout(lockoutKey);
+  if (lockStatus.locked) {
+    res.status(429).json({
+      error: `Too many failed sign-in attempts for this account. Please wait ${Math.ceil(lockStatus.retryAfterSec / 60)} minutes or reset your password.`,
+      code: 'ACCOUNT_LOCKED',
+    });
+    return;
+  }
 
   if (portalRole === 'guardian') {
     const { data: guardianRows } = await sb
       .from('guardians')
       .select('id, profile_id, full_name, email')
-      .ilike('email', cleanEmail)
+      .eq('email', cleanEmail)
       .is('deleted_at', null)
       .order('id', { ascending: true });
 
@@ -1460,11 +1723,12 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
       const { data: profileRow } = await sb
         .from('profiles')
         .select('id, email, full_name, role, is_active, preferred_lang')
-        .ilike('email', cleanEmail)
+        .eq('email', cleanEmail)
         .is('deleted_at', null)
         .maybeSingle();
 
       if (!profileRow || profileRow.role !== 'guardian') {
+        recordAccountFailure(lockoutKey);
         res.status(401).json({ error: 'Invalid credentials' });
         return;
       }
@@ -1475,11 +1739,13 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
         password,
       });
       if (authErr) {
+        recordAccountFailure(lockoutKey);
         res.status(401).json({ error: 'Invalid credentials' });
         return;
       }
       profile = profileRow as AuthUser;
     } else {
+      recordAccountFailure(lockoutKey);
       res.status(401).json({ error: 'Invalid credentials' });
       return;
     }
@@ -1487,11 +1753,12 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
     const { data: profileRow } = await sb
       .from('profiles')
       .select('id, email, full_name, role, is_active, preferred_lang')
-      .ilike('email', cleanEmail)
+      .eq('email', cleanEmail)
       .is('deleted_at', null)
       .maybeSingle();
 
     if (!profileRow) {
+      recordAccountFailure(lockoutKey);
       res.status(401).json({ error: 'Invalid credentials' });
       return;
     }
@@ -1510,6 +1777,28 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
       password,
     });
     if (authErr) {
+      const errMsg = String(authErr.message || '');
+      const errStatus = Number((authErr as { status?: number }).status || 0);
+      console.warn('[auth-login] signInWithPassword failed:', {
+        email: profileRow.email,
+        status: errStatus,
+        code: (authErr as { code?: string }).code,
+        message: errMsg,
+      });
+
+      if (/invalid api key|no api key/i.test(errMsg) || errStatus >= 500) {
+        sendInternalError(res, 'auth-login-supabase-config', authErr, 'Authentication service configuration error');
+        return;
+      }
+      if (errStatus === 429 || /rate limit|too many requests/i.test(errMsg)) {
+        res.status(429).json({ error: 'Too many authentication attempts. Please wait a moment and try again.' });
+        return;
+      }
+      if (/email logins are disabled|email_provider_disabled/i.test(errMsg)) {
+        res.status(403).json({ error: 'Email and password sign-in is currently disabled in Supabase Authentication settings.' });
+        return;
+      }
+
       const { data: uData } = await sb.auth.admin.getUserById(profileRow.id).catch(() => ({ data: { user: null } }));
       const authUserObj = uData?.user;
       const appProviders = Array.isArray(authUserObj?.app_metadata?.providers)
@@ -1526,6 +1815,7 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
         });
         return;
       }
+      recordAccountFailure(lockoutKey);
       res.status(401).json({ error: 'Invalid credentials' });
       return;
     }
@@ -1533,6 +1823,7 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
   }
 
   if (!profile) {
+    recordAccountFailure(lockoutKey);
     res.status(401).json({ error: 'Invalid credentials' });
     return;
   }
@@ -1554,10 +1845,13 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
     return;
   }
 
+  clearAccountFailure(lockoutKey);
+  const tv = await getProfileTokenVersion(sb, profile.id);
   const token = signToken({
     id: profile.id,
     role: profile.role,
     ...(tokenGuardianId ? { guardianId: tokenGuardianId } : {}),
+    tv,
     exp: Date.now() + SESSION_TTL_MS,
   });
   setSessionCookie(req, res, token);
@@ -1642,8 +1936,17 @@ app.post('/api/auth/change-password', authenticate, asyncHandler<AuthRequest>(as
       if (prof?.role === 'guardian') {
         await sb.auth.admin.updateUserById(req.user!.id, { password: newPassword }).catch(() => {});
       }
+      const nextTv = await bumpProfileTokenVersion(sb, req.user!.id);
+      const freshToken = signToken({
+        id: req.user!.id,
+        role: 'guardian',
+        guardianId: req.user!.guardian_id,
+        tv: nextTv,
+        exp: Date.now() + SESSION_TTL_MS,
+      });
+      setSessionCookie(req, res, freshToken);
       await writeAuditLog(req.user!.id, req.user!.full_name, 'CHANGE_PASSWORD', 'guardian', req.user!.guardian_id, {});
-      res.json({ ok: true });
+      res.json({ ok: true, token: freshToken });
       return;
     }
   }
@@ -1666,15 +1969,31 @@ app.post('/api/auth/change-password', authenticate, asyncHandler<AuthRequest>(as
     return;
   }
 
+  const nextTv = await bumpProfileTokenVersion(sb, req.user!.id);
+  const freshToken = signToken({
+    id: req.user!.id,
+    role: req.user!.role,
+    tv: nextTv,
+    exp: Date.now() + SESSION_TTL_MS,
+  });
+  setSessionCookie(req, res, freshToken);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'CHANGE_PASSWORD', 'profile', req.user!.id, {});
-  res.json({ ok: true });
+  res.json({ ok: true, token: freshToken });
 }));
 
 app.post('/api/auth/forgot-password', loginLimiter, asyncHandler(async (req, res) => {
-  const schema = z.object({ email: z.string().trim().email() });
+  const schema = z.object({
+    email: z.string().trim().email(),
+    turnstileToken: z.string().max(4096).optional(),
+  });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: 'Valid email is required.' });
+    return;
+  }
+  const captchaCheck = await verifyTurnstileToken(parsed.data.turnstileToken, req.ip);
+  if (!captchaCheck.ok) {
+    res.status(400).json({ error: captchaCheck.reason || 'CAPTCHA verification failed.' });
     return;
   }
   const baseUrl = IS_PRODUCTION
@@ -1733,6 +2052,7 @@ app.post('/api/auth/complete-password-reset', loginLimiter, asyncHandler(async (
     return;
   }
 
+  await bumpProfileTokenVersion(sb, profile.id);
   await writeAuditLog(profile.id, profile.full_name, 'PASSWORD_RESET_COMPLETED', 'profile', profile.id, {
     email: profile.email,
   });
@@ -1748,12 +2068,19 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
     phone: z.string().trim().max(32).optional(),
     relation: z.string().trim().max(40).optional(),
     google_access_token: z.string().max(8192).optional(),
+    turnstileToken: z.string().max(4096).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({
       error: 'Please fill all required fields accurately (password min 8 chars, valid email and student code).',
     });
+    return;
+  }
+
+  const captchaCheck = await verifyTurnstileToken(parsed.data.turnstileToken, req.ip);
+  if (!captchaCheck.ok) {
+    res.status(400).json({ error: captchaCheck.reason || 'CAPTCHA verification failed.' });
     return;
   }
 
@@ -1764,7 +2091,7 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
   const { data: studentRow } = await sb
     .from('students')
     .select('id, profile_id, student_code, full_name_ar, guardian_id, profiles(id, email, role, is_active), guardians(id, profile_id, full_name, email, phone)')
-    .ilike('student_code', cleanCode)
+    .eq('student_code', cleanCode)
     .is('deleted_at', null)
     .maybeSingle();
 
@@ -1827,7 +2154,7 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
   const { data: existingProfile } = await sb
     .from('profiles')
     .select('id, role, is_active')
-    .ilike('email', cleanEmail)
+    .eq('email', cleanEmail)
     .is('deleted_at', null)
     .maybeSingle();
 
@@ -1851,32 +2178,33 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
       return;
     }
   } else {
-    const existingAuth = await findSupabaseAuthUserByEmail(cleanEmail);
-    if (existingAuth) {
-      const verifiedGoogle = parsed.data.google_access_token
-        ? await verifyVerifiedGoogleToken(sb, parsed.data.google_access_token)
-        : null;
-      if (!verifiedGoogle || verifiedGoogle.email !== cleanEmail) {
+    const verifiedGoogle = parsed.data.google_access_token
+      ? await verifyVerifiedGoogleToken(sb, parsed.data.google_access_token)
+      : null;
+    const googleVerifiedForEmail = Boolean(verifiedGoogle && verifiedGoogle.email === cleanEmail);
+    const provisioned = await provisionSupabaseAuthUser(cleanEmail, parsed.data.password, parsed.data.full_name, 'guardian', {
+      emailConfirm: googleVerifiedForEmail,
+    });
+    userId = provisioned.user.id;
+    alreadyExisted = provisioned.alreadyExisted;
+
+    if (alreadyExisted) {
+      if (!googleVerifiedForEmail) {
         res.status(409).json({
           error: 'An authentication account already exists for this email. Verify with Google Sign-In or contact Academy administration.',
         });
         return;
       }
-      const { data: upd, error: updErr } = await sb.auth.admin.updateUserById(existingAuth.id, {
+      const { data: upd, error: updErr } = await sb.auth.admin.updateUserById(userId, {
         password: parsed.data.password,
         email_confirm: true,
-        user_metadata: { ...(existingAuth.user_metadata || {}), full_name: parsed.data.full_name, role: 'guardian' },
+        user_metadata: { ...(provisioned.user.user_metadata || {}), full_name: parsed.data.full_name, role: 'guardian' },
       });
       if (updErr || !upd.user) {
         sendInternalError(res, 'guardian-register-prepare', updErr, 'Failed to prepare guardian account');
         return;
       }
       userId = upd.user.id;
-      alreadyExisted = true;
-    } else {
-      const provisioned = await provisionSupabaseAuthUser(cleanEmail, parsed.data.password, parsed.data.full_name, 'guardian');
-      userId = provisioned.user.id;
-      alreadyExisted = provisioned.alreadyExisted;
     }
 
     const { error: profErr } = await sb.from('profiles').upsert(
@@ -2056,10 +2384,6 @@ app.get('/auth/google-callback.js', (_req, res) => {
       ch.close();
     }
   } catch (e) {}
-  try {
-    localStorage.setItem('nb_google_oauth_result', JSON.stringify({ state: state, access_token: accessToken, error: payload.error, ts: Date.now() }));
-    setTimeout(function(){ try { localStorage.removeItem('nb_google_oauth_result'); } catch(e){} }, 5000);
-  } catch (e) {}
 
   if (state && /^[a-zA-Z0-9_-]{16,96}$/.test(state)) {
     fetch('/api/auth/oauth-handoff', {
@@ -2140,7 +2464,7 @@ app.post('/api/auth/google', loginLimiter, asyncHandler(async (req, res) => {
   const { data: profile } = await sb
     .from('profiles')
     .select('id, email, full_name, role, is_active, preferred_lang')
-    .ilike('email', cleanEmail)
+    .eq('email', cleanEmail)
     .is('deleted_at', null)
     .maybeSingle();
 
@@ -2188,7 +2512,8 @@ app.post('/api/auth/google', loginLimiter, asyncHandler(async (req, res) => {
     return;
   }
 
-  const token = signToken({ id: profile.id, role: profile.role, exp: Date.now() + SESSION_TTL_MS });
+  const tv = await getProfileTokenVersion(sb, profile.id);
+  const token = signToken({ id: profile.id, role: profile.role, tv, exp: Date.now() + SESSION_TTL_MS });
   setSessionCookie(req, res, token);
 
   await writeAuditLog(profile.id, profile.full_name, 'LOGIN_GOOGLE_OAUTH', 'profile', profile.id, {
@@ -2840,7 +3165,7 @@ app.post('/api/guardian/link-child', authenticate, requireRole('guardian'), guar
   const { data: studentRow } = await sb
     .from('students')
     .select('id, student_code, full_name_ar, guardian_id, profiles(email), guardians(id, profile_id, email)')
-    .ilike('student_code', cleanCode)
+    .eq('student_code', cleanCode)
     .is('deleted_at', null)
     .maybeSingle();
 
@@ -3478,6 +3803,7 @@ app.put('/api/teacher/payout-details', authenticate, requireRole('teacher'), asy
   }
 
   const { account_holder_name, bank_name, iban: cleanIban } = parsed.data;
+  const encryptedIban = encryptIban(cleanIban);
   const sb = requireSupabaseAdmin();
   const { data: existing } = await sb.from('teacher_payout_details').select('id').eq('teacher_id', teacher.id).maybeSingle();
 
@@ -3487,7 +3813,7 @@ app.put('/api/teacher/payout-details', authenticate, requireRole('teacher'), asy
       .update({
         account_holder_name,
         bank_name,
-        iban: cleanIban,
+        iban: encryptedIban,
         updated_at: new Date().toISOString(),
       })
       .eq('id', existing.id);
@@ -3496,12 +3822,12 @@ app.put('/api/teacher/payout-details', authenticate, requireRole('teacher'), asy
       teacher_id: teacher.id,
       account_holder_name,
       bank_name,
-      iban: cleanIban,
+      iban: encryptedIban,
       updated_at: new Date().toISOString(),
     });
   }
 
-  res.json({ masked_iban: maskIban(cleanIban) });
+  res.json({ masked_iban: maskIban(encryptedIban) });
 }));
 
 // ============================================================================
@@ -4607,146 +4933,166 @@ app.post(
       return;
     }
 
-    const [{ data: existingResult }, existingSub, attempt] = await Promise.all([
-      sb.from('exam_results').select('id').eq('exam_id', examId).eq('student_id', studentId).maybeSingle(),
-      getExamSubmission(sb, examId, studentId),
-      getExamAttempt(sb, examId, studentId),
-    ]);
-    if (existingResult || existingSub?.status === 'graded') {
-      res.status(409).json({ error: 'This exam has already been graded.' });
+    const quizSubmitKey = `${examId}:${studentId}`;
+    if (inFlightQuizSubmits.has(quizSubmitKey)) {
+      res.status(409).json({ error: 'Quiz submission is already being processed.' });
       return;
     }
-    if (existingSub && existingSub.quiz_answers.length > 0) {
-      res.status(409).json({ error: 'Quiz answers have already been submitted for this exam.' });
-      return;
-    }
+    inFlightQuizSubmits.add(quizSubmitKey);
 
-    let isTimedOutSubmission = Boolean(parsed.data.timed_out);
-    if (cfg.time_limit_minutes && cfg.time_limit_minutes > 0 && attempt) {
-      const expiresMs = new Date(attempt.expires_at).getTime();
-      const nowMs = Date.now();
-      if (nowMs >= expiresMs) {
-        isTimedOutSubmission = true;
-      }
-      const allowedGraceMs = parsed.data.timed_out ? 180_000 : 45_000;
-      if (nowMs > expiresMs + allowedGraceMs) {
-        res.status(403).json({ error: 'Exam countdown expired and submissions are locked.' });
+    try {
+      const [{ data: existingResult }, existingSub, attempt] = await Promise.all([
+        sb.from('exam_results').select('id').eq('exam_id', examId).eq('student_id', studentId).maybeSingle(),
+        getExamSubmission(sb, examId, studentId),
+        getExamAttempt(sb, examId, studentId),
+      ]);
+      if (existingResult || existingSub?.status === 'graded') {
+        res.status(409).json({ error: 'This exam has already been graded.' });
         return;
       }
-    }
-
-    // 100% Server-side authoritative grading
-    const answerById = new Map<string, number>();
-    for (const a of parsed.data.answers) {
-      answerById.set(a.question_id, a.selected_index);
-    }
-
-    let totalPoints = 0;
-    let earnedPoints = 0;
-    for (const q of cfg.questions) {
-      const pts = Number(q.points || 1);
-      totalPoints += pts;
-      if (answerById.get(q.id) === q.correct_index) {
-        earnedPoints += pts;
+      if (existingSub && existingSub.quiz_answers.length > 0) {
+        res.status(409).json({ error: 'Quiz answers have already been submitted for this exam.' });
+        return;
       }
-    }
 
-    const maxScore = Number(exam.max_score || 100);
-    const computedScore =
-      totalPoints > 0
-        ? Math.round((earnedPoints / totalPoints) * maxScore * 100) / 100
-        : 0;
+      let isTimedOutSubmission = Boolean(parsed.data.timed_out);
+      if (cfg.time_limit_minutes && cfg.time_limit_minutes > 0 && attempt) {
+        const expiresMs = new Date(attempt.expires_at).getTime();
+        const nowMs = Date.now();
+        if (nowMs >= expiresMs) {
+          isTimedOutSubmission = true;
+        }
+        const allowedGraceMs = parsed.data.timed_out ? 180_000 : 45_000;
+        if (nowMs > expiresMs + allowedGraceMs) {
+          res.status(403).json({ error: 'Exam countdown expired and submissions are locked.' });
+          return;
+        }
+      }
 
-    const nowIso = new Date().toISOString();
-    const isPureQuiz = cfg.exam_mode === 'quiz';
+      // 100% Server-side authoritative grading
+      const answerById = new Map<string, number>();
+      for (const a of parsed.data.answers) {
+        answerById.set(a.question_id, a.selected_index);
+      }
 
-    await saveExamSubmission(sb, {
-      exam_id: examId,
-      student_id: studentId,
-      status: isPureQuiz ? 'graded' : 'submitted_pending',
-      submitted_at: existingSub?.submitted_at || nowIso,
-      is_late: pastDeadline,
-      timed_out: isTimedOutSubmission,
-      solution_file: existingSub?.solution_file || null,
-      student_notes: existingSub?.student_notes || '',
-      quiz_answers: parsed.data.answers,
-      auto_score: computedScore,
-      graded_file: existingSub?.graded_file || null,
-      graded_at: isPureQuiz ? nowIso : null,
-    });
+      let totalPoints = 0;
+      let earnedPoints = 0;
+      for (const q of cfg.questions) {
+        const pts = Number(q.points || 1);
+        totalPoints += pts;
+        if (answerById.get(q.id) === q.correct_index) {
+          earnedPoints += pts;
+        }
+      }
 
-    if (isPureQuiz) {
-      const feedbackAr = isTimedOutSubmission
-        ? `تم إغلاق الامتحان تلقائياً بانتهاء العداد واعتماد الإجابات المسجلة (${earnedPoints} من ${totalPoints} نقطة).`
-        : `تم التصحيح التلقائي (${earnedPoints} من ${totalPoints} نقطة).`;
-      const feedbackEn = isTimedOutSubmission
-        ? `Auto-locked on timer expiry with saved answers (${earnedPoints} / ${totalPoints} pts).`
-        : `Auto-graded (${earnedPoints} / ${totalPoints} pts).`;
-      const { data: existingResultRow } = await sb
-        .from('exam_results')
-        .select('id')
-        .eq('exam_id', examId)
-        .eq('student_id', studentId)
-        .maybeSingle();
+      const maxScore = Number(exam.max_score || 100);
+      const computedScore =
+        totalPoints > 0
+          ? Math.round((earnedPoints / totalPoints) * maxScore * 100) / 100
+          : 0;
 
-      if (existingResultRow) {
-        await sb
+      const nowIso = new Date().toISOString();
+      const isPureQuiz = cfg.exam_mode === 'quiz';
+
+      await saveExamSubmission(sb, {
+        exam_id: examId,
+        student_id: studentId,
+        status: isPureQuiz ? 'graded' : 'submitted_pending',
+        submitted_at: existingSub?.submitted_at || nowIso,
+        is_late: pastDeadline,
+        timed_out: isTimedOutSubmission,
+        solution_file: existingSub?.solution_file || null,
+        student_notes: existingSub?.student_notes || '',
+        quiz_answers: parsed.data.answers,
+        auto_score: computedScore,
+        graded_file: existingSub?.graded_file || null,
+        graded_at: isPureQuiz ? nowIso : null,
+      });
+
+      if (isPureQuiz) {
+        const feedbackAr = isTimedOutSubmission
+          ? `تم إغلاق الامتحان تلقائياً بانتهاء العداد واعتماد الإجابات المسجلة (${earnedPoints} من ${totalPoints} نقطة).`
+          : `تم التصحيح التلقائي (${earnedPoints} من ${totalPoints} نقطة).`;
+        const feedbackEn = isTimedOutSubmission
+          ? `Auto-locked on timer expiry with saved answers (${earnedPoints} / ${totalPoints} pts).`
+          : `Auto-graded (${earnedPoints} / ${totalPoints} pts).`;
+        const { data: existingResultRow } = await sb
           .from('exam_results')
-          .update({
-            score: computedScore,
-            feedback_ar: feedbackAr,
-            feedback_en: feedbackEn,
-            graded_at: nowIso,
-          })
-          .eq('id', existingResultRow.id);
-      } else {
-        await insertRowSafe('exam_results', {
-          exam_id: examId,
-          student_id: studentId,
-          score: computedScore,
-          feedback_ar: feedbackAr,
-          feedback_en: feedbackEn,
-          graded_at: nowIso,
-        });
+          .select('id')
+          .eq('exam_id', examId)
+          .eq('student_id', studentId)
+          .maybeSingle();
+
+        if (existingResultRow) {
+          await sb
+            .from('exam_results')
+            .update({
+              score: computedScore,
+              feedback_ar: feedbackAr,
+              feedback_en: feedbackEn,
+              graded_at: nowIso,
+            })
+            .eq('id', existingResultRow.id);
+        } else {
+          try {
+            await insertRowSafe('exam_results', {
+              exam_id: examId,
+              student_id: studentId,
+              score: computedScore,
+              feedback_ar: feedbackAr,
+              feedback_en: feedbackEn,
+              graded_at: nowIso,
+            });
+          } catch (insertErr: unknown) {
+            const msg = insertErr instanceof Error ? insertErr.message : '';
+            if (/duplicate key|23505/i.test(msg)) {
+              res.status(409).json({ error: 'This exam has already been graded.' });
+              return;
+            }
+            throw insertErr;
+          }
+        }
+
+        await notifyStudentAndGuardian(
+          sb,
+          studentId,
+          isTimedOutSubmission ? `انتهى مؤقت الاختبار: ${exam.title_ar}` : `نتيجة الاختبار: ${exam.title_ar}`,
+          isTimedOutSubmission ? `Exam Timer Expired: ${exam.title_en}` : `Quiz Result: ${exam.title_en}`,
+          isTimedOutSubmission
+            ? `انتهى مؤقت الامتحان وأُغلق تلقائياً مع اعتماد إجاباتك: ${computedScore} / ${maxScore}`
+            : `درجتك التلقائية: ${computedScore} / ${maxScore}`,
+          isTimedOutSubmission
+            ? `Exam countdown expired; auto-submitted with score: ${computedScore} / ${maxScore}`
+            : `Auto-graded score: ${computedScore} / ${maxScore}`
+        );
+      } else if (isTimedOutSubmission) {
+        await notifyStudentAndGuardian(
+          sb,
+          studentId,
+          `إغلاق تلقائي للامتحان بانتهاء المؤقت: ${exam.title_ar}`,
+          `Exam Auto-Locked on Timeout: ${exam.title_en}`,
+          `انتهى مؤقت الامتحان الهجين وأُغلقت الإجابات التفاعلية تلقائياً وبانتظار التصحيح النهائي (${computedScore} / ${maxScore} تلقائياً).`,
+          `Exam countdown expired and quiz answers were auto-locked pending final grading.`
+        );
       }
 
-      await notifyStudentAndGuardian(
-        sb,
-        studentId,
-        isTimedOutSubmission ? `انتهى مؤقت الاختبار: ${exam.title_ar}` : `نتيجة الاختبار: ${exam.title_ar}`,
-        isTimedOutSubmission ? `Exam Timer Expired: ${exam.title_en}` : `Quiz Result: ${exam.title_en}`,
-        isTimedOutSubmission
-          ? `انتهى مؤقت الامتحان وأُغلق تلقائياً مع اعتماد إجاباتك: ${computedScore} / ${maxScore}`
-          : `درجتك التلقائية: ${computedScore} / ${maxScore}`,
-        isTimedOutSubmission
-          ? `Exam countdown expired; auto-submitted with score: ${computedScore} / ${maxScore}`
-          : `Auto-graded score: ${computedScore} / ${maxScore}`
-      );
-    } else if (isTimedOutSubmission) {
-      await notifyStudentAndGuardian(
-        sb,
-        studentId,
-        `إغلاق تلقائي للامتحان بانتهاء المؤقت: ${exam.title_ar}`,
-        `Exam Auto-Locked on Timeout: ${exam.title_en}`,
-        `انتهى مؤقت الامتحان الهجين وأُغلقت الإجابات التفاعلية تلقائياً وبانتظار التصحيح النهائي (${computedScore} / ${maxScore} تلقائياً).`,
-        `Exam countdown expired and quiz answers were auto-locked pending final grading.`
-      );
+      await writeAuditLog(req.user!.id, req.user!.full_name, 'SUBMIT_EXAM_QUIZ', 'exam', examId, {
+        student_id: studentId,
+        auto_score: computedScore,
+        pure_quiz: isPureQuiz,
+        timed_out: isTimedOutSubmission,
+      });
+      void broadcastRealtimeEvent('academic:updated', { kind: 'exam_result' });
+
+      res.status(201).json({
+        ok: true,
+        auto_score: computedScore,
+        max_score: maxScore,
+        finalized: isPureQuiz,
+      });
+    } finally {
+      inFlightQuizSubmits.delete(quizSubmitKey);
     }
-
-    await writeAuditLog(req.user!.id, req.user!.full_name, 'SUBMIT_EXAM_QUIZ', 'exam', examId, {
-      student_id: studentId,
-      auto_score: computedScore,
-      pure_quiz: isPureQuiz,
-      timed_out: isTimedOutSubmission,
-    });
-    void broadcastRealtimeEvent('academic:updated', { kind: 'exam_result' });
-
-    res.status(201).json({
-      ok: true,
-      auto_score: computedScore,
-      max_score: maxScore,
-      finalized: isPureQuiz,
-    });
   })
 );
 
@@ -5805,7 +6151,7 @@ async function purgeEmailTraces(sb: ReturnType<typeof requireSupabaseAdmin>, raw
 
   for (const email of emailSet) {
     try {
-      await sb.from('consents').delete().ilike('email', email);
+      await sb.from('consents').delete().eq('email', email);
     } catch {
       // ignore
     }
@@ -6268,13 +6614,15 @@ app.post('/api/admin/admissions/:id/decision', authenticate, requireRole('admin'
     if (meta?.pending_profile_id) {
       profileId = meta.pending_profile_id;
       await sb.from('profiles').update({ is_active: true }).eq('id', profileId);
+      await sb.auth.admin.updateUserById(profileId, { email_confirm: true }).catch(() => {});
       resolvedEmail = meta.student_email;
     } else {
-      const { data: existingProfile } = await sb.from('profiles').select('id, is_active').ilike('email', resolvedEmail).maybeSingle();
+      const { data: existingProfile } = await sb.from('profiles').select('id, is_active').eq('email', resolvedEmail).maybeSingle();
       if (existingProfile) {
         profileId = existingProfile.id;
         if (!existingProfile.is_active) {
           await sb.from('profiles').update({ is_active: true }).eq('id', profileId);
+          await sb.auth.admin.updateUserById(profileId, { email_confirm: true }).catch(() => {});
         }
       } else {
         tempPassword = generateTempPassword();
@@ -6383,6 +6731,7 @@ app.post('/api/admin/teacher-applications/:id/decision', authenticate, requireRo
       return;
     }
     await sb.from('profiles').update({ is_active: true, role: 'teacher' }).eq('id', appRecord.profile_id);
+    await sb.auth.admin.updateUserById(appRecord.profile_id, { email_confirm: true }).catch(() => {});
     const teacher = await insertRowSafe<{ id: number }>('teachers', {
       profile_id: appRecord.profile_id,
       name_ar: appRecord.name_ar,
@@ -6885,6 +7234,8 @@ app.post('/api/admin/admins', authenticate, requireRole('admin'), asyncHandler<A
     full_name: z.string().trim().min(2).max(120),
     email: z.string().trim().email().max(160),
     password: z.string().min(8).max(128),
+    confirmPassword: z.string().max(128).optional(),
+    confirmAction: z.boolean().optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -6892,14 +7243,20 @@ app.post('/api/admin/admins', authenticate, requireRole('admin'), asyncHandler<A
     return;
   }
 
+  const sb = requireSupabaseAdmin();
+  const reauth = await verifyAdminReauth(sb, req.user!, parsed.data.confirmPassword, parsed.data.confirmAction);
+  if (!reauth.ok) {
+    res.status(reauth.status || 401).json({ error: reauth.error, code: reauth.code });
+    return;
+  }
+
   const cleanEmail = parsed.data.email.toLowerCase();
   const cleanName = parsed.data.full_name;
-  const sb = requireSupabaseAdmin();
 
   const { data: existingProfile } = await sb
     .from('profiles')
     .select('id')
-    .ilike('email', cleanEmail)
+    .eq('email', cleanEmail)
     .is('deleted_at', null)
     .maybeSingle();
   if (existingProfile) {
@@ -6907,13 +7264,12 @@ app.post('/api/admin/admins', authenticate, requireRole('admin'), asyncHandler<A
     return;
   }
 
-  const existingAuth = await findSupabaseAuthUserByEmail(cleanEmail);
-  if (existingAuth) {
+  const { user, alreadyExisted } = await provisionSupabaseAuthUser(cleanEmail, parsed.data.password, cleanName, 'admin');
+  if (alreadyExisted) {
     res.status(409).json({ error: 'This email is already registered in Supabase Auth.' });
     return;
   }
 
-  const { user } = await provisionSupabaseAuthUser(cleanEmail, parsed.data.password, cleanName, 'admin');
   const { error: profErr } = await sb.from('profiles').upsert(
     {
       id: user.id,
@@ -6949,6 +7305,8 @@ app.patch('/api/admin/users/:id/role', authenticate, requireRole('admin'), async
   const schema = z.object({
     role: z.enum(['student', 'teacher', 'admin', 'guardian']).optional(),
     is_active: z.union([z.boolean(), z.number()]).optional(),
+    confirmPassword: z.string().max(128).optional(),
+    confirmAction: z.boolean().optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -6957,6 +7315,12 @@ app.patch('/api/admin/users/:id/role', authenticate, requireRole('admin'), async
   }
 
   const sb = requireSupabaseAdmin();
+  const reauth = await verifyAdminReauth(sb, req.user!, parsed.data.confirmPassword, parsed.data.confirmAction);
+  if (!reauth.ok) {
+    res.status(reauth.status || 401).json({ error: reauth.error, code: reauth.code });
+    return;
+  }
+
   const { data: target } = await sb.from('profiles').select('id, email, full_name, role, is_active').eq('id', id).maybeSingle();
   if (!target) {
     res.status(404).json({ error: 'User not found' });
@@ -6986,6 +7350,7 @@ app.patch('/api/admin/users/:id/role', authenticate, requireRole('admin'), async
 
   await sb.from('profiles').update({ role: newRole, is_active: newActive }).eq('id', id);
   await sb.auth.admin.updateUserById(id, { user_metadata: { full_name: target.full_name, role: newRole } });
+  await bumpProfileTokenVersion(sb, id);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'CHANGE_USER_ROLE', 'profile', id, {
     from: target.role,
     to: newRole,
@@ -6996,13 +7361,23 @@ app.patch('/api/admin/users/:id/role', authenticate, requireRole('admin'), async
 
 app.post('/api/admin/users/:id/reset-password', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = String(req.params.id);
-  const parsed = z.object({ newPassword: z.string().min(8, 'Password must be at least 8 characters').max(128) }).safeParse(req.body);
+  const parsed = z.object({
+    newPassword: z.string().min(8, 'Password must be at least 8 characters').max(128),
+    confirmPassword: z.string().max(128).optional(),
+    confirmAction: z.boolean().optional(),
+  }).safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: 'A new password of at least 8 characters is required.' });
     return;
   }
 
   const sb = requireSupabaseAdmin();
+  const reauth = await verifyAdminReauth(sb, req.user!, parsed.data.confirmPassword, parsed.data.confirmAction);
+  if (!reauth.ok) {
+    res.status(reauth.status || 401).json({ error: reauth.error, code: reauth.code });
+    return;
+  }
+
   const { data: target } = await sb
     .from('profiles')
     .select('id, email, full_name, role')
@@ -7024,6 +7399,7 @@ app.post('/api/admin/users/:id/reset-password', authenticate, requireRole('admin
     return;
   }
 
+  await bumpProfileTokenVersion(sb, id);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'ADMIN_RESET_USER_PASSWORD', 'profile', id, {
     email: target.email,
     role: target.role,
@@ -7641,6 +8017,10 @@ async function startServer() {
       })
     );
 
+    const indexHtmlTemplate = fs.existsSync(indexHtmlPath)
+      ? fs.readFileSync(indexHtmlPath, 'utf8')
+      : null;
+
     app.get('*', (req, res, next) => {
       if (req.path.startsWith('/api')) {
         next();
@@ -7650,12 +8030,25 @@ async function startServer() {
         res.status(404).end();
         return;
       }
-      if (!fs.existsSync(indexHtmlPath)) {
+      if (!indexHtmlTemplate && !fs.existsSync(indexHtmlPath)) {
         res.status(503).json({ error: 'Frontend build missing. Run npm run build first.' });
         return;
       }
+      const rawHtml = indexHtmlTemplate || fs.readFileSync(indexHtmlPath, 'utf8');
+      const baseUrl = resolvePublicBaseUrl(req);
+      const safePath = /^\/[a-zA-Z0-9/_-]*$/.test(req.path) ? req.path : '/';
+      const canonicalUrl = `${baseUrl}${safePath === '/' ? '/' : safePath}`;
+      const ogImageAbs = `${baseUrl}/assets/images/academy_banner.webp`;
+      const hydratedHtml = rawHtml
+        .replace(/content="\/assets\/images\/academy_banner\.webp"/g, `content="${escapeXmlText(ogImageAbs)}"`)
+        .replace(
+          '</head>',
+          `  <link rel="canonical" href="${escapeXmlText(canonicalUrl)}" />\n  </head>`
+        );
+
       res.setHeader('Cache-Control', 'no-cache');
-      res.sendFile(indexHtmlPath);
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.send(hydratedHtml);
     });
   }
 

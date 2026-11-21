@@ -16,7 +16,7 @@ import {
   EyeOff,
 } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
-import { apiFetch } from '../../lib/api';
+import { ApiError, apiFetch } from '../../lib/api';
 import {
   buildGoogleOAuthPopupRequest,
   getBrowserSupabase,
@@ -24,6 +24,7 @@ import {
   waitForGoogleOAuthToken,
 } from '../../lib/supabase';
 import { PhoneInputWithCode } from '../../components/ui/PhoneInputWithCode';
+import { TurnstileWidget } from '../../components/ui/TurnstileWidget';
 import type { AuthUser } from '../../types';
 import { Card, PrimaryButton, SecondaryButton, AcademyLogo } from '../../components/ui/CommonUI';
 
@@ -87,13 +88,23 @@ export function LoginPage({
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [resetSaving, setResetSaving] = useState(false);
   const [resetDoneMessage, setResetDoneMessage] = useState<string | null>(null);
+  const [turnstileSiteKey, setTurnstileSiteKey] = useState<string | null>(null);
+  const [loginTurnstileToken, setLoginTurnstileToken] = useState<string | null>(null);
+  const [loginTurnstileReset, setLoginTurnstileReset] = useState(0);
+  const [forgotTurnstileToken, setForgotTurnstileToken] = useState<string | null>(null);
+  const [forgotTurnstileReset, setForgotTurnstileReset] = useState(0);
+  const [guardianTurnstileToken, setGuardianTurnstileToken] = useState<string | null>(null);
+  const [guardianTurnstileReset, setGuardianTurnstileReset] = useState(0);
 
   useEffect(() => {
     fetch('/api/auth/config')
       .then((r) => (r.ok ? r.json() : {}))
-      .then((d: { googleOAuthEnabled?: boolean }) => {
+      .then((d: { googleOAuthEnabled?: boolean; turnstileEnabled?: boolean; turnstileSiteKey?: string | null }) => {
         if (d.googleOAuthEnabled !== undefined) {
           setGoogleEnabled(Boolean(d.googleOAuthEnabled) && isBrowserSupabaseConfigured());
+        }
+        if (d.turnstileEnabled && d.turnstileSiteKey) {
+          setTurnstileSiteKey(d.turnstileSiteKey);
         }
       })
       .catch(() => {});
@@ -148,6 +159,16 @@ export function LoginPage({
   const formatAuthError = (err: unknown): string => {
     const raw = err instanceof Error ? err.message : 'Login failed';
     const lower = raw.toLowerCase();
+    const isRateLimited =
+      (err instanceof ApiError && (err.status === 429 || err.code === 'ACCOUNT_LOCKED')) ||
+      lower.includes('too many') ||
+      lower.includes('rate limit') ||
+      lower.includes('temporarily locked');
+    if (isRateLimited) {
+      return lang === 'ar'
+        ? 'تم تجاوز الحد المسموح لمحاولات الدخول مؤقتاً. يرجى الانتظار بضع دقائق ثم المحاولة مجدداً أو استعادة كلمة المرور.'
+        : raw;
+    }
     if (lower.includes('pending administrator approval')) {
       setPendingNotice(true);
       return lang === 'ar'
@@ -179,13 +200,18 @@ export function LoginPage({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (turnstileSiteKey && !loginTurnstileToken) {
+      toast(lang === 'ar' ? 'يرجى إتمام التحقق الأمني أولاً' : 'Please complete the security verification first', 'error');
+      return;
+    }
     setLoading(true);
     setPendingNotice(false);
     try {
-      await loginWithCredentials(email, password, selectedPortal);
+      await loginWithCredentials(email, password, selectedPortal, loginTurnstileToken);
       toast(lang === 'ar' ? 'تم تسجيل الدخول بنجاح' : 'Signed in successfully', 'success');
       onSuccess();
     } catch (err: unknown) {
+      setLoginTurnstileReset((n) => n + 1);
       toast(formatAuthError(err), 'error');
     } finally {
       setLoading(false);
@@ -202,6 +228,10 @@ export function LoginPage({
       toast(lang === 'ar' ? 'كلمتا مرور ولي الأمر غير متطابقتين' : 'Guardian passwords do not match', 'error');
       return;
     }
+    if (turnstileSiteKey && !guardianTurnstileToken) {
+      toast(lang === 'ar' ? 'يرجى إتمام التحقق الأمني أولاً' : 'Please complete the security verification first', 'error');
+      return;
+    }
     setLoading(true);
     try {
       const res = await apiFetch<{ status: string; request_id: number; student_code: string; email: string }>(
@@ -215,6 +245,7 @@ export function LoginPage({
             phone: guardianForm.phone,
             password: guardianForm.password,
             ...(guardianGoogleToken ? { google_access_token: guardianGoogleToken } : {}),
+            ...(guardianTurnstileToken ? { turnstileToken: guardianTurnstileToken } : {}),
           }),
         }
       );
@@ -228,6 +259,7 @@ export function LoginPage({
         'success'
       );
     } catch (err: unknown) {
+      setGuardianTurnstileReset((n) => n + 1);
       toast(err instanceof Error ? err.message : 'Registration failed', 'error');
     } finally {
       setLoading(false);
@@ -326,12 +358,19 @@ export function LoginPage({
 
   const handleForgotSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (turnstileSiteKey && !forgotTurnstileToken) {
+      toast(lang === 'ar' ? 'يرجى إتمام التحقق الأمني أولاً' : 'Please complete the security verification first', 'error');
+      return;
+    }
     setForgotLoading(true);
     setForgotMessage(null);
     try {
       const res = await apiFetch<{ ok: boolean; emailSentViaSupabase: boolean; mode: string; reason?: string }>('/api/auth/forgot-password', {
         method: 'POST',
-        body: JSON.stringify({ email: forgotEmail }),
+        body: JSON.stringify({
+          email: forgotEmail,
+          ...(forgotTurnstileToken ? { turnstileToken: forgotTurnstileToken } : {}),
+        }),
       });
       setForgotMessage(
         res.mode === 'supabase_email'
@@ -344,7 +383,8 @@ export function LoginPage({
       );
       toast(lang === 'ar' ? 'تم إرسال طلب استعادة كلمة المرور' : 'Password reset request processed', 'success');
     } catch (err: unknown) {
-      toast(err instanceof Error ? err.message : 'Request failed', 'error');
+      setForgotTurnstileReset((n) => n + 1);
+      toast(formatAuthError(err), 'error');
     } finally {
       setForgotLoading(false);
     }
@@ -654,6 +694,11 @@ export function LoginPage({
                   </button>
                 </div>
               </div>
+              <TurnstileWidget
+                siteKey={turnstileSiteKey}
+                onToken={setLoginTurnstileToken}
+                resetKey={loginTurnstileReset}
+              />
               <PrimaryButton type="submit" disabled={loading} className="w-full">
                 <LogIn className="w-4 h-4" />
                 <span>
@@ -684,6 +729,11 @@ export function LoginPage({
                   onChange={(e) => setForgotEmail(e.target.value)}
                   placeholder={lang === 'ar' ? 'أدخل بريدك الإلكتروني المسجّل' : 'Enter your registered email'}
                   className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-white dark:bg-[#091529] px-3 py-2 text-xs"
+                />
+                <TurnstileWidget
+                  siteKey={turnstileSiteKey}
+                  onToken={setForgotTurnstileToken}
+                  resetKey={forgotTurnstileReset}
                 />
                 <div className="flex items-center gap-2">
                   <SecondaryButton type="submit" disabled={forgotLoading} className="text-xs">
@@ -993,6 +1043,11 @@ export function LoginPage({
                 </div>
               </div>
             </div>
+            <TurnstileWidget
+              siteKey={turnstileSiteKey}
+              onToken={setGuardianTurnstileToken}
+              resetKey={guardianTurnstileReset}
+            />
             <PrimaryButton type="submit" disabled={loading} className="w-full">
               <ShieldCheck className="w-4 h-4" />
               <span>
@@ -1082,21 +1137,6 @@ export function GoogleOAuthCallbackPage() {
         ch.postMessage(payload);
         ch.close();
       }
-    } catch {
-      // ignore
-    }
-    try {
-      localStorage.setItem(
-        'nb_google_oauth_result',
-        JSON.stringify({ state, access_token: accessToken, error: payload.error, ts: Date.now() })
-      );
-      window.setTimeout(() => {
-        try {
-          localStorage.removeItem('nb_google_oauth_result');
-        } catch {
-          // ignore
-        }
-      }, 5000);
     } catch {
       // ignore
     }

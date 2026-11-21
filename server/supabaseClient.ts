@@ -227,26 +227,38 @@ export async function provisionSupabaseAuthUser(
   email: string,
   password: string,
   fullName: string,
-  role: 'student' | 'teacher' | 'admin' | 'guardian'
+  role: 'student' | 'teacher' | 'admin' | 'guardian',
+  options?: { emailConfirm?: boolean }
 ) {
   const client = requireSupabaseAdmin();
   const normalizedEmail = email.trim().toLowerCase();
-
-  const existing = await findSupabaseAuthUserByEmail(normalizedEmail);
-  if (existing) {
-    return { user: existing, alreadyExisted: true };
-  }
+  const emailConfirm = options?.emailConfirm ?? true;
 
   const { data, error } = await client.auth.admin.createUser({
     email: normalizedEmail,
     password,
-    email_confirm: true,
+    email_confirm: emailConfirm,
     user_metadata: { full_name: fullName, role },
   });
-  if (error || !data.user) {
-    throw new Error(error?.message || 'Failed to create Supabase Auth user');
+  if (!error && data.user) {
+    return { user: data.user, alreadyExisted: false };
   }
-  return { user: data.user, alreadyExisted: false };
+
+  const errMsg = String(error?.message || '').toLowerCase();
+  const errCode = String((error as { code?: string } | null)?.code || '').toLowerCase();
+  if (
+    errCode === 'email_exists' ||
+    errMsg.includes('already been registered') ||
+    errMsg.includes('already exists') ||
+    errMsg.includes('duplicate')
+  ) {
+    const existing = await findSupabaseAuthUserByEmail(normalizedEmail);
+    if (existing) {
+      return { user: existing, alreadyExisted: true };
+    }
+  }
+
+  throw new Error(error?.message || 'Failed to create Supabase Auth user');
 }
 
 export async function syncUsersToSupabaseAuth(
@@ -319,5 +331,39 @@ export async function broadcastRealtimeEvent(
     });
   } catch (err) {
     console.warn('[realtime] broadcast warning:', err instanceof Error ? err.message : err);
+  }
+}
+
+export async function verifyTurnstileToken(
+  token: string | undefined,
+  remoteIp?: string
+): Promise<{ ok: boolean; reason?: string }> {
+  const secret = process.env.TURNSTILE_SECRET_KEY?.trim();
+  if (!secret) {
+    return { ok: true };
+  }
+  if (!token || typeof token !== 'string' || token.trim().length < 10) {
+    return { ok: false, reason: 'CAPTCHA verification is required.' };
+  }
+  try {
+    const body = new URLSearchParams();
+    body.set('secret', secret);
+    body.set('response', token.trim());
+    if (remoteIp) body.set('remoteip', remoteIp);
+    const resp = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+    if (!resp.ok) {
+      return { ok: false, reason: 'CAPTCHA verification service failed.' };
+    }
+    const result = (await resp.json()) as { success?: boolean };
+    if (!result.success) {
+      return { ok: false, reason: 'CAPTCHA verification failed. Please retry.' };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, reason: 'Unable to verify CAPTCHA right now.' };
   }
 }

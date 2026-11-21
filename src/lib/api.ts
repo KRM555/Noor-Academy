@@ -81,6 +81,17 @@ function readCookie(name: string): string | null {
   return null;
 }
 
+export class ApiError extends Error {
+  status: number;
+  code?: string;
+  constructor(message: string, status: number, code?: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
 export async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
   const token = getStoredToken();
   const headers = new Headers(options.headers || {});
@@ -105,7 +116,8 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error((data as { error?: string }).error || `Request failed (${res.status})`);
+    const errObj = data as { error?: string; code?: string };
+    throw new ApiError(errObj.error || `Request failed (${res.status})`, res.status, errObj.code);
   }
   return data as T;
 }

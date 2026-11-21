@@ -22,7 +22,12 @@ interface AppContextValue {
   setCurrency: (currency: DisplayCurrency) => void;
   user: AuthUser | null;
   authLoading: boolean;
-  loginWithCredentials: (email: string, password: string, portalRole?: UserRole) => Promise<AuthUser>;
+  loginWithCredentials: (
+    email: string,
+    password: string,
+    portalRole?: UserRole,
+    turnstileToken?: string | null
+  ) => Promise<AuthUser>;
   setAuthSession: (token: string, user: AuthUser) => void;
   logout: () => void;
   notifications: NotificationItem[];
@@ -137,10 +142,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     void initAuth();
   }, []);
 
-  const loginWithCredentials = async (email: string, password: string, portalRole?: UserRole) => {
+  const loginWithCredentials = async (
+    email: string,
+    password: string,
+    portalRole?: UserRole,
+    turnstileToken?: string | null
+  ) => {
     const res = await apiFetch<{ token: string; user: AuthUser }>('/api/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ email, password, ...(portalRole ? { portalRole } : {}) }),
+      body: JSON.stringify({
+        email,
+        password,
+        ...(portalRole ? { portalRole } : {}),
+        ...(turnstileToken ? { turnstileToken } : {}),
+      }),
     });
     setStoredToken(res.token);
     setUser(res.user);

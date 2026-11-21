@@ -268,7 +268,22 @@ export async function generateCertificatePDF(cert: CertificatePDFData): Promise<
     color: '#334155',
   });
   if (arProgramStrip) {
-    doc.addImage(arProgramStrip, 'PNG', w / 2 - 330, 332 + yOffset, 660, 26);
+    doc.addImage(arProgramStrip, 'PNG', w / 2 - 330, 330 + yOffset, 660, 26);
+  }
+
+  if (cert.course_title_en && cert.course_title_en !== cert.course_title_ar) {
+    const enCourseStrip = renderTextStripToPng({
+      text: `Program: ${cert.course_title_en}`,
+      widthPt: 620,
+      heightPt: 20,
+      fontSizePx: 11.5,
+      fontWeight: '600',
+      color: '#475569',
+      direction: 'ltr',
+    });
+    if (enCourseStrip) {
+      doc.addImage(enCourseStrip, 'PNG', w / 2 - 310, 356 + yOffset, 620, 20);
+    }
   }
 
   // QR Code for instant verification

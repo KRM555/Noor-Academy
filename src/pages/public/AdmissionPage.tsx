@@ -10,6 +10,7 @@ import { tField } from '../../i18n/translations';
 import type { Course, Level } from '../../types';
 import { Card, PrimaryButton, SecondaryButton } from '../../components/ui/CommonUI';
 import { PhoneInputWithCode } from '../../components/ui/PhoneInputWithCode';
+import { TurnstileWidget } from '../../components/ui/TurnstileWidget';
 
 const studentAdmissionSchema = z
   .object({
@@ -87,7 +88,21 @@ export function AdmissionPage({
   const [showTeacherPass, setShowTeacherPass] = useState(false);
   const [showTeacherConfirm, setShowTeacherConfirm] = useState(false);
   const [sameEmailForGuardian, setSameEmailForGuardian] = useState(true);
+  const [turnstileSiteKey, setTurnstileSiteKey] = useState<string | null>(null);
+  const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
+  const [turnstileResetKey, setTurnstileResetKey] = useState(0);
   const googleEnabled = isBrowserSupabaseConfigured();
+
+  useEffect(() => {
+    fetch('/api/auth/config')
+      .then((r) => (r.ok ? r.json() : {}))
+      .then((d: { turnstileEnabled?: boolean; turnstileSiteKey?: string | null }) => {
+        if (d.turnstileEnabled && d.turnstileSiteKey) {
+          setTurnstileSiteKey(d.turnstileSiteKey);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (initialMode === 'teacher') setApplyRole('teacher');
@@ -191,6 +206,10 @@ export function AdmissionPage({
   };
 
   const onSubmitStudent = async (values: StudentAdmissionValues) => {
+    if (turnstileSiteKey && !turnstileToken) {
+      toast(lang === 'ar' ? 'يرجى إتمام التحقق الأمني أولاً' : 'Please complete the security verification first', 'error');
+      return;
+    }
     try {
       const res = await apiFetch<{ id: number; student_email: string }>('/api/public/admissions', {
         method: 'POST',
@@ -207,16 +226,22 @@ export function AdmissionPage({
           notes: values.notes,
           consent_accepted: values.consent_accepted,
           ...(googleAccessToken ? { google_access_token: googleAccessToken } : {}),
+          ...(turnstileToken ? { turnstileToken } : {}),
         }),
       });
       setSubmittedInfo({ id: res.id, role: 'student', email: res.student_email || values.student_email });
       toast(lang === 'ar' ? 'تم استلام طلب التحاق الطالب بنجاح!' : 'Student admission request received!', 'success');
     } catch (err: unknown) {
+      setTurnstileResetKey((n) => n + 1);
       toast(err instanceof Error ? err.message : 'Submission error', 'error');
     }
   };
 
   const onSubmitTeacher = async (values: TeacherApplicationValues) => {
+    if (turnstileSiteKey && !turnstileToken) {
+      toast(lang === 'ar' ? 'يرجى إتمام التحقق الأمني أولاً' : 'Please complete the security verification first', 'error');
+      return;
+    }
     try {
       const res = await apiFetch<{ id: number; email: string }>('/api/public/teacher-applications', {
         method: 'POST',
@@ -231,11 +256,13 @@ export function AdmissionPage({
           password: values.password,
           consent_accepted: values.consent_accepted,
           ...(googleAccessToken ? { google_access_token: googleAccessToken } : {}),
+          ...(turnstileToken ? { turnstileToken } : {}),
         }),
       });
       setSubmittedInfo({ id: res.id, role: 'teacher', email: res.email || values.email });
       toast(lang === 'ar' ? 'تم استلام طلب انضمام المعلم بنجاح!' : 'Teacher application received!', 'success');
     } catch (err: unknown) {
+      setTurnstileResetKey((n) => n + 1);
       toast(err instanceof Error ? err.message : 'Submission error', 'error');
     }
   };
@@ -593,6 +620,12 @@ export function AdmissionPage({
               )}
             </div>
 
+            <TurnstileWidget
+              siteKey={turnstileSiteKey}
+              onToken={setTurnstileToken}
+              resetKey={turnstileResetKey}
+            />
+
             <PrimaryButton type="submit" disabled={studentForm.formState.isSubmitting}>
               {studentForm.formState.isSubmitting
                 ? lang === 'ar' ? 'جاري إرسال الطلب...' : 'Submitting...'
@@ -769,6 +802,12 @@ export function AdmissionPage({
                 <p className="text-xs text-red-600">{lang === 'ar' ? 'الموافقة على الشروط والخصوصية مطلوبة' : 'Consent is required'}</p>
               )}
             </div>
+
+            <TurnstileWidget
+              siteKey={turnstileSiteKey}
+              onToken={setTurnstileToken}
+              resetKey={turnstileResetKey}
+            />
 
             <PrimaryButton type="submit" disabled={teacherForm.formState.isSubmitting}>
               {teacherForm.formState.isSubmitting

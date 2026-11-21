@@ -14,9 +14,12 @@ CREATE TABLE IF NOT EXISTS public.profiles (
   role TEXT NOT NULL DEFAULT 'student' CHECK (role IN ('student', 'teacher', 'admin', 'guardian')),
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
   preferred_lang TEXT NOT NULL DEFAULT 'ar',
+  token_version INT NOT NULL DEFAULT 1,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   deleted_at TIMESTAMPTZ
 );
+
+ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS token_version INT NOT NULL DEFAULT 1;
 
 -- 2. Levels, Guardians, Teachers, Students
 CREATE TABLE IF NOT EXISTS public.levels (
@@ -324,8 +327,13 @@ CREATE TABLE IF NOT EXISTS public.consents (
   email TEXT NOT NULL,
   doc_type TEXT NOT NULL,
   doc_version TEXT NOT NULL,
+  ip_address TEXT DEFAULT '',
+  actor_role TEXT DEFAULT 'guardian',
   accepted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE public.consents ADD COLUMN IF NOT EXISTS ip_address TEXT DEFAULT '';
+ALTER TABLE public.consents ADD COLUMN IF NOT EXISTS actor_role TEXT DEFAULT 'guardian';
 
 CREATE TABLE IF NOT EXISTS public.testimonials (
   id BIGSERIAL PRIMARY KEY,
@@ -374,6 +382,7 @@ CREATE INDEX IF NOT EXISTS idx_notifications_profile ON public.notifications(pro
 CREATE INDEX IF NOT EXISTS idx_certificates_student ON public.certificates(student_id);
 CREATE INDEX IF NOT EXISTS idx_payroll_teacher ON public.payroll(teacher_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON public.audit_logs(created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_lower_email_unique ON public.profiles (LOWER(email)) WHERE deleted_at IS NULL;
 
 -- ============================================================================
 -- Helper Security-Definer Functions for Strict RLS & Public Certificate Verification
@@ -471,6 +480,24 @@ LANGUAGE SQL SECURITY DEFINER SET search_path = public AS $$
   WHERE LOWER(cert.verification_code) = LOWER(TRIM(p_code))
   LIMIT 1;
 $$;
+
+REVOKE ALL ON FUNCTION public.is_admin() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.is_admin() TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.is_teacher() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.is_teacher() TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.is_student_owner(BIGINT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.is_student_owner(BIGINT) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.teaches_course(BIGINT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.teaches_course(BIGINT) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.teaches_student(BIGINT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.teaches_student(BIGINT) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.enrolled_in_course(BIGINT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.enrolled_in_course(BIGINT) TO authenticated, service_role;
 
 REVOKE ALL ON FUNCTION public.verify_certificate(TEXT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.verify_certificate(TEXT) TO anon, authenticated;

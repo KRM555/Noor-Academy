@@ -27,7 +27,9 @@ function generateOAuthState(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '').slice(0, 8);
   }
-  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`.slice(0, 32);
+  const bytes = new Uint8Array(20);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 export async function buildGoogleOAuthPopupRequest(): Promise<{ state: string; url: string }> {
@@ -75,12 +77,6 @@ export function waitForGoogleOAuthToken(
 
     const cleanup = () => {
       window.removeEventListener('message', onMessage);
-      window.removeEventListener('storage', onStorage);
-      try {
-        localStorage.removeItem('nb_google_oauth_result');
-      } catch {
-        // ignore
-      }
       if (channel) {
         try {
           channel.close();
@@ -123,23 +119,7 @@ export function waitForGoogleOAuthToken(
       handlePayload(event.data);
     };
 
-    const onStorage = (event: StorageEvent) => {
-      if (event.key !== 'nb_google_oauth_result' || !event.newValue) return;
-      try {
-        const parsed = JSON.parse(event.newValue) as { state?: string; access_token?: string; error?: string };
-        try {
-          localStorage.removeItem('nb_google_oauth_result');
-        } catch {
-          // ignore
-        }
-        handlePayload({ type: 'NB_GOOGLE_OAUTH', ...parsed });
-      } catch {
-        // ignore
-      }
-    };
-
     window.addEventListener('message', onMessage);
-    window.addEventListener('storage', onStorage);
 
     if (typeof BroadcastChannel !== 'undefined') {
       try {

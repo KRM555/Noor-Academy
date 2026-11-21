@@ -45,7 +45,7 @@ import {
   ThumbsUp,
 } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
-import { apiFetch } from '../../lib/api';
+import { ApiError, apiFetch } from '../../lib/api';
 import { queryKeys } from '../../lib/queryClient';
 import { isBrowserSupabaseConfigured } from '../../lib/supabase';
 import { PRESET_COURSE_COVERS, getCourseImageUrl } from '../../lib/courseImages';
@@ -377,6 +377,18 @@ export function AdminDashboard({
   const [newAdmin, setNewAdmin] = useState({ full_name: '', email: '', password: '' });
   const [showNewAdminPass, setShowNewAdminPass] = useState(false);
   const [creatingAdmin, setCreatingAdmin] = useState(false);
+  const [reauthPrompt, setReauthPrompt] = useState<{
+    mode: 'password' | 'confirm';
+    titleAr: string;
+    titleEn: string;
+    descriptionAr: string;
+    descriptionEn: string;
+    execute: (reauth: { confirmPassword?: string; confirmAction?: boolean }) => Promise<void>;
+  } | null>(null);
+  const [reauthPassword, setReauthPassword] = useState('');
+  const [showReauthPassword, setShowReauthPassword] = useState(false);
+  const [reauthSubmitting, setReauthSubmitting] = useState(false);
+  const [reauthError, setReauthError] = useState<string | null>(null);
 
   const [examSectionTab, setExamSectionTab] = useState<'center' | 'placement'>('center');
   const [adminReplyText, setAdminReplyText] = useState<Record<string, string>>({});
@@ -597,6 +609,139 @@ export function AdminDashboard({
       onClose={() => setDeleteTarget(null)}
     />
   );
+
+  const runWithAdminReauth = async (
+    meta: { titleAr: string; titleEn: string; descriptionAr: string; descriptionEn: string },
+    execute: (reauth: { confirmPassword?: string; confirmAction?: boolean }) => Promise<void>
+  ) => {
+    try {
+      await execute({});
+    } catch (err: unknown) {
+      if (
+        err instanceof ApiError &&
+        (err.code === 'REAUTH_PASSWORD_REQUIRED' || err.code === 'REAUTH_CONFIRM_REQUIRED')
+      ) {
+        setReauthPassword('');
+        setShowReauthPassword(false);
+        setReauthError(null);
+        setReauthPrompt({
+          mode: err.code === 'REAUTH_CONFIRM_REQUIRED' ? 'confirm' : 'password',
+          ...meta,
+          execute,
+        });
+        return;
+      }
+      throw err;
+    }
+  };
+
+  const adminReauthModalNode = reauthPrompt ? (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+      <Card className="w-full max-w-md p-6 space-y-4">
+        <div className="flex items-start gap-3">
+          <div className="p-2 rounded-xl bg-[#C98A1E]/15 text-[#C98A1E] shrink-0">
+            <ShieldAlert className="w-5 h-5" />
+          </div>
+          <div className="space-y-1">
+            <h3 className="text-base font-extrabold text-[#0F213E] dark:text-[#F8F5EC]">
+              {lang === 'ar' ? reauthPrompt.titleAr : reauthPrompt.titleEn}
+            </h3>
+            <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+              {lang === 'ar' ? reauthPrompt.descriptionAr : reauthPrompt.descriptionEn}
+            </p>
+          </div>
+        </div>
+        <form
+          onSubmit={async (e) => {
+            e.preventDefault();
+            setReauthError(null);
+            setReauthSubmitting(true);
+            try {
+              await reauthPrompt.execute(
+                reauthPrompt.mode === 'confirm'
+                  ? { confirmAction: true }
+                  : { confirmPassword: reauthPassword }
+              );
+              setReauthPrompt(null);
+              setReauthPassword('');
+            } catch (err: unknown) {
+              if (err instanceof ApiError && err.code === 'REAUTH_INVALID_PASSWORD') {
+                setReauthError(
+                  lang === 'ar'
+                    ? 'كلمة مرور المدير غير صحيحة. يرجى التأكد وإعادة المحاولة.'
+                    : 'Administrator password verification failed.'
+                );
+              } else {
+                setReauthError(err instanceof Error ? err.message : 'Verification failed');
+              }
+            } finally {
+              setReauthSubmitting(false);
+            }
+          }}
+          className="space-y-4"
+        >
+          {reauthPrompt.mode === 'password' ? (
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold">
+                {lang === 'ar' ? 'أدخل كلمة مرور حسابك الإداري للتأكيد' : 'Enter your administrator password'}
+              </label>
+              <div className="relative">
+                <input
+                  type={showReauthPassword ? 'text' : 'password'}
+                  dir="ltr"
+                  autoComplete="current-password"
+                  required
+                  autoFocus
+                  value={reauthPassword}
+                  onChange={(e) => setReauthPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] pl-3.5 pr-10 py-2.5 text-sm"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowReauthPassword((v) => !v)}
+                  aria-label={showReauthPassword ? 'Hide password' : 'Show password'}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-[#0F213E] dark:hover:text-[#F8F5EC] cursor-pointer"
+                >
+                  {showReauthPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="p-3 rounded-xl border border-[#0F766E]/30 bg-[#0F766E]/8 text-xs text-[#0F213E] dark:text-[#F8F5EC] leading-relaxed">
+              {lang === 'ar'
+                ? 'حسابك الإداري موثّق عبر Google دون كلمة مرور منفصلة. اضغط «تأكيد التنفيذ» للمتابعة.'
+                : 'Your director account is authenticated via Google. Click Confirm Action to proceed.'}
+            </div>
+          )}
+
+          {reauthError && (
+            <p className="text-xs font-semibold text-red-600 dark:text-red-400">{reauthError}</p>
+          )}
+
+          <div className="flex items-center justify-end gap-2">
+            <SecondaryButton
+              type="button"
+              disabled={reauthSubmitting}
+              onClick={() => {
+                setReauthPrompt(null);
+                setReauthPassword('');
+                setReauthError(null);
+              }}
+              className="text-xs"
+            >
+              {lang === 'ar' ? 'إلغاء' : 'Cancel'}
+            </SecondaryButton>
+            <PrimaryButton type="submit" disabled={reauthSubmitting} className="text-xs">
+              {reauthSubmitting
+                ? lang === 'ar' ? 'جاري التحقق...' : 'Verifying...'
+                : lang === 'ar' ? 'تأكيد التنفيذ' : 'Confirm Action'}
+            </PrimaryButton>
+          </div>
+        </form>
+      </Card>
+    </div>
+  ) : null;
 
   if (activeTab === 'overview') {
     const chartData = data.courses.map((c) => ({
@@ -3398,9 +3543,22 @@ export function AdminDashboard({
   // Settings Tab: Role Management + Create Secondary Admin + Supabase SQL Export
   const changeRole = async (userId: string | number, role: 'student' | 'teacher' | 'admin' | 'guardian') => {
     try {
-      await apiFetch(`/api/admin/users/${userId}/role`, { method: 'PATCH', body: JSON.stringify({ role }) });
-      toast(lang === 'ar' ? 'تم تحديث الدور وتسجيله في سجل العمليات' : 'Role updated and audited', 'success');
-      loadData();
+      await runWithAdminReauth(
+        {
+          titleAr: 'تأكيد تغيير صلاحيات المستخدم',
+          titleEn: 'Confirm Role Change',
+          descriptionAr: `تغيير دور الحساب إلى (${role}) إجراء أمني حساس يُنهي الجلسات النشطة لذلك الحساب.`,
+          descriptionEn: `Changing account role to (${role}) will update permissions and revoke active sessions.`,
+        },
+        async (reauth) => {
+          await apiFetch(`/api/admin/users/${userId}/role`, {
+            method: 'PATCH',
+            body: JSON.stringify({ role, ...reauth }),
+          });
+          toast(lang === 'ar' ? 'تم تحديث الدور وتسجيله في سجل العمليات' : 'Role updated and audited', 'success');
+          loadData();
+        }
+      );
     } catch (err: unknown) {
       toast(err instanceof Error ? err.message : 'Unable to update role', 'error');
     }
@@ -3414,19 +3572,30 @@ export function AdminDashboard({
     }
     setCreatingAdmin(true);
     try {
-      await apiFetch('/api/admin/admins', {
-        method: 'POST',
-        body: JSON.stringify(newAdmin),
-      });
-      toast(
-        lang === 'ar'
-          ? `تمت إضافة المدير (${newAdmin.email}) ويمكنه الدخول لنفس لوحة الإدارة فوراً`
-          : `Administrator (${newAdmin.email}) created and ready to sign in`,
-        'success'
+      const payloadSnapshot = { ...newAdmin };
+      await runWithAdminReauth(
+        {
+          titleAr: 'تأكيد إنشاء حساب مدير جديد',
+          titleEn: 'Confirm New Administrator Creation',
+          descriptionAr: `سيتم منح (${payloadSnapshot.email}) صلاحيات إدارة الأكاديمية الكاملة.`,
+          descriptionEn: `Granting full Academy administration access to (${payloadSnapshot.email}).`,
+        },
+        async (reauth) => {
+          await apiFetch('/api/admin/admins', {
+            method: 'POST',
+            body: JSON.stringify({ ...payloadSnapshot, ...reauth }),
+          });
+          toast(
+            lang === 'ar'
+              ? `تمت إضافة المدير (${payloadSnapshot.email}) ويمكنه الدخول لنفس لوحة الإدارة فوراً`
+              : `Administrator (${payloadSnapshot.email}) created and ready to sign in`,
+            'success'
+          );
+          setNewAdmin({ full_name: '', email: '', password: '' });
+          setShowNewAdminPass(false);
+          loadData();
+        }
       );
-      setNewAdmin({ full_name: '', email: '', password: '' });
-      setShowNewAdminPass(false);
-      loadData();
     } catch (err: unknown) {
       toast(err instanceof Error ? err.message : 'Unable to create admin', 'error');
     } finally {
@@ -3603,18 +3772,30 @@ export function AdminDashboard({
               }
               setResettingUserPass(true);
               try {
-                await apiFetch(`/api/admin/users/${resetTargetUser.id}/reset-password`, {
-                  method: 'POST',
-                  body: JSON.stringify({ newPassword: adminNewPassword }),
-                });
-                toast(
-                  lang === 'ar'
-                    ? `تم تعيين كلمة المرور الجديدة لحساب ${resetTargetUser.email} بنجاح`
-                    : `Password updated for ${resetTargetUser.email}`,
-                  'success'
+                const targetSnap = resetTargetUser;
+                const passSnap = adminNewPassword;
+                await runWithAdminReauth(
+                  {
+                    titleAr: 'تأكيد إعادة تعيين كلمة المرور',
+                    titleEn: 'Confirm Password Reset',
+                    descriptionAr: `سيتم تغيير كلمة مرور (${targetSnap.email}) وإنهاء جلساته النشطة فوراً.`,
+                    descriptionEn: `Resetting password for (${targetSnap.email}) will invalidate active sessions.`,
+                  },
+                  async (reauth) => {
+                    await apiFetch(`/api/admin/users/${targetSnap.id}/reset-password`, {
+                      method: 'POST',
+                      body: JSON.stringify({ newPassword: passSnap, ...reauth }),
+                    });
+                    toast(
+                      lang === 'ar'
+                        ? `تم تعيين كلمة المرور الجديدة لحساب ${targetSnap.email} بنجاح`
+                        : `Password updated for ${targetSnap.email}`,
+                      'success'
+                    );
+                    setResetTargetUser(null);
+                    setAdminNewPassword('');
+                  }
                 );
-                setResetTargetUser(null);
-                setAdminNewPassword('');
               } catch (err: unknown) {
                 toast(err instanceof Error ? err.message : 'Reset failed', 'error');
               } finally {
@@ -3796,6 +3977,7 @@ export function AdminDashboard({
         </pre>
       </Card>
       {confirmDeleteModalNode}
+      {adminReauthModalNode}
     </div>
   );
 }
