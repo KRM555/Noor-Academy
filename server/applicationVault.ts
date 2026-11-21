@@ -80,6 +80,35 @@ export const COURSE_COVERS_BUCKET = 'course-covers';
 let vaultCheckedAt = 0;
 let coversBucketCheckedAt = 0;
 
+const VAULT_CACHE_TTL_MS = 30_000;
+let admissionMetasCache: { value: Map<number, AdmissionMetaRecord>; expiresAt: number } | null = null;
+let teacherAppsCache: { value: TeacherApplicationRecord[]; expiresAt: number } | null = null;
+let guardianReqsCache: { value: GuardianRequestRecord[]; expiresAt: number } | null = null;
+let courseMetasCache: { value: Map<number, CourseMetaRecord>; expiresAt: number } | null = null;
+let lessonMetasCache: { value: Map<number, LessonMetaRecord>; expiresAt: number } | null = null;
+const singleCourseMetaCache = new Map<number, { value: CourseMetaRecord | null; expiresAt: number }>();
+const singleLessonMetaCache = new Map<number, { value: LessonMetaRecord | null; expiresAt: number }>();
+
+function invalidateAdmissionMetasCache() {
+  admissionMetasCache = null;
+}
+function invalidateTeacherAppsCache() {
+  teacherAppsCache = null;
+}
+function invalidateGuardianReqsCache() {
+  guardianReqsCache = null;
+}
+function invalidateCourseMetaCaches(courseId?: number) {
+  courseMetasCache = null;
+  if (typeof courseId === 'number') singleCourseMetaCache.delete(courseId);
+  else singleCourseMetaCache.clear();
+}
+function invalidateLessonMetaCaches(lessonId?: number) {
+  lessonMetasCache = null;
+  if (typeof lessonId === 'number') singleLessonMetaCache.delete(lessonId);
+  else singleLessonMetaCache.clear();
+}
+
 async function ensureApplicationVaultBucket(sb: SupabaseClient): Promise<void> {
   if (Date.now() - vaultCheckedAt < 60_000) return;
   const { data: bucket } = await sb.storage.getBucket(APPLICATION_VAULT_BUCKET);
@@ -153,16 +182,26 @@ async function writeJsonToVault(sb: SupabaseClient, path: string, payload: unkno
 
 export async function saveAdmissionMeta(sb: SupabaseClient, record: AdmissionMetaRecord): Promise<void> {
   await writeJsonToVault(sb, `admissions/${record.admission_id}.json`, record);
+  invalidateAdmissionMetasCache();
 }
 
 export async function getAdmissionMeta(sb: SupabaseClient, admissionId: number): Promise<AdmissionMetaRecord | null> {
+  if (admissionMetasCache && Date.now() < admissionMetasCache.expiresAt) {
+    return admissionMetasCache.value.get(admissionId) ?? null;
+  }
   return readJsonFromVault<AdmissionMetaRecord>(sb, `admissions/${admissionId}.json`);
 }
 
 export async function listAdmissionMetas(sb: SupabaseClient): Promise<Map<number, AdmissionMetaRecord>> {
+  if (admissionMetasCache && Date.now() < admissionMetasCache.expiresAt) {
+    return admissionMetasCache.value;
+  }
   const result = new Map<number, AdmissionMetaRecord>();
   const files = await listAllVaultFiles(sb, 'admissions');
-  if (!files.length) return result;
+  if (!files.length) {
+    admissionMetasCache = { value: result, expiresAt: Date.now() + VAULT_CACHE_TTL_MS };
+    return result;
+  }
   const rows = await Promise.all(
     files.map((f) => readJsonFromVault<AdmissionMetaRecord>(sb, `admissions/${f.name}`))
   );
@@ -171,6 +210,7 @@ export async function listAdmissionMetas(sb: SupabaseClient): Promise<Map<number
       result.set(row.admission_id, row);
     }
   }
+  admissionMetasCache = { value: result, expiresAt: Date.now() + VAULT_CACHE_TTL_MS };
   return result;
 }
 
@@ -180,6 +220,7 @@ export function generateApplicationId(): number {
 
 export async function saveTeacherApplication(sb: SupabaseClient, record: TeacherApplicationRecord): Promise<void> {
   await writeJsonToVault(sb, `teacher-applications/${record.id}.json`, record);
+  invalidateTeacherAppsCache();
 }
 
 export async function getTeacherApplication(sb: SupabaseClient, id: number): Promise<TeacherApplicationRecord | null> {
@@ -187,18 +228,27 @@ export async function getTeacherApplication(sb: SupabaseClient, id: number): Pro
 }
 
 export async function listTeacherApplications(sb: SupabaseClient): Promise<TeacherApplicationRecord[]> {
+  if (teacherAppsCache && Date.now() < teacherAppsCache.expiresAt) {
+    return teacherAppsCache.value;
+  }
   const files = await listAllVaultFiles(sb, 'teacher-applications');
-  if (!files.length) return [];
+  if (!files.length) {
+    teacherAppsCache = { value: [], expiresAt: Date.now() + VAULT_CACHE_TTL_MS };
+    return [];
+  }
   const rows = await Promise.all(
     files.map((f) => readJsonFromVault<TeacherApplicationRecord>(sb, `teacher-applications/${f.name}`))
   );
-  return rows
+  const sorted = rows
     .filter((r): r is TeacherApplicationRecord => Boolean(r && typeof r.id === 'number'))
     .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  teacherAppsCache = { value: sorted, expiresAt: Date.now() + VAULT_CACHE_TTL_MS };
+  return sorted;
 }
 
 export async function saveGuardianRequest(sb: SupabaseClient, record: GuardianRequestRecord): Promise<void> {
   await writeJsonToVault(sb, `guardian-requests/${record.id}.json`, record);
+  invalidateGuardianReqsCache();
 }
 
 export async function getGuardianRequest(sb: SupabaseClient, id: number): Promise<GuardianRequestRecord | null> {
@@ -206,29 +256,40 @@ export async function getGuardianRequest(sb: SupabaseClient, id: number): Promis
 }
 
 export async function listGuardianRequests(sb: SupabaseClient): Promise<GuardianRequestRecord[]> {
+  if (guardianReqsCache && Date.now() < guardianReqsCache.expiresAt) {
+    return guardianReqsCache.value;
+  }
   const files = await listAllVaultFiles(sb, 'guardian-requests');
-  if (!files.length) return [];
+  if (!files.length) {
+    guardianReqsCache = { value: [], expiresAt: Date.now() + VAULT_CACHE_TTL_MS };
+    return [];
+  }
   const rows = await Promise.all(
     files.map((f) => readJsonFromVault<GuardianRequestRecord>(sb, `guardian-requests/${f.name}`))
   );
-  return rows
+  const sorted = rows
     .filter((r): r is GuardianRequestRecord => Boolean(r && typeof r.id === 'number'))
     .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  guardianReqsCache = { value: sorted, expiresAt: Date.now() + VAULT_CACHE_TTL_MS };
+  return sorted;
 }
 
 export async function deleteAdmissionMeta(sb: SupabaseClient, admissionId: number): Promise<void> {
   await ensureApplicationVaultBucket(sb);
   await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`admissions/${admissionId}.json`]).catch(() => {});
+  invalidateAdmissionMetasCache();
 }
 
 export async function deleteTeacherApplication(sb: SupabaseClient, id: number): Promise<void> {
   await ensureApplicationVaultBucket(sb);
   await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`teacher-applications/${id}.json`]).catch(() => {});
+  invalidateTeacherAppsCache();
 }
 
 export async function deleteGuardianRequest(sb: SupabaseClient, id: number): Promise<void> {
   await ensureApplicationVaultBucket(sb);
   await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`guardian-requests/${id}.json`]).catch(() => {});
+  invalidateGuardianReqsCache();
 }
 
 export function hashVaultPassword(password: string): { salt: string; hash: string } {
@@ -273,21 +334,38 @@ export async function listGuardianAuths(sb: SupabaseClient): Promise<GuardianAut
 
 export async function saveCourseMeta(sb: SupabaseClient, record: CourseMetaRecord): Promise<void> {
   await writeJsonToVault(sb, `course-meta/${record.course_id}.json`, record);
+  invalidateCourseMetaCaches(record.course_id);
 }
 
 export async function getCourseMeta(sb: SupabaseClient, courseId: number): Promise<CourseMetaRecord | null> {
-  return readJsonFromVault<CourseMetaRecord>(sb, `course-meta/${courseId}.json`);
+  const cachedSingle = singleCourseMetaCache.get(courseId);
+  if (cachedSingle && Date.now() < cachedSingle.expiresAt) {
+    return cachedSingle.value;
+  }
+  if (courseMetasCache && Date.now() < courseMetasCache.expiresAt) {
+    return courseMetasCache.value.get(courseId) ?? null;
+  }
+  const value = await readJsonFromVault<CourseMetaRecord>(sb, `course-meta/${courseId}.json`);
+  singleCourseMetaCache.set(courseId, { value, expiresAt: Date.now() + VAULT_CACHE_TTL_MS });
+  return value;
 }
 
 export async function deleteCourseMeta(sb: SupabaseClient, courseId: number): Promise<void> {
   await ensureApplicationVaultBucket(sb);
   await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`course-meta/${courseId}.json`]).catch(() => {});
+  invalidateCourseMetaCaches(courseId);
 }
 
 export async function listCourseMetas(sb: SupabaseClient): Promise<Map<number, CourseMetaRecord>> {
+  if (courseMetasCache && Date.now() < courseMetasCache.expiresAt) {
+    return courseMetasCache.value;
+  }
   const result = new Map<number, CourseMetaRecord>();
   const files = await listAllVaultFiles(sb, 'course-meta');
-  if (!files.length) return result;
+  if (!files.length) {
+    courseMetasCache = { value: result, expiresAt: Date.now() + VAULT_CACHE_TTL_MS };
+    return result;
+  }
   const rows = await Promise.all(
     files.map((f) => readJsonFromVault<CourseMetaRecord>(sb, `course-meta/${f.name}`))
   );
@@ -296,6 +374,7 @@ export async function listCourseMetas(sb: SupabaseClient): Promise<Map<number, C
       result.set(row.course_id, row);
     }
   }
+  courseMetasCache = { value: result, expiresAt: Date.now() + VAULT_CACHE_TTL_MS };
   return result;
 }
 
@@ -334,21 +413,38 @@ export async function readCourseCoverFile(sb: SupabaseClient, storagePath: strin
 
 export async function saveLessonMeta(sb: SupabaseClient, record: LessonMetaRecord): Promise<void> {
   await writeJsonToVault(sb, `lesson-meta/${record.lesson_id}.json`, record);
+  invalidateLessonMetaCaches(record.lesson_id);
 }
 
 export async function getLessonMeta(sb: SupabaseClient, lessonId: number): Promise<LessonMetaRecord | null> {
-  return readJsonFromVault<LessonMetaRecord>(sb, `lesson-meta/${lessonId}.json`);
+  const cachedSingle = singleLessonMetaCache.get(lessonId);
+  if (cachedSingle && Date.now() < cachedSingle.expiresAt) {
+    return cachedSingle.value;
+  }
+  if (lessonMetasCache && Date.now() < lessonMetasCache.expiresAt) {
+    return lessonMetasCache.value.get(lessonId) ?? null;
+  }
+  const value = await readJsonFromVault<LessonMetaRecord>(sb, `lesson-meta/${lessonId}.json`);
+  singleLessonMetaCache.set(lessonId, { value, expiresAt: Date.now() + VAULT_CACHE_TTL_MS });
+  return value;
 }
 
 export async function deleteLessonMeta(sb: SupabaseClient, lessonId: number): Promise<void> {
   await ensureApplicationVaultBucket(sb);
   await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`lesson-meta/${lessonId}.json`]).catch(() => {});
+  invalidateLessonMetaCaches(lessonId);
 }
 
 export async function listLessonMetas(sb: SupabaseClient): Promise<Map<number, LessonMetaRecord>> {
+  if (lessonMetasCache && Date.now() < lessonMetasCache.expiresAt) {
+    return lessonMetasCache.value;
+  }
   const result = new Map<number, LessonMetaRecord>();
   const files = await listAllVaultFiles(sb, 'lesson-meta');
-  if (!files.length) return result;
+  if (!files.length) {
+    lessonMetasCache = { value: result, expiresAt: Date.now() + VAULT_CACHE_TTL_MS };
+    return result;
+  }
   const rows = await Promise.all(
     files.map((f) => readJsonFromVault<LessonMetaRecord>(sb, `lesson-meta/${f.name}`))
   );
@@ -357,6 +453,7 @@ export async function listLessonMetas(sb: SupabaseClient): Promise<Map<number, L
       result.set(row.lesson_id, row);
     }
   }
+  lessonMetasCache = { value: result, expiresAt: Date.now() + VAULT_CACHE_TTL_MS };
   return result;
 }
 

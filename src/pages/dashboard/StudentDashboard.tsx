@@ -318,7 +318,7 @@ export function StudentDashboard({
     }
   }, [data?.exams, examDeadlinesMs, nowMs, submittingQuiz, submitOnlineQuiz]);
 
-  if (isLoading) return <LoadingState />;
+  if (isLoading) return <LoadingState variant="dashboard" />;
   if (!data) return <EmptyState title={lang === 'ar' ? 'لا توجد بيانات طالب مرتبطة' : 'No linked student record'} />;
 
   const nextLesson = data.lessons[0];

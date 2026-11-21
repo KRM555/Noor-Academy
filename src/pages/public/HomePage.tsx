@@ -331,6 +331,7 @@ export function HomePage({
               <ResilientImage
                 src={CLIENT_CLASSROOM_IMG}
                 alt={lang === 'ar' ? 'فصل تعليمي تفاعلي أونلاين في أكاديمية نور وبيان' : 'Interactive Virtual Learning Classroom at Noor & Bayan'}
+                priority={theme === 'day'}
                 className={`w-full h-full object-cover transition-opacity duration-500 ${
                   theme === 'day' ? 'opacity-100' : 'opacity-0'
                 }`}
@@ -339,6 +340,7 @@ export function HomePage({
               <ResilientImage
                 src={nightHeroImg}
                 alt={lang === 'ar' ? 'مشهد ليلي هادئ لأكاديمية نور وبيان' : 'Nighttime library illustration'}
+                priority={theme === 'night'}
                 className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-500 ${
                   theme === 'night' ? 'opacity-100' : 'opacity-0'
                 }`}
@@ -349,6 +351,8 @@ export function HomePage({
                   src={nightHeroImg}
                   alt=""
                   aria-hidden="true"
+                  loading="lazy"
+                  decoding="async"
                   style={{ opacity: scrollBlend }}
                   className="absolute inset-0 w-full h-full object-cover pointer-events-none"
                 />
@@ -386,6 +390,8 @@ export function HomePage({
                 src={CLIENT_LOGO_IMG}
                 alt={t.brandFull}
                 referrerPolicy="no-referrer"
+                loading="lazy"
+                decoding="async"
                 className="w-12 h-12 rounded-xl bg-white p-1 object-contain border border-[#E5DEC9] dark:border-[#233C63]"
               />
               <h2 className="text-2xl sm:text-3xl font-extrabold">

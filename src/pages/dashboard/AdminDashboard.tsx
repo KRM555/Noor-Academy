@@ -50,6 +50,7 @@ import { queryKeys } from '../../lib/queryClient';
 import { isBrowserSupabaseConfigured } from '../../lib/supabase';
 import { PRESET_COURSE_COVERS, getCourseImageUrl } from '../../lib/courseImages';
 import { formatCoursePriceSummary, estimateSarFromEgp } from '../../lib/currency';
+import { compressImageFileToWebPDataUrl } from '../../lib/imageCompression';
 import { tField } from '../../i18n/translations';
 import {
   Card,
@@ -449,7 +450,7 @@ export function AdminDashboard({
     void qc.invalidateQueries({ queryKey: queryKeys.adminLaunchStatus });
   }, [qc]);
 
-  if (isLoading) return <LoadingState />;
+  if (isLoading) return <LoadingState variant="dashboard" />;
   if (!data) return null;
 
   const confirmDelete = async () => {
@@ -1341,7 +1342,11 @@ export function AdminDashboard({
         }
         setUploadingCourseCover(true);
         try {
-          const base64Data = await readFileAsDataUrl(file);
+          const base64Data = await compressImageFileToWebPDataUrl(file, {
+            maxWidth: 1280,
+            maxHeight: 800,
+            quality: 0.84,
+          });
           const res = await apiFetch<{ cover_url: string }>(`/api/admin/courses/${selectedCourse.id}/cover`, {
             method: 'POST',
             body: JSON.stringify({ base64Data }),
@@ -2105,7 +2110,7 @@ export function AdminDashboard({
                             }`}
                           >
                             <div className="aspect-[16/10] w-full overflow-hidden bg-[#FAF8F3]">
-                              <img src={preset.url} alt={preset.label_ar} className="w-full h-full object-cover" />
+                              <img src={preset.url} alt={preset.label_ar} loading="lazy" decoding="async" className="w-full h-full object-cover" />
                             </div>
                             <div className="px-2 py-1.5 text-[11px] font-bold flex items-center justify-between gap-1 truncate">
                               <span className="truncate">{lang === 'ar' ? preset.label_ar : preset.label_en}</span>
@@ -2297,7 +2302,11 @@ export function AdminDashboard({
           }),
         });
         if (newCourseCoverFile && res.id) {
-          const base64Data = await readFileAsDataUrl(newCourseCoverFile);
+          const base64Data = await compressImageFileToWebPDataUrl(newCourseCoverFile, {
+            maxWidth: 1280,
+            maxHeight: 800,
+            quality: 0.84,
+          });
           await apiFetch(`/api/admin/courses/${res.id}/cover`, {
             method: 'POST',
             body: JSON.stringify({ base64Data }),

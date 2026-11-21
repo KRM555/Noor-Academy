@@ -361,7 +361,7 @@ function RouterContent() {
     if (authLoading) {
       return (
         <div className="max-w-4xl mx-auto p-8">
-          <LoadingState />
+          <LoadingState variant="dashboard" />
         </div>
       );
     }
@@ -406,7 +406,7 @@ function RouterContent() {
         onSelectTab={(tabId) => navigate(`/dashboard/${tabId}`)}
         onNavigatePublic={navigate}
       >
-        <Suspense fallback={<LoadingState />}>
+        <Suspense fallback={<LoadingState variant="dashboard" />}>
           {user.role === 'student' && (
             <StudentDashboard activeTab={requestedTab} onLaunchGame={launchGame} />
           )}

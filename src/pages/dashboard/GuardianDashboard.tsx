@@ -101,7 +101,7 @@ export function GuardianDashboard({ activeTab }: { activeTab: string }) {
     }
   };
 
-  if (isLoading) return <LoadingState label={lang === 'ar' ? 'جاري تحميل متابعة الأبناء...' : 'Loading family progress...'} />;
+  if (isLoading) return <LoadingState variant="dashboard" label={lang === 'ar' ? 'جاري تحميل متابعة الأبناء...' : 'Loading family progress...'} />;
   if (!data) return <EmptyState title={lang === 'ar' ? 'لا توجد بيانات لولي الأمر بعد' : 'Guardian data unavailable'} />;
 
   const selectedChild = data.children.find((c) => c.id === selectedChildId) || data.children[0];

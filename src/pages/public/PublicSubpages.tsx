@@ -6,7 +6,7 @@ import { apiFetch } from '../../lib/api';
 import { queryKeys } from '../../lib/queryClient';
 import { dict, tField } from '../../i18n/translations';
 import type { Course, LegalDocument, PublicOverview, Teacher } from '../../types';
-import { Card, PrimaryButton, SecondaryButton, ResilientImage, LoadingState } from '../../components/ui/CommonUI';
+import { Card, PrimaryButton, SecondaryButton, ResilientImage, LoadingState, PaginationBar } from '../../components/ui/CommonUI';
 import { getCourseImageUrl } from '../../lib/courseImages';
 import { formatCoursePriceSummary, resolveCoursePrices, type DisplayCurrency } from '../../lib/currency';
 import {
@@ -28,6 +28,9 @@ export function CoursesPage({
 }) {
   const { lang, currency, setCurrency } = useApp();
   const t = dict[lang];
+  const [page, setPage] = useState(1);
+  const pageSize = 20;
+  const pagedCourses = courses.slice((page - 1) * pageSize, page * pageSize);
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-12 space-y-8">
@@ -83,8 +86,9 @@ export function CoursesPage({
           </p>
         </Card>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {courses.map((c) => (
+        <>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {pagedCourses.map((c) => (
             <Card key={c.id} className="overflow-hidden flex flex-col justify-between">
               <div>
                 <div className="aspect-[16/10] bg-[#F2EFE6] dark:bg-[#13284A]">
@@ -127,8 +131,10 @@ export function CoursesPage({
                 </div>
               </div>
             </Card>
-          ))}
-        </div>
+            ))}
+          </div>
+          <PaginationBar page={page} totalItems={courses.length} pageSize={pageSize} onPageChange={setPage} />
+        </>
       )}
     </div>
   );
@@ -155,7 +161,7 @@ export function CourseDetailPage({
     retry: 1,
   });
 
-  if (isLoading) return <div className="max-w-5xl mx-auto px-4 py-12"><LoadingState /></div>;
+  if (isLoading) return <div className="max-w-5xl mx-auto px-4 py-12"><LoadingState variant="detail" /></div>;
   if (isError || !data) {
     return (
       <div className="max-w-xl mx-auto px-4 py-16">
@@ -278,6 +284,9 @@ export function TeachersPage({
   onSelectTeacher: (id: number) => void;
 }) {
   const { lang } = useApp();
+  const [page, setPage] = useState(1);
+  const pageSize = 20;
+  const pagedTeachers = teachers.slice((page - 1) * pageSize, page * pageSize);
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-12 space-y-8">
       <div className="space-y-2 max-w-2xl">
@@ -293,8 +302,9 @@ export function TeachersPage({
           </p>
         </Card>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          {teachers.map((t) => (
+        <>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {pagedTeachers.map((t) => (
             <Card key={t.id} className="overflow-hidden flex flex-col">
               <div className="aspect-[4/3] bg-[#F2EFE6] dark:bg-[#13284A]">
                 <ResilientImage
@@ -321,8 +331,10 @@ export function TeachersPage({
                 </SecondaryButton>
               </div>
             </Card>
-          ))}
-        </div>
+            ))}
+          </div>
+          <PaginationBar page={page} totalItems={teachers.length} pageSize={pageSize} onPageChange={setPage} />
+        </>
       )}
     </div>
   );
@@ -345,7 +357,7 @@ export function TeacherDetailPage({
     retry: 1,
   });
 
-  if (isLoading) return <div className="max-w-5xl mx-auto px-4 py-12"><LoadingState /></div>;
+  if (isLoading) return <div className="max-w-5xl mx-auto px-4 py-12"><LoadingState variant="detail" /></div>;
   if (isError || !data) {
     return (
       <div className="max-w-xl mx-auto px-4 py-16">

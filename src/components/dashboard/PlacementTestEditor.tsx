@@ -48,7 +48,7 @@ export function PlacementTestEditor() {
   }, [data]);
 
   if (isLoading) {
-    return <LoadingState label={lang === 'ar' ? 'جاري تحميل إعدادات اختبار تحديد المستوى...' : 'Loading placement test editor...'} />;
+    return <LoadingState variant="table" label={lang === 'ar' ? 'جاري تحميل إعدادات اختبار تحديد المستوى...' : 'Loading placement test editor...'} />;
   }
 
   const addQuestion = () => {

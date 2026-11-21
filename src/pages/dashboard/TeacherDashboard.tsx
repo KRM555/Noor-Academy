@@ -103,7 +103,7 @@ export function TeacherDashboard({ activeTab }: { activeTab: string }) {
     void qc.invalidateQueries({ queryKey: queryKeys.teacherDashboard(user?.id) });
   }, [qc, user?.id]);
 
-  if (isLoading) return <LoadingState />;
+  if (isLoading) return <LoadingState variant="dashboard" />;
   if (!data) return <EmptyState title={lang === 'ar' ? 'لا يوجد ملف معلم' : 'Teacher profile not found'} />;
 
   if (activeTab === 'home') {

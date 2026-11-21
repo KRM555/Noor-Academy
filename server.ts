@@ -1069,8 +1069,12 @@ app.get('/api/health', asyncHandler(async (req, res) => {
 // PUBLIC ROUTES (No Auth Required)
 // ============================================================================
 let overviewCache: { payload: unknown; expiresAt: number } | null = null;
+const courseDetailCache = new Map<number, { payload: unknown; expiresAt: number }>();
+const teacherDetailCache = new Map<number, { payload: unknown; expiresAt: number }>();
 function invalidateOverviewCache(): void {
   overviewCache = null;
+  courseDetailCache.clear();
+  teacherDetailCache.clear();
 }
 
 app.get('/api/public/overview', asyncHandler(async (_req, res) => {
@@ -1200,14 +1204,31 @@ app.get('/api/public/course-covers/:id', asyncHandler(async (req, res) => {
 }));
 
 app.get('/api/public/courses/:id', asyncHandler(async (req, res) => {
-  const sb = requireSupabaseAdmin();
   const courseId = parsePositiveIntParam(req.params.id, 'course id');
-  const { data: c } = await sb
-    .from('courses')
-    .select('*, levels(name_ar, name_en, age_range), teachers(id, name_ar, name_en, qualifications_ar, qualifications_en, avatar_url, is_public, deleted_at)')
-    .eq('id', courseId)
-    .is('deleted_at', null)
-    .maybeSingle();
+  const cached = courseDetailCache.get(courseId);
+  if (cached && Date.now() < cached.expiresAt) {
+    res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
+    res.json(cached.payload);
+    return;
+  }
+
+  const sb = requireSupabaseAdmin();
+  const [{ data: c }, courseMeta, { data: lessons }, lessonMetasMap] = await Promise.all([
+    sb
+      .from('courses')
+      .select('*, levels(name_ar, name_en, age_range), teachers(id, name_ar, name_en, qualifications_ar, qualifications_en, avatar_url, is_public, deleted_at)')
+      .eq('id', courseId)
+      .is('deleted_at', null)
+      .maybeSingle(),
+    getCourseMeta(sb, courseId),
+    sb
+      .from('lessons')
+      .select('id, title_ar, title_en, lesson_date, start_time, duration_min, objectives_ar, objectives_en')
+      .eq('course_id', courseId)
+      .is('deleted_at', null)
+      .order('lesson_date', { ascending: true }),
+    listLessonMetas(sb),
+  ]);
 
   if (!c) {
     res.status(404).json({ error: 'Course not found' });
@@ -1228,7 +1249,6 @@ app.get('/api/public/courses/:id', asyncHandler(async (req, res) => {
   const showPrimaryTeacher = Boolean(tch && tch.is_public !== false && !tch.deleted_at);
   const { levels: _l, teachers: _t, ...rest } = c as Record<string, unknown>;
 
-  const courseMeta = await getCourseMeta(sb, courseId);
   const coIds = (courseMeta?.co_teacher_ids || []).filter((id) => id !== Number(tch?.id ?? rest.teacher_id));
   const coTeachers = coIds.length
     ? ((await sb.from('teachers').select('id, name_ar, name_en').in('id', coIds).eq('is_public', true).is('deleted_at', null)).data || [])
@@ -1252,16 +1272,6 @@ app.get('/api/public/courses/:id', asyncHandler(async (req, res) => {
     co_teacher_names_en: coTeachers.map((t: { name_en: string }) => t.name_en),
   };
 
-  const [{ data: lessons }, lessonMetasMap] = await Promise.all([
-    sb
-      .from('lessons')
-      .select('id, title_ar, title_en, lesson_date, start_time, duration_min, objectives_ar, objectives_en')
-      .eq('course_id', courseId)
-      .is('deleted_at', null)
-      .order('lesson_date', { ascending: true }),
-    listLessonMetas(sb),
-  ]);
-
   const publishedLessons = (lessons || [])
     .map((l: Record<string, unknown>) => {
       const lm = lessonMetasMap.get(Number(l.id));
@@ -1273,13 +1283,22 @@ app.get('/api/public/courses/:id', asyncHandler(async (req, res) => {
     })
     .filter((l) => l.is_published);
 
-  res.json({ course, lessons: publishedLessons });
+  const payload = { course, lessons: publishedLessons };
+  courseDetailCache.set(courseId, { payload, expiresAt: Date.now() + 60_000 });
+  res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
+  res.json(payload);
 }));
 
 app.get('/api/public/teachers/:id', asyncHandler(async (req, res) => {
-  const sb = requireSupabaseAdmin();
   const teacherId = parsePositiveIntParam(req.params.id, 'teacher id');
+  const cached = teacherDetailCache.get(teacherId);
+  if (cached && Date.now() < cached.expiresAt) {
+    res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
+    res.json(cached.payload);
+    return;
+  }
 
+  const sb = requireSupabaseAdmin();
   const [{ data: teacher }, { data: courses }] = await Promise.all([
     sb
       .from('teachers')
@@ -1300,7 +1319,10 @@ app.get('/api/public/teachers/:id', asyncHandler(async (req, res) => {
     return;
   }
 
-  res.json({ teacher, courses: courses || [] });
+  const payload = { teacher, courses: courses || [] };
+  teacherDetailCache.set(teacherId, { payload, expiresAt: Date.now() + 60_000 });
+  res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
+  res.json(payload);
 }));
 
 app.get('/api/public/certificates/verify/:code', verifyLimiter, asyncHandler(async (req, res) => {
@@ -3088,38 +3110,42 @@ app.get('/api/guardian/dashboard', authenticate, requireRole('guardian'), asyncH
     })
   );
 
-  const guardianExams: Array<Record<string, unknown>> = [];
-  await Promise.all(
-    childCoursePairs.map(async ({ student_id, course_id }) => {
-      const matching = guardianExamsRaw.filter((ex: Record<string, unknown>) => Number(ex.course_id) === course_id);
-      for (const ex of matching) {
-        const eid = Number(ex.id);
-        const c = ex.courses as { title_ar?: string; title_en?: string } | null;
-        const cfg = guardianExamConfigs.get(eid)!;
-        const sub = await getExamSubmission(sb, eid, student_id);
-        const resRow = guardianExamResultMap.get(`${eid}:${student_id}`) || null;
-        guardianExams.push({
-          id: eid,
-          student_id,
-          course_id,
-          title_ar: ex.title_ar,
-          title_en: ex.title_en,
-          exam_date: ex.exam_date,
-          max_score: ex.max_score,
-          course_title_ar: c?.title_ar ?? null,
-          course_title_en: c?.title_en ?? null,
-          ...sanitizeExamConfigForViewer(cfg, { isPrivileged: false, canRevealAnswers: false }),
-          submission: sanitizeSubmissionForViewer(sub),
-          result: resRow
-            ? {
-                score: resRow.score,
-                feedback_ar: resRow.feedback_ar,
-                feedback_en: resRow.feedback_en,
-                graded_at: resRow.graded_at,
-              }
-            : null,
-        });
-      }
+  const examSubPairs: Array<{ student_id: number; course_id: number; ex: Record<string, unknown> }> = [];
+  for (const { student_id, course_id } of childCoursePairs) {
+    const matching = guardianExamsRaw.filter((ex: Record<string, unknown>) => Number(ex.course_id) === course_id);
+    for (const ex of matching) {
+      examSubPairs.push({ student_id, course_id, ex });
+    }
+  }
+
+  const guardianExams = await Promise.all(
+    examSubPairs.map(async ({ student_id, course_id, ex }) => {
+      const eid = Number(ex.id);
+      const c = ex.courses as { title_ar?: string; title_en?: string } | null;
+      const cfg = guardianExamConfigs.get(eid)!;
+      const sub = await getExamSubmission(sb, eid, student_id);
+      const resRow = guardianExamResultMap.get(`${eid}:${student_id}`) || null;
+      return {
+        id: eid,
+        student_id,
+        course_id,
+        title_ar: ex.title_ar,
+        title_en: ex.title_en,
+        exam_date: ex.exam_date,
+        max_score: ex.max_score,
+        course_title_ar: c?.title_ar ?? null,
+        course_title_en: c?.title_en ?? null,
+        ...sanitizeExamConfigForViewer(cfg, { isPrivileged: false, canRevealAnswers: false }),
+        submission: sanitizeSubmissionForViewer(sub),
+        result: resRow
+          ? {
+              score: resRow.score,
+              feedback_ar: resRow.feedback_ar,
+              feedback_en: resRow.feedback_en,
+              graded_at: resRow.graded_at,
+            }
+          : null,
+      };
     })
   );
 
@@ -7177,6 +7203,27 @@ app.delete('/api/admin/payroll/:id', authenticate, requireRole('admin'), asyncHa
     status: row.status,
   });
   res.json({ ok: true });
+}));
+
+app.get('/api/admin/audit-logs', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const sb = requireSupabaseAdmin();
+  const page = Math.max(1, Number(req.query.page || 1) || 1);
+  const limit = Math.min(50, Math.max(1, Number(req.query.limit || 20) || 20));
+  const from = (page - 1) * limit;
+  const to = from + limit - 1;
+  const { data, count } = await sb
+    .from('audit_logs')
+    .select('*', { count: 'exact' })
+    .order('id', { ascending: false })
+    .range(from, to);
+  const total = count || 0;
+  res.json({
+    items: data || [],
+    page,
+    limit,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / limit)),
+  });
 }));
 
 app.delete('/api/admin/audit-logs/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {

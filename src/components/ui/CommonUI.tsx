@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { X, AlertTriangle, Inbox } from 'lucide-react';
+import React, { useState, useEffect, useMemo } from 'react';
+import { X, AlertTriangle, Inbox, ChevronLeft, ChevronRight } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { dict } from '../../i18n/translations';
 
@@ -27,6 +27,7 @@ export function AcademyLogo({ className = 'w-9 h-9' }: { className?: string }) {
       src="/assets/images/academy_logo.webp"
       alt="شعار أكاديمية نور وبيان"
       referrerPolicy="no-referrer"
+      decoding="async"
       onError={() => setImgErr(true)}
       className={`rounded-xl bg-white p-0.5 object-contain border border-[#E5DEC9] dark:border-[#233C63] ${className}`}
     />
@@ -38,11 +39,13 @@ export function ResilientImage({
   alt,
   className = '',
   fallbackTitle,
+  priority = false,
 }: {
   src: string;
   alt: string;
   className?: string;
   fallbackTitle?: string;
+  priority?: boolean;
 }) {
   const [failed, setFailed] = useState(false);
   useEffect(() => {
@@ -65,6 +68,9 @@ export function ResilientImage({
       src={src}
       alt={alt}
       referrerPolicy="no-referrer"
+      loading={priority ? 'eager' : 'lazy'}
+      decoding="async"
+      fetchPriority={priority ? 'high' : undefined}
       onError={() => setFailed(true)}
       className={className}
     />
@@ -137,18 +143,264 @@ export function SecondaryButton({
   );
 }
 
-export function LoadingState({ label }: { label?: string }) {
-  const { lang } = useApp();
+function SkeletonBlock({ className = '' }: { className?: string }) {
   return (
-    <div className="space-y-4 py-6" aria-busy="true">
-      <div className="text-sm text-slate-500 dark:text-slate-400">{label || dict[lang].loading}</div>
+    <div
+      aria-hidden="true"
+      className={`motion-safe:animate-pulse rounded-lg bg-[#E9E2CE] dark:bg-[#1B345B] ${className}`}
+    />
+  );
+}
+
+export function LoadingState({
+  label,
+  variant = 'cards',
+}: {
+  label?: string;
+  variant?: 'cards' | 'dashboard' | 'table' | 'catalog' | 'detail';
+}) {
+  const { lang } = useApp();
+  const srText = label || dict[lang].loading;
+
+  if (variant === 'table') {
+    return (
+      <div className="space-y-3 py-4" aria-busy="true" aria-label={srText}>
+        <div className="rounded-2xl border border-[#E5DEC9] dark:border-[#233C63] bg-white dark:bg-[#0F213E] overflow-hidden">
+          <div className="px-4 py-3 bg-[#FAF8F3] dark:bg-[#13284A] border-b border-[#E5DEC9] dark:border-[#233C63] grid grid-cols-4 gap-4">
+            {[1, 2, 3, 4].map((c) => (
+              <SkeletonBlock key={c} className="h-3.5 w-3/4" />
+            ))}
+          </div>
+          <div className="divide-y divide-[#EFEAD8] dark:divide-[#1D355B]">
+            {[1, 2, 3, 4, 5, 6].map((r) => (
+              <div key={r} className="px-4 py-3.5 grid grid-cols-4 gap-4 items-center">
+                <SkeletonBlock className="h-4 w-5/6" />
+                <SkeletonBlock className="h-4 w-2/3" />
+                <SkeletonBlock className="h-4 w-1/2" />
+                <SkeletonBlock className="h-4 w-16 ms-auto" />
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (variant === 'detail') {
+    return (
+      <div className="space-y-6 py-4" aria-busy="true" aria-label={srText}>
+        <SkeletonBlock className="h-4 w-28" />
+        <div className="rounded-2xl border border-[#E5DEC9] dark:border-[#233C63] bg-white dark:bg-[#0F213E] overflow-hidden grid grid-cols-1 md:grid-cols-12">
+          <div className="md:col-span-5 aspect-[16/10] md:aspect-auto md:min-h-[260px] bg-[#F2EFE6] dark:bg-[#13284A] motion-safe:animate-pulse" />
+          <div className="md:col-span-7 p-6 sm:p-8 space-y-4">
+            <SkeletonBlock className="h-3 w-36" />
+            <SkeletonBlock className="h-7 w-3/4" />
+            <div className="space-y-2">
+              <SkeletonBlock className="h-4 w-full" />
+              <SkeletonBlock className="h-4 w-5/6" />
+            </div>
+            <div className="grid grid-cols-3 gap-4 pt-4 border-t border-[#EFEAD8] dark:border-[#1D355B]">
+              <SkeletonBlock className="h-10 w-full" />
+              <SkeletonBlock className="h-10 w-full" />
+              <SkeletonBlock className="h-10 w-full" />
+            </div>
+            <SkeletonBlock className="h-10 w-44 rounded-xl" />
+          </div>
+        </div>
+        <div className="space-y-3">
+          {[1, 2, 3].map((row) => (
+            <div
+              key={row}
+              className="rounded-2xl border border-[#E5DEC9] dark:border-[#233C63] bg-white dark:bg-[#0F213E] p-4 flex items-center justify-between gap-4"
+            >
+              <div className="space-y-2 flex-1">
+                <SkeletonBlock className="h-4 w-48" />
+                <SkeletonBlock className="h-3 w-72 max-w-full" />
+              </div>
+              <SkeletonBlock className="h-4 w-24 shrink-0" />
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  if (variant === 'catalog') {
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 py-4" aria-busy="true" aria-label={srText}>
+        {[1, 2, 3, 4, 5, 6].map((i) => (
+          <div
+            key={i}
+            className="rounded-2xl border border-[#E5DEC9] dark:border-[#233C63] bg-white dark:bg-[#0F213E] overflow-hidden flex flex-col justify-between"
+          >
+            <div>
+              <div className="aspect-[16/10] bg-[#F2EFE6] dark:bg-[#13284A] motion-safe:animate-pulse" />
+              <div className="p-6 space-y-3">
+                <SkeletonBlock className="h-3 w-32" />
+                <SkeletonBlock className="h-5 w-4/5" />
+                <div className="space-y-2">
+                  <SkeletonBlock className="h-3.5 w-full" />
+                  <SkeletonBlock className="h-3.5 w-5/6" />
+                </div>
+              </div>
+            </div>
+            <div className="p-6 pt-4 border-t border-[#EFEAD8] dark:border-[#1D355B] flex gap-2">
+              <SkeletonBlock className="h-9 flex-1 rounded-xl" />
+              <SkeletonBlock className="h-9 flex-1 rounded-xl" />
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  if (variant === 'dashboard') {
+    return (
+      <div className="space-y-6 py-4" aria-busy="true" aria-label={srText}>
+        <div className="flex items-center justify-between gap-4">
+          <div className="space-y-2">
+            <SkeletonBlock className="h-6 w-52" />
+            <SkeletonBlock className="h-3.5 w-72 max-w-full" />
+          </div>
+          <SkeletonBlock className="h-10 w-32 rounded-xl" />
+        </div>
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          {[1, 2, 3, 4].map((k) => (
+            <div
+              key={k}
+              className="rounded-2xl border border-[#E5DEC9] dark:border-[#233C63] bg-white dark:bg-[#0F213E] p-5 space-y-2.5"
+            >
+              <SkeletonBlock className="h-3 w-24" />
+              <SkeletonBlock className="h-7 w-16" />
+            </div>
+          ))}
+        </div>
+        <div className="rounded-2xl border border-[#E5DEC9] dark:border-[#233C63] bg-white dark:bg-[#0F213E] overflow-hidden">
+          <div className="px-4 py-3 bg-[#FAF8F3] dark:bg-[#13284A] border-b border-[#E5DEC9] dark:border-[#233C63] grid grid-cols-4 gap-4">
+            {[1, 2, 3, 4].map((c) => (
+              <SkeletonBlock key={c} className="h-3.5 w-2/3" />
+            ))}
+          </div>
+          <div className="divide-y divide-[#EFEAD8] dark:divide-[#1D355B]">
+            {[1, 2, 3, 4, 5].map((r) => (
+              <div key={r} className="px-4 py-3.5 grid grid-cols-4 gap-4 items-center">
+                <SkeletonBlock className="h-4 w-4/5" />
+                <SkeletonBlock className="h-4 w-3/5" />
+                <SkeletonBlock className="h-4 w-1/2" />
+                <SkeletonBlock className="h-4 w-16 ms-auto" />
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4 py-6" aria-busy="true" aria-label={srText}>
+      {label && <div className="text-sm font-medium text-slate-500 dark:text-slate-400">{label}</div>}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         {[1, 2, 3].map((i) => (
           <div
             key={i}
-            className="h-28 rounded-2xl bg-[#F2EFE6] dark:bg-[#162C4E] border border-[#E5DEC9] dark:border-[#233C63] opacity-70"
-          />
+            className="rounded-2xl bg-white dark:bg-[#0F213E] border border-[#E5DEC9] dark:border-[#233C63] p-5 space-y-3"
+          >
+            <SkeletonBlock className="h-3 w-24" />
+            <SkeletonBlock className="h-5 w-4/5" />
+            <SkeletonBlock className="h-3.5 w-full" />
+            <SkeletonBlock className="h-3.5 w-2/3" />
+          </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+export function PaginationBar({
+  page,
+  totalItems,
+  pageSize = 20,
+  onPageChange,
+}: {
+  page: number;
+  totalItems: number;
+  pageSize?: number;
+  onPageChange: (nextPage: number) => void;
+}) {
+  const { lang } = useApp();
+  const safeSize = Math.max(1, pageSize);
+  const totalPages = Math.max(1, Math.ceil(totalItems / safeSize));
+
+  if (totalItems <= safeSize) return null;
+
+  const currentPage = Math.min(Math.max(1, page), totalPages);
+  const startIdx = (currentPage - 1) * safeSize + 1;
+  const endIdx = Math.min(totalItems, currentPage * safeSize);
+
+  const pageNumbers: Array<number | 'ellipsis-start' | 'ellipsis-end'> = [];
+  if (totalPages <= 7) {
+    for (let i = 1; i <= totalPages; i++) pageNumbers.push(i);
+  } else {
+    pageNumbers.push(1);
+    if (currentPage > 3) pageNumbers.push('ellipsis-start');
+    const winStart = Math.max(2, currentPage - 1);
+    const winEnd = Math.min(totalPages - 1, currentPage + 1);
+    for (let i = winStart; i <= winEnd; i++) pageNumbers.push(i);
+    if (currentPage < totalPages - 2) pageNumbers.push('ellipsis-end');
+    pageNumbers.push(totalPages);
+  }
+
+  return (
+    <div className="mt-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-1">
+      <div className="text-xs text-slate-600 dark:text-slate-300 tabular-nums">
+        {lang === 'ar'
+          ? `عرض ${startIdx}–${endIdx} من أصل ${totalItems} عنصر (صفحة ${currentPage} من ${totalPages})`
+          : `Showing ${startIdx}–${endIdx} of ${totalItems} (Page ${currentPage} of ${totalPages})`}
+      </div>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <button
+          type="button"
+          onClick={() => onPageChange(currentPage - 1)}
+          disabled={currentPage <= 1}
+          aria-label={lang === 'ar' ? 'الصفحة السابقة' : 'Previous page'}
+          className="inline-flex items-center gap-1 rounded-xl px-3 py-1.5 text-xs font-semibold whitespace-nowrap shrink-0 border border-[#E5DEC9] dark:border-[#233C63] bg-white dark:bg-[#0F213E] text-[#0F213E] dark:text-[#F8F5EC] hover:bg-[#FAF8F3] dark:hover:bg-[#162C4E] disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
+        >
+          {lang === 'ar' ? <ChevronRight className="w-3.5 h-3.5" /> : <ChevronLeft className="w-3.5 h-3.5" />}
+          <span>{lang === 'ar' ? 'السابق' : 'Prev'}</span>
+        </button>
+
+        {pageNumbers.map((item) =>
+          typeof item === 'string' ? (
+            <span key={item} className="px-1.5 text-xs text-slate-400 select-none">
+              …
+            </span>
+          ) : (
+            <button
+              key={item}
+              type="button"
+              onClick={() => onPageChange(item)}
+              aria-current={item === currentPage ? 'page' : undefined}
+              className={`min-w-8 h-8 rounded-xl px-2.5 text-xs font-bold tabular-nums whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                item === currentPage
+                  ? 'bg-[#0F213E] text-white dark:bg-[#C98A1E]'
+                  : 'border border-[#E5DEC9] dark:border-[#233C63] bg-white dark:bg-[#0F213E] text-[#0F213E] dark:text-[#F8F5EC] hover:bg-[#FAF8F3] dark:hover:bg-[#162C4E]'
+              }`}
+            >
+              {item}
+            </button>
+          )
+        )}
+
+        <button
+          type="button"
+          onClick={() => onPageChange(currentPage + 1)}
+          disabled={currentPage >= totalPages}
+          aria-label={lang === 'ar' ? 'الصفحة التالية' : 'Next page'}
+          className="inline-flex items-center gap-1 rounded-xl px-3 py-1.5 text-xs font-semibold whitespace-nowrap shrink-0 border border-[#E5DEC9] dark:border-[#233C63] bg-white dark:bg-[#0F213E] text-[#0F213E] dark:text-[#F8F5EC] hover:bg-[#FAF8F3] dark:hover:bg-[#162C4E] disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
+        >
+          <span>{lang === 'ar' ? 'التالي' : 'Next'}</span>
+          {lang === 'ar' ? <ChevronLeft className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+        </button>
       </div>
     </div>
   );
@@ -185,12 +437,29 @@ export function ResponsiveTable<T extends { id?: string | number }>({
   columns,
   emptyTitle,
   emptyDescription,
+  pageSize = 20,
 }: {
   data: T[];
   columns: TableColumn<T>[];
   emptyTitle: string;
   emptyDescription?: string;
+  pageSize?: number;
 }) {
+  const [page, setPage] = useState(1);
+  const safeSize = Math.max(1, pageSize);
+  const totalPages = Math.max(1, Math.ceil(data.length / safeSize));
+
+  useEffect(() => {
+    setPage((prev) => (prev > totalPages ? 1 : prev));
+  }, [totalPages]);
+
+  const currentPage = Math.min(page, totalPages);
+  const pagedData = useMemo(() => {
+    if (data.length <= safeSize) return data;
+    const start = (currentPage - 1) * safeSize;
+    return data.slice(start, start + safeSize);
+  }, [data, currentPage, safeSize]);
+
   if (!data.length) {
     return <EmptyState title={emptyTitle} description={emptyDescription} />;
   }
@@ -215,7 +484,7 @@ export function ResponsiveTable<T extends { id?: string | number }>({
             </tr>
           </thead>
           <tbody className="divide-y divide-[#EFEAD8] dark:divide-[#1D355B]">
-            {data.map((row, idx) => (
+            {pagedData.map((row, idx) => (
               <tr key={row.id ?? idx} className="hover:bg-[#FAF8F3]/70 dark:hover:bg-[#162C4E]/60 transition-colors">
                 {columns.map((col) => (
                   <td
@@ -235,7 +504,7 @@ export function ResponsiveTable<T extends { id?: string | number }>({
 
       {/* Mobile Card List */}
       <div className="md:hidden space-y-3">
-        {data.map((row, idx) => (
+        {pagedData.map((row, idx) => (
           <Card key={row.id ?? idx} className="p-4 space-y-2.5">
             {columns.map((col) => (
               <div key={col.key} className="flex items-start justify-between gap-4 text-sm">
@@ -248,6 +517,13 @@ export function ResponsiveTable<T extends { id?: string | number }>({
           </Card>
         ))}
       </div>
+
+      <PaginationBar
+        page={currentPage}
+        totalItems={data.length}
+        pageSize={safeSize}
+        onPageChange={setPage}
+      />
     </div>
   );
 }
