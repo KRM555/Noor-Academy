@@ -88,6 +88,13 @@ export function LoginPage({
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [resetSaving, setResetSaving] = useState(false);
   const [resetDoneMessage, setResetDoneMessage] = useState<string | null>(null);
+  const [emailConfirmedNotice, setEmailConfirmedNotice] = useState(false);
+  const [emailNotConfirmedFor, setEmailNotConfirmedFor] = useState<string | null>(null);
+  const [resendLoading, setResendLoading] = useState(false);
+  const [resendFeedback, setResendFeedback] = useState<string | null>(null);
+  const [resendCooldownSec, setResendCooldownSec] = useState(0);
+  const [resendTurnstileToken, setResendTurnstileToken] = useState<string | null>(null);
+  const [resendTurnstileReset, setResendTurnstileReset] = useState(0);
   const [turnstileSiteKey, setTurnstileSiteKey] = useState<string | null>(null);
   const [loginTurnstileToken, setLoginTurnstileToken] = useState<string | null>(null);
   const [loginTurnstileReset, setLoginTurnstileReset] = useState(0);
@@ -120,6 +127,14 @@ export function LoginPage({
         const hashType = hashParams.get('type');
         const queryMode = searchParams.get('mode');
         const pkceCode = searchParams.get('code');
+
+        if (searchParams.get('confirmed') === '1') {
+          if (active) setEmailConfirmedNotice(true);
+          if (window.location.hash || pkceCode || searchParams.get('type') === 'signup') {
+            window.history.replaceState({}, '', '/login?confirmed=1');
+          }
+          return;
+        }
 
         if (hashToken && (hashType === 'recovery' || queryMode === 'reset-password')) {
           if (active) setRecoveryToken(hashToken);
@@ -156,6 +171,14 @@ export function LoginPage({
     };
   }, []);
 
+  useEffect(() => {
+    if (resendCooldownSec <= 0) return;
+    const timer = window.setInterval(() => {
+      setResendCooldownSec((prev) => (prev <= 1 ? 0 : prev - 1));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [resendCooldownSec]);
+
   const formatAuthError = (err: unknown): string => {
     const raw = err instanceof Error ? err.message : 'Login failed';
     const lower = raw.toLowerCase();
@@ -174,6 +197,16 @@ export function LoginPage({
       return lang === 'ar'
         ? 'طلبك ما زال قيد المراجعة من إدارة الأكاديمية. ستتمكن من الدخول فور الموافقة وتفعيل الحساب.'
         : raw;
+    }
+    if ((err instanceof ApiError && err.code === 'EMAIL_NOT_CONFIRMED') || raw.includes('EMAIL_NOT_CONFIRMED')) {
+      const targetEmail = email.trim().toLowerCase();
+      if (targetEmail) {
+        setEmailNotConfirmedFor(targetEmail);
+      }
+      setResendFeedback(null);
+      return lang === 'ar'
+        ? 'يرجى تأكيد بريدك الإلكتروني عبر رابط التفعيل المرسل إليك قبل تسجيل الدخول.'
+        : 'Please confirm your email address using the verification link sent to your inbox before signing in.';
     }
     if (raw.includes('PORTAL_ROLE_MISMATCH')) {
       return lang === 'ar'
@@ -206,6 +239,8 @@ export function LoginPage({
     }
     setLoading(true);
     setPendingNotice(false);
+    setEmailNotConfirmedFor(null);
+    setResendFeedback(null);
     try {
       await loginWithCredentials(email, password, selectedPortal, loginTurnstileToken);
       toast(lang === 'ar' ? 'تم تسجيل الدخول بنجاح' : 'Signed in successfully', 'success');
@@ -215,6 +250,41 @@ export function LoginPage({
       toast(formatAuthError(err), 'error');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleResendConfirmation = async () => {
+    const targetEmail = (emailNotConfirmedFor || email).trim().toLowerCase();
+    if (!targetEmail) {
+      toast(lang === 'ar' ? 'أدخل بريدك الإلكتروني أولاً' : 'Please enter your email address first', 'error');
+      return;
+    }
+    if (turnstileSiteKey && !resendTurnstileToken) {
+      toast(lang === 'ar' ? 'يرجى إتمام التحقق الأمني قبل إعادة الإرسال' : 'Please complete the security check before resending', 'error');
+      return;
+    }
+    setResendLoading(true);
+    setResendFeedback(null);
+    try {
+      await apiFetch<{ ok: boolean; message: string }>('/api/auth/resend-confirmation', {
+        method: 'POST',
+        body: JSON.stringify({
+          email: targetEmail,
+          ...(resendTurnstileToken ? { turnstileToken: resendTurnstileToken } : {}),
+        }),
+      });
+      setResendCooldownSec(60);
+      setResendFeedback(
+        lang === 'ar'
+          ? 'تم إرسال طلب رابط التفعيل إلى بريدك الإلكتروني. تفقد البريد الوارد أو الرسائل غير المرغوب فيها.'
+          : 'A verification link request has been sent. Please check your inbox or spam folder.'
+      );
+      toast(lang === 'ar' ? 'تم إرسال رابط التفعيل بنجاح' : 'Confirmation email request sent', 'success');
+    } catch (err: unknown) {
+      setResendTurnstileReset((n) => n + 1);
+      toast(formatAuthError(err), 'error');
+    } finally {
+      setResendLoading(false);
     }
   };
 
@@ -569,6 +639,8 @@ export function LoginPage({
                     setSelectedPortal(opt.id);
                     setUnregisteredGoogle(null);
                     setPendingNotice(false);
+                    setEmailNotConfirmedFor(null);
+                    setResendFeedback(null);
                     setGuardianPendingInfo(null);
                   }}
                   className={`p-3 rounded-xl border text-start transition-colors cursor-pointer space-y-1.5 ${
@@ -628,6 +700,17 @@ export function LoginPage({
           </div>
         )}
 
+        {emailConfirmedNotice && (
+          <div className="p-3.5 rounded-xl border border-[#0F766E]/40 bg-[#0F766E]/10 text-xs text-[#0F766E] dark:text-[#2DD4BF] flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 shrink-0" />
+            <span>
+              {lang === 'ar'
+                ? 'تم تأكيد بريدك الإلكتروني بنجاح! يمكنك الآن تسجيل الدخول إلى حسابك.'
+                : 'Your email address has been confirmed! You can now sign in to your account.'}
+            </span>
+          </div>
+        )}
+
         {resetDoneMessage && (
           <div className="p-3.5 rounded-xl border border-[#0F766E]/40 bg-[#0F766E]/10 text-xs text-[#0F766E] dark:text-[#2DD4BF] flex items-center gap-2">
             <CheckCircle2 className="w-4 h-4 shrink-0" />
@@ -640,6 +723,56 @@ export function LoginPage({
             {lang === 'ar'
               ? 'حسابك مسجّل وطلبك قيد المراجعة الآن من إدارة الأكاديمية. بمجرد الموافقة ستتمكن من الدخول مباشرة بنفس البريد وكلمة المرور.'
               : 'Your application is pending director approval. Once approved, you can sign in immediately with these credentials.'}
+          </div>
+        )}
+
+        {emailNotConfirmedFor && (
+          <div className="p-4 rounded-xl border border-[#C98A1E]/50 bg-[#C98A1E]/10 text-xs text-[#0F213E] dark:text-[#F8F5EC] space-y-3 leading-relaxed">
+            <div className="flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 text-[#C98A1E] shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <div className="font-extrabold">
+                  {lang === 'ar'
+                    ? 'يلزم تأكيد البريد الإلكتروني أولاً'
+                    : 'Email Confirmation Required'}
+                </div>
+                <p>
+                  {lang === 'ar'
+                    ? `لم يتم تأكيد البريد (${emailNotConfirmedFor}) بعد. يرجى فتح رابط التفعيل المرسل إلى بريدك الإلكتروني قبل تسجيل الدخول.`
+                    : `Your email (${emailNotConfirmedFor}) has not been confirmed yet. Please open the verification link sent to your inbox before signing in.`}
+                </p>
+              </div>
+            </div>
+            <TurnstileWidget
+              siteKey={turnstileSiteKey}
+              onToken={setResendTurnstileToken}
+              resetKey={resendTurnstileReset}
+            />
+            <div className="flex flex-wrap items-center gap-2">
+              <SecondaryButton
+                type="button"
+                disabled={resendLoading || resendCooldownSec > 0}
+                onClick={() => void handleResendConfirmation()}
+                className="text-xs"
+              >
+                <span>
+                  {resendLoading
+                    ? lang === 'ar'
+                      ? 'جاري الإرسال...'
+                      : 'Sending...'
+                    : resendCooldownSec > 0
+                    ? lang === 'ar'
+                      ? `أعد الإرسال بعد ${resendCooldownSec} ث`
+                      : `Resend in ${resendCooldownSec}s`
+                    : lang === 'ar'
+                    ? 'إعادة إرسال رابط التفعيل'
+                    : 'Resend confirmation email'}
+                </span>
+              </SecondaryButton>
+            </div>
+            {resendFeedback && (
+              <p className="text-xs text-[#0F766E] dark:text-[#2DD4BF] font-medium">{resendFeedback}</p>
+            )}
           </div>
         )}
 
@@ -1067,6 +1200,8 @@ export function LoginPage({
                 setSelectedPortal('admin');
                 setUnregisteredGoogle(null);
                 setPendingNotice(false);
+                setEmailNotConfirmedFor(null);
+                setResendFeedback(null);
               }}
               className="text-xs font-semibold text-slate-500 hover:text-[#0F213E] dark:hover:text-[#F8F5EC] hover:underline cursor-pointer"
             >
@@ -1078,6 +1213,8 @@ export function LoginPage({
               onClick={() => {
                 setSelectedPortal('student');
                 setPendingNotice(false);
+                setEmailNotConfirmedFor(null);
+                setResendFeedback(null);
               }}
               className="text-xs font-semibold text-[#0F766E] dark:text-[#2DD4BF] hover:underline cursor-pointer"
             >

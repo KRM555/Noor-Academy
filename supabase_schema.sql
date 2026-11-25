@@ -841,3 +841,63 @@ SET
   criteria_ar = 'اجتياز المستوى الثاني أو تحقيق درجة متقدمة في تحديد المستوى',
   criteria_en = 'Completion of Level 2 or advanced placement score'
 WHERE id = 3 OR code = 'L3-TAJWEED';
+
+-- ============================================================================
+-- Audit Logs Historical Privacy Scrub (Idempotent — safe to run repeatedly)
+-- ============================================================================
+UPDATE public.audit_logs SET details_json = details_json - 'email' - 'name_ar' - 'full_name_ar' - 'student_name' - 'student_email' WHERE details_json ?| ARRAY['email','name_ar','full_name_ar','student_name','student_email'];
+UPDATE public.audit_logs SET actor_name = 'deleted-user' WHERE actor_id IS NULL AND actor_name NOT IN ('deleted-user','system');
+
+-- ============================================================================
+-- Atomic Exam Attempts Table (Idempotent — safe to run repeatedly)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS public.exam_attempts (
+  exam_id BIGINT NOT NULL REFERENCES public.exams(id) ON DELETE CASCADE,
+  student_id BIGINT NOT NULL REFERENCES public.students(id) ON DELETE CASCADE,
+  started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  submitted_at TIMESTAMPTZ,
+  PRIMARY KEY (exam_id, student_id)
+);
+ALTER TABLE public.exam_attempts ENABLE ROW LEVEL SECURITY; -- no public policies, the server uses the service role
+REVOKE ALL ON public.exam_attempts FROM anon, authenticated;
+CREATE INDEX IF NOT EXISTS idx_exam_attempts_student ON public.exam_attempts(student_id);
+
+-- ============================================================================
+-- Official Domain & Support Email Migration (Idempotent — safe to run repeatedly)
+-- ============================================================================
+UPDATE public.legal_documents
+SET
+  content_ar = REPLACE(
+    REPLACE(
+      REPLACE(
+        REPLACE(content_ar, 'care@noorbayan.academy', 'care@noorwbayan-academy.com'),
+        'noorwbayan558@gmail.com',
+        'care@noorwbayan-academy.com'
+      ),
+      'noorwbayan-academy.up.railway.app',
+      'noorwbayan-academy.com'
+    ),
+    'noorbayan.academy',
+    'noorwbayan-academy.com'
+  ),
+  content_en = REPLACE(
+    REPLACE(
+      REPLACE(
+        REPLACE(content_en, 'care@noorbayan.academy', 'care@noorwbayan-academy.com'),
+        'noorwbayan558@gmail.com',
+        'care@noorwbayan-academy.com'
+      ),
+      'noorwbayan-academy.up.railway.app',
+      'noorwbayan-academy.com'
+    ),
+    'noorbayan.academy',
+    'noorwbayan-academy.com'
+  )
+WHERE
+  content_ar LIKE '%noorbayan.academy%'
+  OR content_ar LIKE '%noorwbayan-academy.up.railway.app%'
+  OR content_ar LIKE '%noorwbayan558@gmail.com%'
+  OR content_en LIKE '%noorbayan.academy%'
+  OR content_en LIKE '%noorwbayan-academy.up.railway.app%'
+  OR content_en LIKE '%noorwbayan558@gmail.com%';

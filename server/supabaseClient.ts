@@ -317,6 +317,18 @@ export async function requestSupabasePasswordReset(email: string, redirectTo?: s
   return { sent: true as const };
 }
 
+export async function requestSupabaseSignupConfirmation(email: string, emailRedirectTo?: string) {
+  const client = getSupabaseAnon();
+  if (!client) return { sent: false, reason: 'anon_client_not_configured' as const };
+  const { error } = await client.auth.resend({
+    type: 'signup',
+    email,
+    ...(emailRedirectTo ? { options: { emailRedirectTo } } : {}),
+  });
+  if (error) return { sent: false, reason: error.message };
+  return { sent: true as const };
+}
+
 export async function broadcastRealtimeEvent(
   event: string,
   payload: { kind?: string } = {}

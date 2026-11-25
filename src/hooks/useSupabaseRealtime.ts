@@ -49,7 +49,8 @@ export function useSupabaseRealtime() {
       })
       .on('broadcast', { event: 'admission:created' }, () => {
         if (user.role === 'admin') {
-          void qc.invalidateQueries({ queryKey: queryKeys.adminDashboard(user.id) });
+          void qc.invalidateQueries({ queryKey: queryKeys.adminSummary(user.id) });
+          void qc.invalidateQueries({ queryKey: queryKeys.adminList('admissions') });
           toast(
             lang === 'ar' ? 'وصل طلب التحاق جديد' : 'New admission request received',
             'info'

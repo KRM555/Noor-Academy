@@ -25,7 +25,8 @@ import { QueryClientProvider, useQuery } from '@tanstack/react-query';
 import { AppProvider, useApp } from './contexts/AppContext';
 import { apiFetch } from './lib/api';
 import { queryClient, queryKeys } from './lib/queryClient';
-import type { AcademySuggestion, PublicOverview } from './types';
+import { OFFICIAL_SITE_URL } from './lib/siteConfig';
+import type { PublicOverview } from './types';
 import { PublicLayout } from './components/public/PublicLayout';
 import { HomePage } from './pages/public/HomePage';
 import { PlacementTestPage } from './pages/public/PlacementTestPage';
@@ -146,33 +147,51 @@ function RouterContent() {
   const [preLevelId, setPreLevelId] = useState<number | null>(null);
   const lastPathBeforeGameRef = useRef<string>('/games');
 
+  const isDashboardRoute = path.startsWith('/dashboard');
+
   const { data: overview = null } = useQuery({
     queryKey: queryKeys.publicOverview,
     queryFn: () => apiFetch<PublicOverview>('/api/public/overview'),
+    enabled: !isDashboardRoute,
     staleTime: 2 * 60 * 1000,
   });
 
-  const isDashboardRoute = path.startsWith('/dashboard');
-
   const { data: adminSummary } = useQuery({
-    queryKey: queryKeys.adminDashboard(user?.id),
+    queryKey: queryKeys.adminSummary(user?.id),
     queryFn: () =>
       apiFetch<{
-        admissionRequests?: Array<{ status: string }>;
-        teacherApplications?: Array<{ status: string }>;
-        guardianRequests?: Array<{ status: string }>;
-        exams?: Array<{ pending_grading_count?: number }>;
-      }>('/api/admin/dashboard'),
+        counts?: {
+          pendingAdmissions?: number;
+          pendingGrading?: number;
+          pendingSuggestions?: number;
+        };
+      }>('/api/admin/dashboard/summary'),
     enabled: user?.role === 'admin' && isDashboardRoute,
     staleTime: 60 * 1000,
   });
 
-  const { data: adminCommSummary } = useQuery({
-    queryKey: queryKeys.adminCommunity,
-    queryFn: () => apiFetch<{ suggestions?: AcademySuggestion[] }>('/api/admin/community'),
-    enabled: user?.role === 'admin' && isDashboardRoute,
-    staleTime: 60 * 1000,
-  });
+  useEffect(() => {
+    if (!isDashboardRoute || !user?.id) return;
+    if (user.role === 'student') {
+      void queryClient.prefetchQuery({
+        queryKey: queryKeys.studentDashboard(user.id),
+        queryFn: () => apiFetch('/api/student/dashboard'),
+        staleTime: 60 * 1000,
+      });
+    } else if (user.role === 'teacher') {
+      void queryClient.prefetchQuery({
+        queryKey: queryKeys.teacherDashboard(user.id),
+        queryFn: () => apiFetch('/api/teacher/dashboard'),
+        staleTime: 60 * 1000,
+      });
+    } else if (user.role === 'guardian') {
+      void queryClient.prefetchQuery({
+        queryKey: queryKeys.guardianDashboard(user.id),
+        queryFn: () => apiFetch('/api/guardian/dashboard'),
+        staleTime: 60 * 1000,
+      });
+    }
+  }, [isDashboardRoute, user?.id, user?.role]);
 
   const navigate = useCallback((nextPath: string) => {
     window.history.pushState({}, '', nextPath);
@@ -299,7 +318,7 @@ function RouterContent() {
     document.querySelector('meta[property="og:title"]')?.setAttribute('content', nextTitle);
     document.querySelector('meta[property="og:description"]')?.setAttribute('content', nextDesc);
 
-    const canonicalHref = `${window.location.origin}${path === '/' ? '/' : path}`;
+    const canonicalHref = `${OFFICIAL_SITE_URL}${path === '/' ? '/' : path}`;
     let canonicalLink = document.querySelector('link[rel="canonical"]') as HTMLLinkElement | null;
     if (!canonicalLink) {
       canonicalLink = document.createElement('link');
@@ -315,6 +334,10 @@ function RouterContent() {
       document.head.appendChild(ogUrlMeta);
     }
     ogUrlMeta.setAttribute('content', canonicalHref);
+
+    const ogImageAbs = `${OFFICIAL_SITE_URL}/assets/images/academy_banner.webp`;
+    document.querySelector('meta[property="og:image"]')?.setAttribute('content', ogImageAbs);
+    document.querySelector('meta[name="twitter:image"]')?.setAttribute('content', ogImageAbs);
   }, [path, lang]);
 
   const exitGame = useCallback(() => {
@@ -379,17 +402,9 @@ function RouterContent() {
     const parts = path.split('/').filter(Boolean); // ['dashboard', tab?]
     const requestedTab = parts[1] || getDefaultTabForRole(user.role);
 
-    const pendingAdmissionsCount =
-      (adminSummary?.admissionRequests || []).filter((r) => r.status === 'pending').length +
-      (adminSummary?.teacherApplications || []).filter((r) => r.status === 'pending').length +
-      (adminSummary?.guardianRequests || []).filter((r) => r.status === 'pending').length;
-    const pendingGradingCount = (adminSummary?.exams || []).reduce(
-      (sum, ex) => sum + Number(ex.pending_grading_count || 0),
-      0
-    );
-    const pendingSuggestionsCount = (adminCommSummary?.suggestions || []).filter(
-      (s) => s.status === 'pending'
-    ).length;
+    const pendingAdmissionsCount = Number(adminSummary?.counts?.pendingAdmissions || 0);
+    const pendingGradingCount = Number(adminSummary?.counts?.pendingGrading || 0);
+    const pendingSuggestionsCount = Number(adminSummary?.counts?.pendingSuggestions || 0);
 
     const resolvedTabs = getDashboardTabsForRole(user.role).map((t) => {
       if (user.role !== 'admin') return t;

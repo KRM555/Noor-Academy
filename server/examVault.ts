@@ -67,6 +67,7 @@ export interface ExamAttemptRecord {
   student_id: number;
   started_at: string;
   expires_at: string;
+  submitted_at?: string | null;
 }
 
 const DISALLOWED_EXTENSIONS = new Set([
@@ -301,16 +302,248 @@ export async function saveExamSubmission(sb: SupabaseClient, record: ExamSubmiss
   });
 }
 
+let examAttemptsTableMissingWarned = false;
+
+function isExamAttemptsMissingTableError(error: { code?: string; message?: string } | null | undefined): boolean {
+  if (!error) return false;
+  const code = String(error.code || '').toUpperCase();
+  const msg = String(error.message || '');
+  return (
+    code === '42P01' ||
+    code === 'PGRST205' ||
+    /exam_attempts.*does not exist|could not find the table.*exam_attempts|schema cache/i.test(msg)
+  );
+}
+
+function warnMissingExamAttemptsTableOnce(context: string): void {
+  if (!examAttemptsTableMissingWarned) {
+    examAttemptsTableMissingWarned = true;
+    console.warn(
+      `[examVault] public.exam_attempts table is not applied yet (${context}); falling back to vault JSON storage.`
+    );
+  }
+}
+
+function mapExamAttemptRow(row: {
+  exam_id: number;
+  student_id: number;
+  started_at: string;
+  expires_at: string;
+  submitted_at?: string | null;
+}): ExamAttemptRecord {
+  return {
+    exam_id: Number(row.exam_id),
+    student_id: Number(row.student_id),
+    started_at: String(row.started_at),
+    expires_at: String(row.expires_at),
+    submitted_at: row.submitted_at ? String(row.submitted_at) : null,
+  };
+}
+
 export async function getExamAttempt(
   sb: SupabaseClient,
   examId: number,
   studentId: number
 ): Promise<ExamAttemptRecord | null> {
-  return readJsonFromVault<ExamAttemptRecord>(sb, `meta/attempt/${examId}/${studentId}.json`);
+  const { data, error } = await sb
+    .from('exam_attempts')
+    .select('exam_id, student_id, started_at, expires_at, submitted_at')
+    .eq('exam_id', examId)
+    .eq('student_id', studentId)
+    .maybeSingle();
+  if (error) {
+    if (isExamAttemptsMissingTableError(error)) {
+      warnMissingExamAttemptsTableOnce('getExamAttempt');
+      return readJsonFromVault<ExamAttemptRecord>(sb, `meta/attempt/${examId}/${studentId}.json`);
+    }
+    throw new AppError(
+      500,
+      process.env.NODE_ENV === 'production'
+        ? 'Failed reading exam attempt state'
+        : `Failed reading exam attempt state: ${error.message}`
+    );
+  }
+  return data ? mapExamAttemptRow(data) : null;
 }
 
-export async function saveExamAttempt(sb: SupabaseClient, record: ExamAttemptRecord): Promise<void> {
-  await writeJsonToVault(sb, `meta/attempt/${record.exam_id}/${record.student_id}.json`, record);
+export async function saveExamAttempt(
+  sb: SupabaseClient,
+  record: ExamAttemptRecord
+): Promise<ExamAttemptRecord> {
+  const { error: upsertErr } = await sb
+    .from('exam_attempts')
+    .upsert(
+      {
+        exam_id: record.exam_id,
+        student_id: record.student_id,
+        started_at: record.started_at,
+        expires_at: record.expires_at,
+      },
+      { onConflict: 'exam_id,student_id', ignoreDuplicates: true }
+    );
+  if (upsertErr) {
+    if (isExamAttemptsMissingTableError(upsertErr)) {
+      warnMissingExamAttemptsTableOnce('saveExamAttempt');
+      const existing = await readJsonFromVault<ExamAttemptRecord>(
+        sb,
+        `meta/attempt/${record.exam_id}/${record.student_id}.json`
+      );
+      if (existing) return existing;
+      await writeJsonToVault(sb, `meta/attempt/${record.exam_id}/${record.student_id}.json`, record);
+      return record;
+    }
+    throw new AppError(
+      500,
+      process.env.NODE_ENV === 'production'
+        ? 'Failed starting exam attempt'
+        : `Failed starting exam attempt: ${upsertErr.message}`
+    );
+  }
+
+  const { data: selected, error: selectErr } = await sb
+    .from('exam_attempts')
+    .select('exam_id, student_id, started_at, expires_at, submitted_at')
+    .eq('exam_id', record.exam_id)
+    .eq('student_id', record.student_id)
+    .maybeSingle();
+  if (selectErr) {
+    if (isExamAttemptsMissingTableError(selectErr)) {
+      warnMissingExamAttemptsTableOnce('saveExamAttempt:select');
+      await writeJsonToVault(sb, `meta/attempt/${record.exam_id}/${record.student_id}.json`, record);
+      return record;
+    }
+    throw new AppError(
+      500,
+      process.env.NODE_ENV === 'production'
+        ? 'Failed reading exam attempt'
+        : `Failed reading exam attempt: ${selectErr.message}`
+    );
+  }
+  return selected ? mapExamAttemptRow(selected) : record;
+}
+
+export async function claimExamAttemptForSubmit(
+  sb: SupabaseClient,
+  examId: number,
+  studentId: number,
+  fallbackExpiresAtIso: string
+): Promise<{ mode: 'claimed' | 'already_submitted' | 'fallback'; attempt: ExamAttemptRecord | null }> {
+  const { data: claimedRows, error: claimErr } = await sb
+    .from('exam_attempts')
+    .update({ submitted_at: new Date().toISOString() })
+    .eq('exam_id', examId)
+    .eq('student_id', studentId)
+    .is('submitted_at', null)
+    .select('exam_id, student_id, started_at, expires_at, submitted_at');
+
+  if (claimErr) {
+    if (isExamAttemptsMissingTableError(claimErr)) {
+      warnMissingExamAttemptsTableOnce('claimExamAttemptForSubmit');
+      const vaultAttempt = await readJsonFromVault<ExamAttemptRecord>(
+        sb,
+        `meta/attempt/${examId}/${studentId}.json`
+      );
+      return { mode: 'fallback', attempt: vaultAttempt };
+    }
+    throw new AppError(
+      500,
+      process.env.NODE_ENV === 'production'
+        ? 'Failed locking exam submission'
+        : `Failed locking exam submission: ${claimErr.message}`
+    );
+  }
+
+  if (claimedRows && claimedRows.length > 0) {
+    return { mode: 'claimed', attempt: mapExamAttemptRow(claimedRows[0]) };
+  }
+
+  const { data: existingRow, error: checkErr } = await sb
+    .from('exam_attempts')
+    .select('exam_id, student_id, started_at, expires_at, submitted_at')
+    .eq('exam_id', examId)
+    .eq('student_id', studentId)
+    .maybeSingle();
+
+  if (checkErr) {
+    if (isExamAttemptsMissingTableError(checkErr)) {
+      warnMissingExamAttemptsTableOnce('claimExamAttemptForSubmit:check');
+      const vaultAttempt = await readJsonFromVault<ExamAttemptRecord>(
+        sb,
+        `meta/attempt/${examId}/${studentId}.json`
+      );
+      return { mode: 'fallback', attempt: vaultAttempt };
+    }
+    throw new AppError(
+      500,
+      process.env.NODE_ENV === 'production'
+        ? 'Failed checking exam attempt'
+        : `Failed checking exam attempt: ${checkErr.message}`
+    );
+  }
+
+  if (!existingRow) {
+    const nowIso = new Date().toISOString();
+    const { error: upsertErr } = await sb
+      .from('exam_attempts')
+      .upsert(
+        {
+          exam_id: examId,
+          student_id: studentId,
+          started_at: nowIso,
+          expires_at: fallbackExpiresAtIso,
+        },
+        { onConflict: 'exam_id,student_id', ignoreDuplicates: true }
+      );
+    if (upsertErr) {
+      throw new AppError(
+        500,
+        process.env.NODE_ENV === 'production'
+          ? 'Failed initializing exam attempt'
+          : `Failed initializing exam attempt: ${upsertErr.message}`
+      );
+    }
+
+    const { data: retryRows, error: retryErr } = await sb
+      .from('exam_attempts')
+      .update({ submitted_at: new Date().toISOString() })
+      .eq('exam_id', examId)
+      .eq('student_id', studentId)
+      .is('submitted_at', null)
+      .select('exam_id, student_id, started_at, expires_at, submitted_at');
+    if (retryErr) {
+      throw new AppError(
+        500,
+        process.env.NODE_ENV === 'production'
+          ? 'Failed claiming exam attempt'
+          : `Failed claiming exam attempt: ${retryErr.message}`
+      );
+    }
+    if (retryRows && retryRows.length > 0) {
+      return { mode: 'claimed', attempt: mapExamAttemptRow(retryRows[0]) };
+    }
+    return { mode: 'already_submitted', attempt: null };
+  }
+
+  return { mode: 'already_submitted', attempt: mapExamAttemptRow(existingRow) };
+}
+
+export async function releaseExamAttemptClaim(
+  sb: SupabaseClient,
+  examId: number,
+  studentId: number
+): Promise<void> {
+  const { error } = await sb
+    .from('exam_attempts')
+    .update({ submitted_at: null })
+    .eq('exam_id', examId)
+    .eq('student_id', studentId);
+  if (error) {
+    if (isExamAttemptsMissingTableError(error)) {
+      warnMissingExamAttemptsTableOnce('releaseExamAttemptClaim');
+    } else {
+      console.warn(`[examVault] Failed releasing exam_attempts claim (${examId}, ${studentId}):`, error.message);
+    }
+  }
 }
 
 export async function deleteExamSubmissionRecord(
@@ -325,8 +558,45 @@ export async function deleteExamSubmissionRecord(
   ];
   if (existing?.solution_file?.path) pathsToRemove.push(existing.solution_file.path);
   if (existing?.graded_file?.path) pathsToRemove.push(existing.graded_file.path);
-  await sb.storage.from(EXAM_VAULT_BUCKET).remove(pathsToRemove).catch(() => {});
+  const [{ error: storageErr }, { error: dbErr }] = await Promise.all([
+    sb.storage.from(EXAM_VAULT_BUCKET).remove(pathsToRemove),
+    sb.from('exam_attempts').delete().eq('exam_id', examId).eq('student_id', studentId),
+  ]);
+  if (storageErr) {
+    console.warn(`[examVault] Failed removing exam ${examId} submission for student ${studentId}:`, storageErr.message);
+  }
+  if (dbErr) {
+    if (isExamAttemptsMissingTableError(dbErr)) {
+      warnMissingExamAttemptsTableOnce('deleteExamSubmissionRecord');
+    } else {
+      console.warn(`[examVault] Failed deleting exam_attempts row (${examId}, ${studentId}):`, dbErr.message);
+    }
+  }
   subMetaCache.delete(`${examId}:${studentId}`);
+}
+
+export async function countExamSubmissionFiles(
+  sb: SupabaseClient,
+  examId: number
+): Promise<number> {
+  await ensureExamVaultBucket(sb).catch(() => {});
+  const PAGE_SIZE = 100;
+  let count = 0;
+  for (let offset = 0; ; offset += PAGE_SIZE) {
+    const { data: files, error } = await sb.storage
+      .from(EXAM_VAULT_BUCKET)
+      .list(`meta/sub/${examId}`, { limit: PAGE_SIZE, offset });
+    if (error || !files || !files.length) break;
+    for (const f of files) {
+      const name = String(f.name || '');
+      if (name.endsWith('.json')) {
+        const sid = Number(name.slice(0, -5));
+        if (Number.isFinite(sid) && sid > 0) count += 1;
+      }
+    }
+    if (files.length < PAGE_SIZE) break;
+  }
+  return count;
 }
 
 export async function listExamSubmissionsForExam(
@@ -334,23 +604,147 @@ export async function listExamSubmissionsForExam(
   examId: number
 ): Promise<ExamSubmissionRecord[]> {
   await ensureExamVaultBucket(sb).catch(() => {});
-  const { data: files } = await sb.storage.from(EXAM_VAULT_BUCKET).list(`meta/sub/${examId}`, { limit: 200 });
-  if (!files || !files.length) return [];
-  const studentIds = files
-    .map((f) => Number(String(f.name || '').replace('.json', '')))
-    .filter((id) => Number.isFinite(id) && id > 0);
+  const PAGE_SIZE = 100;
+  const studentIds: number[] = [];
+  for (let offset = 0; ; offset += PAGE_SIZE) {
+    const { data: files, error } = await sb.storage
+      .from(EXAM_VAULT_BUCKET)
+      .list(`meta/sub/${examId}`, { limit: PAGE_SIZE, offset });
+    if (error || !files || !files.length) break;
+    for (const f of files) {
+      const name = String(f.name || '');
+      if (name.endsWith('.json')) {
+        const sid = Number(name.slice(0, -5));
+        if (Number.isFinite(sid) && sid > 0) studentIds.push(sid);
+      }
+    }
+    if (files.length < PAGE_SIZE) break;
+  }
+  if (!studentIds.length) return [];
   const records = await Promise.all(studentIds.map((sid) => getExamSubmission(sb, examId, sid)));
   return records.filter((r): r is ExamSubmissionRecord => Boolean(r));
 }
 
-export async function deleteExamDataForStudent(sb: SupabaseClient, studentId: number): Promise<void> {
+export async function deleteExamDataForStudent(
+  sb: SupabaseClient,
+  studentId: number
+): Promise<{ removed: number; failed: number }> {
+  let removed = 0;
+  let failed = 0;
   try {
     await ensureExamVaultBucket(sb);
-    const { data: exams } = await sb.from('exams').select('id');
-    const examIds = (exams || []).map((e: { id: number }) => Number(e.id)).filter((id) => Number.isFinite(id));
-    await Promise.all(examIds.map((eid) => deleteExamSubmissionRecord(sb, eid, studentId)));
-  } catch {
-    // non-fatal cleanup
+
+    const EXAM_PAGE_SIZE = 1000;
+    const examIds: number[] = [];
+    for (let offset = 0; ; offset += EXAM_PAGE_SIZE) {
+      const { data: examsPage, error: examsErr } = await sb
+        .from('exams')
+        .select('id')
+        .order('id', { ascending: true })
+        .range(offset, offset + EXAM_PAGE_SIZE - 1);
+      if (examsErr) {
+        console.warn(`[examVault] Failed fetching exam list for student ${studentId} cleanup:`, examsErr.message);
+        failed += 1;
+        break;
+      }
+      const rows = (examsPage || []) as Array<{ id: number }>;
+      for (const row of rows) {
+        const id = Number(row.id);
+        if (Number.isFinite(id) && id > 0) examIds.push(id);
+      }
+      if (rows.length < EXAM_PAGE_SIZE) break;
+    }
+
+    if (!examIds.length) return { removed, failed };
+
+    const STORAGE_LIST_LIMIT = 100;
+    const listAllPathsInFolder = async (folder: string): Promise<{ paths: string[]; hadError: boolean }> => {
+      const paths: string[] = [];
+      for (let offset = 0; ; offset += STORAGE_LIST_LIMIT) {
+        const { data, error } = await sb.storage
+          .from(EXAM_VAULT_BUCKET)
+          .list(folder, { limit: STORAGE_LIST_LIMIT, offset });
+        if (error) {
+          console.warn(`[examVault] Failed listing ${folder} (offset=${offset}) for student ${studentId}:`, error.message);
+          return { paths, hadError: true };
+        }
+        const items = data || [];
+        for (const f of items) {
+          if (f.name) paths.push(`${folder}/${f.name}`);
+        }
+        if (items.length < STORAGE_LIST_LIMIT) break;
+      }
+      return { paths, hadError: false };
+    };
+
+    const folderResults = await Promise.allSettled(
+      examIds.map(async (eid) => {
+        subMetaCache.delete(`${eid}:${studentId}`);
+        const collected = [`meta/sub/${eid}/${studentId}.json`, `meta/attempt/${eid}/${studentId}.json`];
+        const [subRes, gradedRes] = await Promise.all([
+          listAllPathsInFolder(`submissions/${eid}/${studentId}`),
+          listAllPathsInFolder(`graded/${eid}/${studentId}`),
+        ]);
+        collected.push(...subRes.paths, ...gradedRes.paths);
+        return {
+          paths: collected,
+          listFailures: (subRes.hadError ? 1 : 0) + (gradedRes.hadError ? 1 : 0),
+        };
+      })
+    );
+
+    const pathsToRemove: string[] = [];
+    for (const r of folderResults) {
+      if (r.status === 'fulfilled') {
+        pathsToRemove.push(...r.value.paths);
+        failed += r.value.listFailures;
+      } else {
+        failed += 1;
+        console.warn(`[examVault] Partial listing failure during student ${studentId} cleanup:`, r.reason);
+      }
+    }
+
+    const CHUNK_SIZE = 100;
+    const removeChunkWithRetry = async (chunk: string[]): Promise<{ removed: number; failed: number }> => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const { data, error } = await sb.storage.from(EXAM_VAULT_BUCKET).remove(chunk);
+          if (!error) {
+            return { removed: Array.isArray(data) ? data.length : chunk.length, failed: 0 };
+          }
+          console.warn(
+            `[examVault] Remove attempt ${attempt + 1} failed for student ${studentId}:`,
+            error.message
+          );
+        } catch (err) {
+          console.warn(
+            `[examVault] Remove attempt ${attempt + 1} threw for student ${studentId}:`,
+            err instanceof Error ? err.message : err
+          );
+        }
+      }
+      return { removed: 0, failed: chunk.length };
+    };
+
+    const removeTasks: Promise<{ removed: number; failed: number }>[] = [];
+    for (let i = 0; i < pathsToRemove.length; i += CHUNK_SIZE) {
+      const chunk = pathsToRemove.slice(i, i + CHUNK_SIZE);
+      removeTasks.push(removeChunkWithRetry(chunk));
+    }
+    const removeResults = await Promise.allSettled(removeTasks);
+    for (const r of removeResults) {
+      if (r.status === 'fulfilled') {
+        removed += r.value.removed;
+        failed += r.value.failed;
+      } else {
+        failed += 1;
+        console.warn(`[examVault] Batch storage cleanup error for student ${studentId}:`, r.reason);
+      }
+    }
+    return { removed, failed };
+  } catch (err) {
+    console.warn(`[examVault] deleteExamDataForStudent error for student ${studentId}:`, err instanceof Error ? err.message : err);
+    return { removed, failed: failed > 0 ? failed : 1 };
   }
 }
 

@@ -13,6 +13,7 @@ import { Users, BookOpen, CheckCircle2, Award, Download, Heart, Link2 } from 'lu
 import { useApp } from '../../contexts/AppContext';
 import { apiFetch } from '../../lib/api';
 import { queryKeys } from '../../lib/queryClient';
+import { getCertificateVerifyUrl } from '../../lib/siteConfig';
 import { tField } from '../../i18n/translations';
 import { Card, LoadingState, EmptyState, ResponsiveTable, PrimaryButton } from '../../components/ui/CommonUI';
 import { ChangePasswordCard } from '../../components/dashboard/ChangePasswordCard';
@@ -214,28 +215,45 @@ export function GuardianDashboard({ activeTab }: { activeTab: string }) {
                   <div className="text-xs text-slate-500">
                     {tField(cert as unknown as Record<string, unknown>, 'course_title', lang)} · {cert.grade_label}
                   </div>
-                  {child && (
-                    <PrimaryButton
+                  <div className="flex flex-wrap gap-2">
+                    {child && (
+                      <PrimaryButton
+                        onClick={async () => {
+                          const { generateCertificatePDF } = await import('../../lib/pdfCertificate');
+                          await generateCertificatePDF({
+                            verification_code: cert.verification_code,
+                            student_name_ar: child.full_name_ar,
+                            student_name_en: child.full_name_en,
+                            course_title_ar: cert.course_title_ar,
+                            course_title_en: cert.course_title_en,
+                            title_ar: cert.title_ar,
+                            title_en: cert.title_en,
+                            grade_label: cert.grade_label,
+                            issued_at: cert.issued_at,
+                          });
+                        }}
+                        className="text-xs"
+                      >
+                        <Download className="w-4 h-4" />
+                        <span>{lang === 'ar' ? 'تحميل PDF' : 'Download PDF'}</span>
+                      </PrimaryButton>
+                    )}
+                    <button
+                      type="button"
                       onClick={async () => {
-                        const { generateCertificatePDF } = await import('../../lib/pdfCertificate');
-                        await generateCertificatePDF({
-                          verification_code: cert.verification_code,
-                          student_name_ar: child.full_name_ar,
-                          student_name_en: child.full_name_en,
-                          course_title_ar: cert.course_title_ar,
-                          course_title_en: cert.course_title_en,
-                          title_ar: cert.title_ar,
-                          title_en: cert.title_en,
-                          grade_label: cert.grade_label,
-                          issued_at: cert.issued_at,
-                        });
+                        try {
+                          await navigator.clipboard.writeText(getCertificateVerifyUrl(cert.verification_code));
+                          toast(lang === 'ar' ? 'تم نسخ رابط التحقق من الشهادة' : 'Verification link copied', 'success');
+                        } catch {
+                          toast(lang === 'ar' ? 'تعذر نسخ الرابط' : 'Failed to copy link', 'error');
+                        }
                       }}
-                      className="text-xs"
+                      className="inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-bold border border-[#D6CDB4] dark:border-[#294A7D] hover:bg-[#EFEAD8] dark:hover:bg-[#162C4E] transition-colors cursor-pointer"
                     >
-                      <Download className="w-4 h-4" />
-                      <span>{lang === 'ar' ? 'تحميل PDF' : 'Download PDF'}</span>
-                    </PrimaryButton>
-                  )}
+                      <Link2 className="w-3.5 h-3.5" />
+                      <span>{lang === 'ar' ? 'نسخ رابط التحقق' : 'Copy Verify Link'}</span>
+                    </button>
+                  </div>
                 </Card>
               );
             })}

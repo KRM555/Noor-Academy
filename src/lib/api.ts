@@ -1,5 +1,8 @@
+import type { AuthUser } from '../types';
+
 const LEGACY_TOKEN_KEY = 'nb_auth_token';
 const IFRAME_TOKEN_KEY = 'nb_iframe_session';
+const SESSION_USER_HINT_KEY = 'nb_session_user';
 const CSRF_COOKIE_NAME = 'nb_csrf';
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -62,6 +65,74 @@ export function setStoredToken(token: string | null) {
     }
   } catch {
     // Ignore
+  }
+}
+
+export function getStoredSessionHint(): AuthUser | null {
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      const raw = sessionStorage.getItem(SESSION_USER_HINT_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<AuthUser> | null;
+        if (parsed && parsed.id && parsed.role) {
+          return parsed as AuthUser;
+        }
+      }
+    }
+    const token = getStoredToken();
+    if (token) {
+      const [payloadB64] = token.split('.');
+      if (payloadB64) {
+        const b64 = payloadB64.replace(/-/g, '+').replace(/_/g, '/');
+        const json = decodeURIComponent(
+          Array.from(atob(b64))
+            .map((c) => `%${c.charCodeAt(0).toString(16).padStart(2, '0')}`)
+            .join('')
+        );
+        const claims = JSON.parse(json) as {
+          id?: string;
+          role?: AuthUser['role'];
+          guardianId?: number;
+          exp?: number;
+        };
+        if (claims?.id && claims?.role && typeof claims.exp === 'number' && claims.exp > Date.now()) {
+          return {
+            id: claims.id,
+            email: '',
+            full_name: '',
+            role: claims.role,
+            preferred_lang: 'ar',
+            ...(claims.guardianId ? { guardian_id: Number(claims.guardianId) } : {}),
+          };
+        }
+      }
+    }
+  } catch {
+    // Ignore storage or parse failures
+  }
+  return null;
+}
+
+export function setStoredSessionHint(user: AuthUser | null): void {
+  try {
+    if (typeof sessionStorage === 'undefined') return;
+    if (user && user.id && user.role) {
+      sessionStorage.setItem(
+        SESSION_USER_HINT_KEY,
+        JSON.stringify({
+          id: user.id,
+          email: user.email,
+          full_name: user.full_name,
+          role: user.role,
+          preferred_lang: user.preferred_lang,
+          ...(user.guardian_id ? { guardian_id: user.guardian_id } : {}),
+        })
+      );
+    } else {
+      sessionStorage.removeItem(SESSION_USER_HINT_KEY);
+    }
+  } catch {
+    // Ignore storage restrictions
   }
 }
 

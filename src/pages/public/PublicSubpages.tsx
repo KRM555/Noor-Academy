@@ -1,9 +1,10 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Award, Search, CheckCircle2, XCircle, Gamepad2, BookOpen, Clock, ExternalLink } from 'lucide-react';
+import { Award, Search, CheckCircle2, XCircle, Gamepad2, BookOpen, Clock, ExternalLink, Copy, Check } from 'lucide-react';
 import { useApp } from '../../contexts/AppContext';
 import { apiFetch } from '../../lib/api';
 import { queryKeys } from '../../lib/queryClient';
+import { getCertificateVerifyUrl, normalizeAcademyText } from '../../lib/siteConfig';
 import { dict, tField } from '../../i18n/translations';
 import type { Course, LegalDocument, PublicOverview, Teacher } from '../../types';
 import { Card, PrimaryButton, SecondaryButton, ResilientImage, LoadingState, PaginationBar } from '../../components/ui/CommonUI';
@@ -475,6 +476,7 @@ export function VerifyCertificatePage() {
     return fromQuery?.trim() || 'NB-CERT-2026-8841';
   });
   const [loading, setLoading] = useState(false);
+  const [copiedLink, setCopiedLink] = useState(false);
   const [result, setResult] = useState<{
     valid: boolean;
     error?: string;
@@ -608,6 +610,37 @@ export function VerifyCertificatePage() {
                   <div className="font-mono-tabular">{String(result.certificate.issued_at).slice(0, 10)}</div>
                 </div>
               </div>
+              <div className="pt-3 border-t border-[#EFEAD8] dark:border-[#1D355B] flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <span dir="ltr" className="text-xs font-mono-tabular text-slate-500 break-all">
+                  {getCertificateVerifyUrl(result.certificate.verification_code)}
+                </span>
+                <SecondaryButton
+                  type="button"
+                  className="text-xs shrink-0"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(
+                        getCertificateVerifyUrl(result.certificate!.verification_code)
+                      );
+                      setCopiedLink(true);
+                      setTimeout(() => setCopiedLink(false), 2000);
+                    } catch {
+                      // Clipboard unavailable
+                    }
+                  }}
+                >
+                  {copiedLink ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>
+                    {copiedLink
+                      ? lang === 'ar'
+                        ? 'تم نسخ الرابط'
+                        : 'Link Copied'
+                      : lang === 'ar'
+                      ? 'نسخ رابط التحقق'
+                      : 'Copy Verify Link'}
+                  </span>
+                </SecondaryButton>
+              </div>
             </>
           ) : (
             <div className="flex items-center gap-2.5 text-red-600 dark:text-red-400 font-bold">
@@ -684,6 +717,9 @@ export function InfoStaticPage({
 
   if (mode === 'terms' || mode === 'privacy' || mode === 'refund') {
     const doc = legalDocs.find((d) => d.doc_type === mode);
+    const legalContent = doc
+      ? normalizeAcademyText(tField(doc as unknown as Record<string, unknown>, 'content', lang))
+      : '';
     return (
       <div className="max-w-3xl mx-auto px-4 sm:px-6 py-12 space-y-6">
         <h1 className="text-3xl font-extrabold">
@@ -695,7 +731,24 @@ export function InfoStaticPage({
           </div>
         )}
         <Card className="p-6 sm:p-8 whitespace-pre-line text-sm sm:text-base leading-loose text-slate-700 dark:text-slate-200">
-          {doc ? tField(doc as unknown as Record<string, unknown>, 'content', lang) : ''}
+          {legalContent}
+        </Card>
+        <Card className="p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-[#F2EFE6] dark:bg-[#13284A]">
+          <div className="text-xs sm:text-sm text-slate-600 dark:text-slate-300">
+            {lang === 'ar'
+              ? 'للاستفسارات القانونية أو طلبات الخصوصية والتواصل الرسمي:'
+              : 'For legal, privacy, or official support inquiries:'}{' '}
+            <a
+              href={ACADEMY_CONTACTS.mailtoUrl}
+              dir="ltr"
+              className="font-mono-tabular font-bold text-[#0F766E] dark:text-[#2DD4BF] hover:underline"
+            >
+              {ACADEMY_CONTACTS.email}
+            </a>
+          </div>
+          <SecondaryButton className="text-xs shrink-0" onClick={() => onNavigate('/contact')}>
+            {dict[lang].contactUs}
+          </SecondaryButton>
         </Card>
       </div>
     );
@@ -825,7 +878,7 @@ export function InfoStaticPage({
             <div className="flex items-center gap-3">
               <GmailBrandIcon className="w-8 h-8 shrink-0" />
               <h2 className="text-lg font-bold text-[#0F213E] dark:text-[#F8F5EC]">
-                {lang === 'ar' ? 'البريد الإلكتروني الرسمي (Gmail)' : 'Official Email (Gmail)'}
+                {lang === 'ar' ? 'البريد الإلكتروني الرسمي' : 'Official Email'}
               </h2>
             </div>
             <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">

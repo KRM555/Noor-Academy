@@ -1,10 +1,12 @@
 import React from 'react';
+import { OFFICIAL_CONTACT_EMAIL, OFFICIAL_SITE_URL } from '../../lib/siteConfig';
 
 export const ACADEMY_CONTACTS = {
   whatsappDisplay: '+20 10 80937383',
   whatsappUrl: 'https://wa.me/201080937383',
-  email: 'noorwbayan558@gmail.com',
-  mailtoUrl: 'mailto:noorwbayan558@gmail.com',
+  email: OFFICIAL_CONTACT_EMAIL,
+  mailtoUrl: `mailto:${OFFICIAL_CONTACT_EMAIL}`,
+  websiteUrl: OFFICIAL_SITE_URL,
   facebookUrl: 'https://www.facebook.com/profile.php?id=61595040401874',
   youtubeUrl: 'https://youtube.com/@noorbayanacademy?si=wj_VlS4i4iOzZ97T',
 } as const;

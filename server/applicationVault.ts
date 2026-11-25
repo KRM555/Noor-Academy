@@ -73,6 +73,7 @@ export interface LessonMetaRecord {
   weekday_ar: string;
   is_published: boolean;
   published_at: string | null;
+  teacher_id?: number | null;
 }
 
 export const COURSE_COVERS_BUCKET = 'course-covers';
@@ -276,20 +277,131 @@ export async function listGuardianRequests(sb: SupabaseClient): Promise<Guardian
 
 export async function deleteAdmissionMeta(sb: SupabaseClient, admissionId: number): Promise<void> {
   await ensureApplicationVaultBucket(sb);
-  await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`admissions/${admissionId}.json`]).catch(() => {});
-  invalidateAdmissionMetasCache();
+  const { error } = await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`admissions/${admissionId}.json`]);
+  if (error) {
+    console.warn(`[applicationVault] Failed removing admission meta ${admissionId}:`, error.message);
+  }
+  if (admissionMetasCache && Date.now() < admissionMetasCache.expiresAt) {
+    admissionMetasCache.value.delete(admissionId);
+  } else {
+    invalidateAdmissionMetasCache();
+  }
+}
+
+async function removeVaultPathsWithRetry(
+  sb: SupabaseClient,
+  paths: string[],
+  label: string
+): Promise<number> {
+  if (!paths.length) return 0;
+  try {
+    await ensureApplicationVaultBucket(sb);
+  } catch (err) {
+    console.warn(`[applicationVault] ${label} bucket check failed:`, err instanceof Error ? err.message : err);
+    return paths.length;
+  }
+
+  let failedCount = 0;
+  const CHUNK_SIZE = 100;
+  for (let i = 0; i < paths.length; i += CHUNK_SIZE) {
+    const chunk = paths.slice(i, i + CHUNK_SIZE);
+    let chunkSucceeded = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const { error } = await sb.storage.from(APPLICATION_VAULT_BUCKET).remove(chunk);
+        if (!error) {
+          chunkSucceeded = true;
+          break;
+        }
+        console.warn(`[applicationVault] ${label} remove attempt ${attempt + 1} failed:`, error.message);
+      } catch (err) {
+        console.warn(
+          `[applicationVault] ${label} remove attempt ${attempt + 1} threw:`,
+          err instanceof Error ? err.message : err
+        );
+      }
+    }
+    if (!chunkSucceeded) {
+      failedCount += chunk.length;
+    }
+  }
+  return failedCount;
+}
+
+export async function deleteAdmissionMetasBatch(
+  sb: SupabaseClient,
+  admissionIds: number[]
+): Promise<{ failed: number }> {
+  const uniqueIds = Array.from(new Set(admissionIds.filter((id) => Number.isFinite(id))));
+  if (!uniqueIds.length) return { failed: 0 };
+  const paths = uniqueIds.map((id) => `admissions/${id}.json`);
+  const failed = await removeVaultPathsWithRetry(sb, paths, 'admissionMetasBatch');
+  if (admissionMetasCache && Date.now() < admissionMetasCache.expiresAt) {
+    for (const id of uniqueIds) admissionMetasCache.value.delete(id);
+  } else {
+    invalidateAdmissionMetasCache();
+  }
+  return { failed };
 }
 
 export async function deleteTeacherApplication(sb: SupabaseClient, id: number): Promise<void> {
   await ensureApplicationVaultBucket(sb);
-  await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`teacher-applications/${id}.json`]).catch(() => {});
-  invalidateTeacherAppsCache();
+  const { error } = await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`teacher-applications/${id}.json`]);
+  if (error) {
+    console.warn(`[applicationVault] Failed removing teacher application ${id}:`, error.message);
+  }
+  if (teacherAppsCache && Date.now() < teacherAppsCache.expiresAt) {
+    teacherAppsCache.value = teacherAppsCache.value.filter((app) => app.id !== id);
+  } else {
+    invalidateTeacherAppsCache();
+  }
+}
+
+export async function deleteTeacherApplicationsBatch(
+  sb: SupabaseClient,
+  ids: number[]
+): Promise<{ failed: number }> {
+  const uniqueIds = Array.from(new Set(ids.filter((id) => Number.isFinite(id))));
+  if (!uniqueIds.length) return { failed: 0 };
+  const paths = uniqueIds.map((id) => `teacher-applications/${id}.json`);
+  const failed = await removeVaultPathsWithRetry(sb, paths, 'teacherApplicationsBatch');
+  const idSet = new Set(uniqueIds);
+  if (teacherAppsCache && Date.now() < teacherAppsCache.expiresAt) {
+    teacherAppsCache.value = teacherAppsCache.value.filter((app) => !idSet.has(app.id));
+  } else {
+    invalidateTeacherAppsCache();
+  }
+  return { failed };
 }
 
 export async function deleteGuardianRequest(sb: SupabaseClient, id: number): Promise<void> {
   await ensureApplicationVaultBucket(sb);
-  await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`guardian-requests/${id}.json`]).catch(() => {});
-  invalidateGuardianReqsCache();
+  const { error } = await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`guardian-requests/${id}.json`]);
+  if (error) {
+    console.warn(`[applicationVault] Failed removing guardian request ${id}:`, error.message);
+  }
+  if (guardianReqsCache && Date.now() < guardianReqsCache.expiresAt) {
+    guardianReqsCache.value = guardianReqsCache.value.filter((req) => req.id !== id);
+  } else {
+    invalidateGuardianReqsCache();
+  }
+}
+
+export async function deleteGuardianRequestsBatch(
+  sb: SupabaseClient,
+  ids: number[]
+): Promise<{ failed: number }> {
+  const uniqueIds = Array.from(new Set(ids.filter((id) => Number.isFinite(id))));
+  if (!uniqueIds.length) return { failed: 0 };
+  const paths = uniqueIds.map((id) => `guardian-requests/${id}.json`);
+  const failed = await removeVaultPathsWithRetry(sb, paths, 'guardianRequestsBatch');
+  const idSet = new Set(uniqueIds);
+  if (guardianReqsCache && Date.now() < guardianReqsCache.expiresAt) {
+    guardianReqsCache.value = guardianReqsCache.value.filter((req) => !idSet.has(req.id));
+  } else {
+    invalidateGuardianReqsCache();
+  }
+  return { failed };
 }
 
 export function hashVaultPassword(password: string): { salt: string; hash: string } {

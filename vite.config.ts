@@ -56,7 +56,7 @@ export default defineConfig(() => {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
           globIgnores: ['**/vendor-three*', '**/vendor-pdf*', '**/vendor-charts*'],
           maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
-          navigateFallbackDenylist: [/^\/api\//, /^\/auth\//, /^\/robots\.txt$/, /^\/sitemap\.xml$/],
+          navigateFallbackDenylist: [/^\/api(?:\/|$)/, /^\/auth\//, /^\/robots\.txt$/, /^\/sitemap\.xml$/],
           runtimeCaching: [
             {
               urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
@@ -101,23 +101,8 @@ export default defineConfig(() => {
               },
             },
             {
-              urlPattern: /\/api\/public\/certificates\/verify\/.*/i,
+              urlPattern: /^https?:\/\/[^/]+\/api(?:\/|$)/i,
               handler: 'NetworkOnly',
-            },
-            {
-              urlPattern: /\/api\/public\/(?!certificates\/verify\/).*/i,
-              handler: 'NetworkFirst',
-              options: {
-                cacheName: 'academy-public-api',
-                networkTimeoutSeconds: 4,
-                expiration: {
-                  maxEntries: 25,
-                  maxAgeSeconds: 60 * 60,
-                },
-                cacheableResponse: {
-                  statuses: [0, 200],
-                },
-              },
             },
           ],
         },

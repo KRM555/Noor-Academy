@@ -26,7 +26,16 @@ export const queryKeys = {
   studentDashboard: (userId?: string | number) => ['dashboard', 'student', userId ?? 'anon'] as const,
   teacherDashboard: (userId?: string | number) => ['dashboard', 'teacher', userId ?? 'anon'] as const,
   guardianDashboard: (userId?: string | number) => ['dashboard', 'guardian', userId ?? 'anon'] as const,
-  adminDashboard: (userId?: string | number) => ['dashboard', 'admin', userId ?? 'anon'] as const,
+  adminSummary: (userId?: string | number) => ['admin', 'summary', userId ?? 'anon'] as const,
+  adminList: (
+    resource: string,
+    params?: { page?: number; limit?: number; q?: string; status?: string; action?: string }
+  ) =>
+    params
+      ? (['admin', 'list', resource, params] as const)
+      : (['admin', 'list', resource] as const),
+  adminCourseWorkspace: (courseId: number | null) =>
+    ['admin', 'course-workspace', courseId ?? 'none'] as const,
   adminLaunchStatus: ['admin', 'launch-status'] as const,
   adminSchema: ['admin', 'supabase-schema'] as const,
   publicComments: ['public', 'comments'] as const,

@@ -532,17 +532,20 @@ export function ConfirmDeleteModal({
   open,
   title,
   description,
+  loading,
   onConfirm,
   onClose,
 }: {
   open: boolean;
   title?: string;
   description?: string;
-  onConfirm: () => void;
+  loading?: boolean;
+  onConfirm: () => void | Promise<void>;
   onClose: () => void;
 }) {
   const { lang } = useApp();
   if (!open) return null;
+  const isBusy = Boolean(loading);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/60">
@@ -559,9 +562,12 @@ export function ConfirmDeleteModal({
             </div>
           </div>
           <button
-            onClick={onClose}
+            onClick={() => {
+              if (!isBusy) onClose();
+            }}
+            disabled={isBusy}
             aria-label="Close"
-            className="p-1.5 rounded-lg text-slate-500 hover:text-slate-900 dark:hover:text-white cursor-pointer"
+            className="p-1.5 rounded-lg text-slate-500 hover:text-slate-900 dark:hover:text-white disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -570,15 +576,24 @@ export function ConfirmDeleteModal({
           {description || dict[lang].confirmDeleteBody}
         </p>
         <div className="flex items-center justify-end gap-3 pt-2">
-          <SecondaryButton onClick={onClose}>{dict[lang].cancel}</SecondaryButton>
-          <button
+          <SecondaryButton
+            disabled={isBusy}
             onClick={() => {
-              onConfirm();
-              onClose();
+              if (!isBusy) onClose();
             }}
-            className="inline-flex items-center justify-center rounded-xl px-5 py-2.5 text-sm font-semibold bg-red-700 hover:bg-red-800 text-white transition-colors cursor-pointer"
           >
-            {dict[lang].delete}
+            {dict[lang].cancel}
+          </SecondaryButton>
+          <button
+            disabled={isBusy}
+            onClick={() => {
+              if (isBusy) return;
+              void onConfirm();
+              if (loading === undefined) onClose();
+            }}
+            className="inline-flex items-center justify-center rounded-xl px-5 py-2.5 text-sm font-semibold bg-red-700 hover:bg-red-800 disabled:opacity-60 disabled:cursor-not-allowed text-white transition-colors cursor-pointer"
+          >
+            {isBusy ? (lang === 'ar' ? 'جاري الحذف...' : 'Deleting...') : dict[lang].delete}
           </button>
         </div>
       </Card>

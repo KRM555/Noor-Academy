@@ -364,10 +364,9 @@ export function HomePage({
 
       {/* 2. STATS STRIP */}
       <section className="border-b border-[#E5DEC9] dark:border-[#233C63] bg-white dark:bg-[#0F213E]">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-8 grid grid-cols-2 md:grid-cols-4 gap-6">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-8 grid grid-cols-3 gap-4 sm:gap-6">
           {[
             { val: overview?.stats.students ?? 0, label: t.statsStudents, suffix: (overview?.stats.students ?? 0) > 0 ? '+' : '' },
-            { val: overview?.stats.teachers ?? 0, label: t.statsTeachers, suffix: '' },
             { val: overview?.stats.courses ?? 0, label: t.statsCourses, suffix: '' },
             { val: overview?.stats.lessons ?? 0, label: t.statsLessons, suffix: (overview?.stats.lessons ?? 0) > 0 ? '+' : '' },
           ].map((stat, i) => (

@@ -1,5 +1,6 @@
 import { jsPDF } from 'jspdf';
 import QRCode from 'qrcode';
+import { getCertificateVerifyUrl } from './siteConfig';
 
 export interface CertificatePDFData {
   verification_code: string;
@@ -286,12 +287,8 @@ export async function generateCertificatePDF(cert: CertificatePDFData): Promise<
     }
   }
 
-  // QR Code for instant verification
-  const origin =
-    typeof window !== 'undefined' && window.location?.origin
-      ? window.location.origin
-      : 'https://noorbayan.academy';
-  const verifyUrl = `${origin}/verify?code=${encodeURIComponent(cert.verification_code)}`;
+  // QR Code for instant verification (always resolves to official production domain)
+  const verifyUrl = getCertificateVerifyUrl(cert.verification_code);
   try {
     const qrDataUrl = await QRCode.toDataURL(verifyUrl, {
       width: 240,

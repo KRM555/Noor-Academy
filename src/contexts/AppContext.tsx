@@ -2,7 +2,7 @@ import React, { createContext, useContext, useEffect, useState, useCallback } fr
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import type { AuthUser, Lang, NotificationItem, Theme, UserRole } from '../types';
 import type { DisplayCurrency } from '../lib/currency';
-import { apiFetch, setStoredToken } from '../lib/api';
+import { ApiError, apiFetch, getStoredSessionHint, setStoredSessionHint, setStoredToken } from '../lib/api';
 import { queryKeys } from '../lib/queryClient';
 
 interface ToastMessage {
@@ -46,8 +46,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const saved = localStorage.getItem('nb_currency');
     return saved === 'EGP' || saved === 'SAR' || saved === 'BOTH' ? saved : 'BOTH';
   });
-  const [user, setUser] = useState<AuthUser | null>(null);
-  const [authLoading, setAuthLoading] = useState(true);
+  const [user, setUser] = useState<AuthUser | null>(() => getStoredSessionHint());
+  const [authLoading, setAuthLoading] = useState<boolean>(() => !getStoredSessionHint());
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
   const { data: notifications = [] } = useQuery({
@@ -123,24 +123,45 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [qc, user?.id]);
 
   useEffect(() => {
+    let cancelled = false;
     async function initAuth() {
       try {
         const res = await apiFetch<{ user: AuthUser | null }>('/api/auth/session');
+        if (cancelled) return;
         if (res.user) {
+          setStoredSessionHint(res.user);
           setUser(res.user);
         } else {
           setStoredToken(null);
+          setStoredSessionHint(null);
           setUser(null);
+          qc.removeQueries({ queryKey: ['dashboard'] });
+          qc.removeQueries({ queryKey: ['notifications'] });
+          qc.removeQueries({ queryKey: ['admin'] });
         }
-      } catch {
-        setStoredToken(null);
-        setUser(null);
+      } catch (err) {
+        if (cancelled) return;
+        const isAuthRejection = err instanceof ApiError && (err.status === 401 || err.status === 403);
+        const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+        if (isAuthRejection || !isOffline) {
+          setStoredToken(null);
+          setStoredSessionHint(null);
+          setUser(null);
+          qc.removeQueries({ queryKey: ['dashboard'] });
+          qc.removeQueries({ queryKey: ['notifications'] });
+          qc.removeQueries({ queryKey: ['admin'] });
+        }
       } finally {
-        setAuthLoading(false);
+        if (!cancelled) {
+          setAuthLoading(false);
+        }
       }
     }
     void initAuth();
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+  }, [qc]);
 
   const loginWithCredentials = async (
     email: string,
@@ -158,6 +179,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }),
     });
     setStoredToken(res.token);
+    setStoredSessionHint(res.user);
     setUser(res.user);
     void qc.invalidateQueries({ queryKey: queryKeys.notifications(res.user.id) });
     return res.user;
@@ -166,6 +188,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const setAuthSession = useCallback(
     (token: string, nextUser: AuthUser) => {
       setStoredToken(token);
+      setStoredSessionHint(nextUser);
       setUser(nextUser);
       void qc.invalidateQueries({ queryKey: queryKeys.notifications(nextUser.id) });
     },
@@ -175,6 +198,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const logout = () => {
     void apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
     setStoredToken(null);
+    setStoredSessionHint(null);
     setUser(null);
     try {
       for (let i = localStorage.length - 1; i >= 0; i -= 1) {

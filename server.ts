@@ -7,6 +7,7 @@ import dotenv from 'dotenv';
 import { z } from 'zod';
 import type { ViteDevServer } from 'vite';
 import {
+  getSupabaseAdmin,
   requireSupabaseAdmin,
   createEphemeralSupabaseAnon,
   insertRowSafe,
@@ -17,6 +18,7 @@ import {
   provisionSupabaseAuthUser,
   syncUsersToSupabaseAuth,
   requestSupabasePasswordReset,
+  requestSupabaseSignupConfirmation,
   broadcastRealtimeEvent,
   verifyTurnstileToken,
 } from './server/supabaseClient.ts';
@@ -26,15 +28,18 @@ import {
   getAdmissionMeta,
   listAdmissionMetas,
   deleteAdmissionMeta,
+  deleteAdmissionMetasBatch,
   generateApplicationId,
   saveTeacherApplication,
   getTeacherApplication,
   listTeacherApplications,
   deleteTeacherApplication,
+  deleteTeacherApplicationsBatch,
   saveGuardianRequest,
   getGuardianRequest,
   listGuardianRequests,
   deleteGuardianRequest,
+  deleteGuardianRequestsBatch,
   hashVaultPassword,
   verifyVaultPassword,
   saveGuardianAuth,
@@ -62,10 +67,13 @@ import {
   saveExamSubmission,
   getExamAttempt,
   saveExamAttempt,
+  claimExamAttemptForSubmit,
+  releaseExamAttemptClaim,
   deleteExamSubmissionRecord,
   deleteExamDataForStudent,
   deleteExamVaultData,
   listExamSubmissionsForExam,
+  countExamSubmissionFiles,
   uploadExamBinaryFile,
   createExamSignedUrl,
   removeExamBinaryFile,
@@ -98,6 +106,20 @@ import {
 dotenv.config();
 
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const REQUIRE_EMAIL_VERIFICATION = process.env.REQUIRE_EMAIL_VERIFICATION === 'true';
+const OFFICIAL_SITE_URL = 'https://noorwbayan-academy.com';
+const OFFICIAL_CONTACT_EMAIL = 'care@noorwbayan-academy.com';
+
+function normalizeLegacyDomainText(value: string): string {
+  if (!value) return value;
+  return value
+    .replace(/care@noorbayan\.academy/gi, OFFICIAL_CONTACT_EMAIL)
+    .replace(/noorwbayan558@gmail\.com/gi, OFFICIAL_CONTACT_EMAIL)
+    .replace(/https?:\/\/(?:[a-z0-9-]+\.)?noorwbayan-academy\.up\.railway\.app/gi, OFFICIAL_SITE_URL)
+    .replace(/https?:\/\/(?:www\.)?noorbayan\.academy/gi, OFFICIAL_SITE_URL)
+    .replace(/\b(?:[a-z0-9-]+\.)?noorwbayan-academy\.up\.railway\.app\b/gi, 'noorwbayan-academy.com')
+    .replace(/\b(?:www\.)?noorbayan\.academy\b/gi, 'noorwbayan-academy.com');
+}
 
 if (IS_PRODUCTION && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 24)) {
   throw new Error('FATAL: SESSION_SECRET environment variable (min 24 chars) is required in production.');
@@ -168,7 +190,12 @@ app.use((req, res, next) => {
 
 // Configurable CORS for production custom domains / separated frontends
 const allowedOrigins = new Set(
-  [process.env.CORS_ALLOWED_ORIGINS || '', process.env.APP_URL || '']
+  [
+    OFFICIAL_SITE_URL,
+    'https://www.noorwbayan-academy.com',
+    process.env.CORS_ALLOWED_ORIGINS || '',
+    process.env.APP_URL || '',
+  ]
     .join(',')
     .split(',')
     .map((origin) => origin.trim().replace(/\/+$/, ''))
@@ -199,6 +226,14 @@ function resolveRequestExpectedOrigin(req: Request): string | null {
   const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
   return `${proto}://${host}`;
 }
+
+const AUTH_READONLY_MUTATION_PATHS = new Set([
+  '/auth/login',
+  '/auth/logout',
+  '/auth/google-session',
+  '/auth/forgot-password',
+  '/auth/resend-confirmation',
+]);
 
 app.use('/api', (req, res, next) => {
   if (SAFE_HTTP_METHODS.has(req.method.toUpperCase())) {
@@ -246,6 +281,14 @@ app.use('/api', (req, res, next) => {
       res.status(403).json({ error: 'CSRF validation failed. Please refresh the page and try again.' });
       return;
     }
+  }
+
+  if (!AUTH_READONLY_MUTATION_PATHS.has(req.path)) {
+    res.on('finish', () => {
+      if (res.statusCode < 400) {
+        invalidateDashboardCaches();
+      }
+    });
   }
 
   next();
@@ -321,12 +364,19 @@ app.use((req, res, next) => {
 });
 
 // Lightweight In-Memory Sliding-Window Rate Limiter
-function createRateLimiter(name: string, windowMs: number, maxRequests: number) {
+function createRateLimiter(
+  name: string,
+  windowMs: number,
+  maxRequests: number,
+  keyExtractor?: (req: Request) => string
+) {
   const buckets = new Map<string, number[]>();
   const MAX_BUCKETS = 5000;
   return (req: Request, res: Response, next: NextFunction) => {
-    const ip = req.ip || req.socket.remoteAddress || 'unknown';
-    const key = `${name}:${ip}`;
+    const rawKey = keyExtractor
+      ? keyExtractor(req)
+      : req.ip || req.socket.remoteAddress || 'unknown';
+    const key = `${name}:${rawKey}`;
     const now = Date.now();
     const recent = (buckets.get(key) || []).filter((ts) => now - ts < windowMs);
     if (recent.length >= maxRequests) {
@@ -361,6 +411,33 @@ const verifyLimiter = createRateLimiter('verify', 15 * 60 * 1000, 40);
 const guardianVerifyLimiter = createRateLimiter('guardian-verify', 15 * 60 * 1000, 6);
 const examUploadLimiter = createRateLimiter('exam-upload', 15 * 60 * 1000, 25);
 const communityWriteLimiter = createRateLimiter('community-write', 15 * 60 * 1000, 20);
+const resendConfirmIpLimiter = createRateLimiter('resend-confirm-ip', 15 * 60 * 1000, 15);
+const resendConfirmEmailLimiter = createRateLimiter('resend-confirm-email', 15 * 60 * 1000, 5, (req) => {
+  const rawEmail = typeof (req.body as { email?: unknown } | undefined)?.email === 'string'
+    ? (req.body as { email: string }).email.trim().toLowerCase()
+    : '';
+  return rawEmail || req.ip || req.socket.remoteAddress || 'unknown';
+});
+
+const RESEND_CONFIRM_COOLDOWN_MS = 60_000;
+const resendConfirmationCooldownMap = new Map<string, number>();
+
+async function sendSignupConfirmationIfNeeded(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  profileId: string,
+  email: string,
+  redirectTo: string
+): Promise<{ alreadyConfirmed: boolean; emailSent: boolean }> {
+  const { data: uData } = await sb.auth.admin.getUserById(profileId).catch(() => ({ data: { user: null } }));
+  if (uData?.user?.email_confirmed_at) {
+    return { alreadyConfirmed: true, emailSent: false };
+  }
+  const result = await requestSupabaseSignupConfirmation(email, redirectTo);
+  if (!result.sent && result.reason) {
+    console.warn('[auth] confirmation email delivery warning:', result.reason);
+  }
+  return { alreadyConfirmed: false, emailSent: result.sent };
+}
 
 function generateTempPassword(): string {
   return `NB-${crypto.randomBytes(6).toString('base64url')}`;
@@ -580,36 +657,103 @@ function verifyToken(token: string): { id: string; role: string; guardianId?: nu
   }
 }
 
-const IBAN_AES_KEY = crypto
+const IBAN_LEGACY_AES_KEY = crypto
   .createHash('sha256')
-  .update(process.env.IBAN_ENCRYPTION_KEY?.trim() || `nb-iban:${TOKEN_SECRET}`)
+  .update(`nb-iban:${TOKEN_SECRET}`)
   .digest();
+const IBAN_CURRENT_RAW = process.env.IBAN_ENCRYPTION_KEY?.trim() || '';
+const IBAN_PREVIOUS_RAW = process.env.IBAN_ENCRYPTION_KEY_PREVIOUS?.trim() || '';
+
+const IBAN_AES_KEY = IBAN_CURRENT_RAW
+  ? crypto.createHash('sha256').update(IBAN_CURRENT_RAW).digest()
+  : IBAN_LEGACY_AES_KEY;
+const IBAN_PREVIOUS_AES_KEY = IBAN_PREVIOUS_RAW
+  ? crypto.createHash('sha256').update(IBAN_PREVIOUS_RAW).digest()
+  : null;
+
+function ibanKeyId(key: Buffer): string {
+  return crypto.createHash('sha256').update(key).digest('hex').slice(0, 8);
+}
+
+const IBAN_CURRENT_KEY_ID = ibanKeyId(IBAN_AES_KEY);
+const IBAN_KEY_RING: Array<{ id: string; key: Buffer }> = (() => {
+  const seen = new Set<string>();
+  const ring: Array<{ id: string; key: Buffer }> = [];
+  for (const key of [IBAN_AES_KEY, IBAN_PREVIOUS_AES_KEY, IBAN_LEGACY_AES_KEY]) {
+    if (!key) continue;
+    const id = ibanKeyId(key);
+    if (!seen.has(id)) {
+      seen.add(id);
+      ring.push({ id, key });
+    }
+  }
+  return ring;
+})();
 
 function encryptIban(plainIban: string): string {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', IBAN_AES_KEY, iv);
   const encrypted = Buffer.concat([cipher.update(plainIban, 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return `enc:v1:${iv.toString('hex')}:${tag.toString('hex')}:${encrypted.toString('hex')}`;
+  return `enc:v2:${IBAN_CURRENT_KEY_ID}:${iv.toString('hex')}:${tag.toString('hex')}:${encrypted.toString('hex')}`;
 }
 
-function decryptIban(storedIban: string): string {
-  if (!storedIban || !storedIban.startsWith('enc:v1:')) {
-    return storedIban;
-  }
+function tryDecryptIbanWithKey(key: Buffer, iv: Buffer, tag: Buffer, data: Buffer): string | null {
   try {
-    const parts = storedIban.split(':');
-    if (parts.length !== 5) return storedIban;
-    const [, , ivHex, tagHex, cipherHex] = parts;
-    const iv = Buffer.from(ivHex, 'hex');
-    const tag = Buffer.from(tagHex, 'hex');
-    const data = Buffer.from(cipherHex, 'hex');
-    const decipher = crypto.createDecipheriv('aes-256-gcm', IBAN_AES_KEY, iv);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
     decipher.setAuthTag(tag);
     return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
   } catch {
-    return 'INVALID';
+    return null;
   }
+}
+
+function decryptIban(storedIban: string): string {
+  if (!storedIban) return storedIban;
+
+  if (storedIban.startsWith('enc:v2:')) {
+    try {
+      const parts = storedIban.split(':');
+      if (parts.length !== 6) return 'INVALID';
+      const [, , keyId, ivHex, tagHex, cipherHex] = parts;
+      const iv = Buffer.from(ivHex, 'hex');
+      const tag = Buffer.from(tagHex, 'hex');
+      const data = Buffer.from(cipherHex, 'hex');
+      if (iv.length !== 12 || tag.length !== 16) return 'INVALID';
+
+      const preferred = IBAN_KEY_RING.filter((entry) => entry.id === keyId);
+      const fallback = IBAN_KEY_RING.filter((entry) => entry.id !== keyId);
+      for (const entry of [...preferred, ...fallback]) {
+        const plain = tryDecryptIbanWithKey(entry.key, iv, tag, data);
+        if (plain !== null) return plain;
+      }
+      return 'INVALID';
+    } catch {
+      return 'INVALID';
+    }
+  }
+
+  if (storedIban.startsWith('enc:v1:')) {
+    try {
+      const parts = storedIban.split(':');
+      if (parts.length !== 5) return storedIban;
+      const [, , ivHex, tagHex, cipherHex] = parts;
+      const iv = Buffer.from(ivHex, 'hex');
+      const tag = Buffer.from(tagHex, 'hex');
+      const data = Buffer.from(cipherHex, 'hex');
+      if (iv.length !== 12 || tag.length !== 16) return 'INVALID';
+
+      for (const entry of IBAN_KEY_RING) {
+        const plain = tryDecryptIbanWithKey(entry.key, iv, tag, data);
+        if (plain !== null) return plain;
+      }
+      return 'INVALID';
+    } catch {
+      return 'INVALID';
+    }
+  }
+
+  return storedIban;
 }
 
 function maskIban(iban: string): string {
@@ -650,6 +794,7 @@ async function bumpProfileTokenVersion(
   const current = await getProfileTokenVersion(sb, profileId);
   const next = current + 1;
   tokenVersionFallback.set(profileId, next);
+  invalidateAuthSessionCacheForUser(profileId);
   try {
     await sb.from('profiles').update({ token_version: next }).eq('id', profileId);
   } catch {
@@ -660,7 +805,10 @@ async function bumpProfileTokenVersion(
 
 const ACCOUNT_LOCKOUT_WINDOW_MS = 15 * 60 * 1000;
 const ACCOUNT_LOCKOUT_MAX_ATTEMPTS = 5;
+const EMAIL_FAIL_DELAY_THRESHOLD = 20;
+const EMAIL_FAIL_DELAY_MS = 3000;
 const loginAccountFailures = new Map<string, { count: number; lockedUntil: number; firstAt: number }>();
+const loginEmailFailures = new Map<string, { count: number; firstAt: number; warned: boolean }>();
 
 function checkAccountLockout(key: string): { locked: boolean; retryAfterSec: number } {
   const entry = loginAccountFailures.get(key);
@@ -675,7 +823,18 @@ function checkAccountLockout(key: string): { locked: boolean; retryAfterSec: num
   return { locked: false, retryAfterSec: 0 };
 }
 
-function recordAccountFailure(key: string): void {
+function shouldDelayEmailLogin(emailKey: string): boolean {
+  const entry = loginEmailFailures.get(emailKey);
+  if (!entry) return false;
+  const now = Date.now();
+  if (now - entry.firstAt > ACCOUNT_LOCKOUT_WINDOW_MS) {
+    loginEmailFailures.delete(emailKey);
+    return false;
+  }
+  return entry.count >= EMAIL_FAIL_DELAY_THRESHOLD;
+}
+
+function recordAccountFailure(key: string, emailKey?: string): void {
   const now = Date.now();
   if (loginAccountFailures.size > 5000) {
     for (const [k, v] of loginAccountFailures.entries()) {
@@ -687,15 +846,42 @@ function recordAccountFailure(key: string): void {
   const existing = loginAccountFailures.get(key);
   if (!existing || now - existing.firstAt > ACCOUNT_LOCKOUT_WINDOW_MS) {
     loginAccountFailures.set(key, { count: 1, lockedUntil: 0, firstAt: now });
-    return;
+  } else {
+    const nextCount = existing.count + 1;
+    const lockedUntil = nextCount >= ACCOUNT_LOCKOUT_MAX_ATTEMPTS ? now + ACCOUNT_LOCKOUT_WINDOW_MS : 0;
+    loginAccountFailures.set(key, { count: nextCount, lockedUntil, firstAt: existing.firstAt });
   }
-  const nextCount = existing.count + 1;
-  const lockedUntil = nextCount >= ACCOUNT_LOCKOUT_MAX_ATTEMPTS ? now + ACCOUNT_LOCKOUT_WINDOW_MS : 0;
-  loginAccountFailures.set(key, { count: nextCount, lockedUntil, firstAt: existing.firstAt });
+
+  if (emailKey) {
+    if (loginEmailFailures.size > 5000) {
+      for (const [k, v] of loginEmailFailures.entries()) {
+        if (now - v.firstAt > ACCOUNT_LOCKOUT_WINDOW_MS) {
+          loginEmailFailures.delete(k);
+        }
+      }
+    }
+    const emailEntry = loginEmailFailures.get(emailKey);
+    if (!emailEntry || now - emailEntry.firstAt > ACCOUNT_LOCKOUT_WINDOW_MS) {
+      loginEmailFailures.set(emailKey, { count: 1, firstAt: now, warned: false });
+    } else {
+      const nextCount = emailEntry.count + 1;
+      let warned = emailEntry.warned;
+      if (nextCount >= EMAIL_FAIL_DELAY_THRESHOLD && !warned) {
+        warned = true;
+        console.warn(
+          `[auth-lockout] ${nextCount} failed login attempts across IPs in 15m for ${maskEmail(emailKey)}; applying ${EMAIL_FAIL_DELAY_MS}ms delay without hard lock.`
+        );
+      }
+      loginEmailFailures.set(emailKey, { count: nextCount, firstAt: emailEntry.firstAt, warned });
+    }
+  }
 }
 
-function clearAccountFailure(key: string): void {
+function clearAccountFailure(key: string, emailKey?: string): void {
   loginAccountFailures.delete(key);
+  if (emailKey) {
+    loginEmailFailures.delete(emailKey);
+  }
 }
 
 async function insertConsentSafe(
@@ -724,12 +910,79 @@ async function insertConsentSafe(
   });
 }
 
+const REAUTH_WINDOW_MS = 15 * 60 * 1000;
+const REAUTH_MAX_ATTEMPTS = 5;
+const GOOGLE_REAUTH_MAX_AGE_MS = 3 * 60 * 1000;
+const reauthFailedAttempts = new Map<string, { count: number; resetAt: number }>();
+
+function isAdminReauthRateLimited(adminId: string): boolean {
+  const rec = reauthFailedAttempts.get(adminId);
+  if (!rec) return false;
+  if (Date.now() > rec.resetAt) {
+    reauthFailedAttempts.delete(adminId);
+    return false;
+  }
+  return rec.count >= REAUTH_MAX_ATTEMPTS;
+}
+
+function recordAdminReauthFailure(adminId: string): void {
+  const now = Date.now();
+  const existing = reauthFailedAttempts.get(adminId);
+  if (!existing || now > existing.resetAt) {
+    reauthFailedAttempts.set(adminId, { count: 1, resetAt: now + REAUTH_WINDOW_MS });
+  } else {
+    existing.count += 1;
+  }
+}
+
+function clearAdminReauthFailures(adminId: string): void {
+  reauthFailedAttempts.delete(adminId);
+}
+
+/**
+ * Inspects Supabase JWT `amr` (Authentication Methods References) claim AFTER the token
+ * has already been verified by `sb.auth.getUser(token)`. Returns the most recent
+ * interactive authentication timestamp (never `iat` from a silent refresh).
+ */
+function parseJwtInteractiveAuthMs(verifiedJwt: string): number | null {
+  try {
+    const parts = verifiedJwt.split('.');
+    if (parts.length < 2) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as {
+      amr?: Array<{ method?: string; timestamp?: number }>;
+    };
+    if (!Array.isArray(payload.amr)) return null;
+    let latestMs: number | null = null;
+    for (const entry of payload.amr) {
+      if (!entry || typeof entry.timestamp !== 'number') continue;
+      const method = String(entry.method || '').toLowerCase();
+      if (method === 'token_refresh') continue;
+      const tsMs = entry.timestamp > 1e12 ? entry.timestamp : entry.timestamp * 1000;
+      if (Number.isFinite(tsMs) && (latestMs === null || tsMs > latestMs)) {
+        latestMs = tsMs;
+      }
+    }
+    return latestMs;
+  } catch {
+    return null;
+  }
+}
+
 async function verifyAdminReauth(
   sb: ReturnType<typeof requireSupabaseAdmin>,
   adminUser: AuthUser,
   confirmPassword?: string,
-  confirmAction?: boolean
+  confirmGoogleToken?: string
 ): Promise<{ ok: boolean; status?: number; error?: string; code?: string }> {
+  if (isAdminReauthRateLimited(adminUser.id)) {
+    return {
+      ok: false,
+      status: 429,
+      error: 'Too many failed verification attempts. Please wait 15 minutes before trying again.',
+      code: 'REAUTH_RATE_LIMITED',
+    };
+  }
+
   const { data: uData } = await sb.auth.admin.getUserById(adminUser.id).catch(() => ({ data: { user: null } }));
   const authUserObj = uData?.user;
   const appProviders = Array.isArray(authUserObj?.app_metadata?.providers)
@@ -745,16 +998,72 @@ async function verifyAdminReauth(
     if (confirmPassword && confirmPassword.trim().length > 0) {
       const anon = createEphemeralSupabaseAnon();
       const { error } = await anon.auth.signInWithPassword({ email: adminUser.email, password: confirmPassword });
-      if (!error) return { ok: true };
+      if (!error) {
+        clearAdminReauthFailures(adminUser.id);
+        return { ok: true };
+      }
+      recordAdminReauthFailure(adminUser.id);
+      return {
+        ok: false,
+        status: 401,
+        error: 'Administrator password confirmation failed.',
+        code: 'REAUTH_INVALID_PASSWORD',
+      };
     }
-    if (confirmAction === true) {
+
+    if (confirmGoogleToken && confirmGoogleToken.trim().length > 0) {
+      const verified = await verifyVerifiedGoogleToken(sb, confirmGoogleToken.trim());
+      if (!verified) {
+        recordAdminReauthFailure(adminUser.id);
+        return {
+          ok: false,
+          status: 401,
+          error: 'Invalid or unverified Google re-authentication token.',
+          code: 'REAUTH_GOOGLE_INVALID',
+        };
+      }
+
+      const expectedEmail = adminUser.email.trim().toLowerCase();
+      if (verified.user.id !== adminUser.id || verified.email !== expectedEmail) {
+        recordAdminReauthFailure(adminUser.id);
+        return {
+          ok: false,
+          status: 403,
+          error: 'Google verification must match the currently signed-in administrator account.',
+          code: 'REAUTH_GOOGLE_MISMATCH',
+        };
+      }
+
+      const lastSignInMs = verified.user.last_sign_in_at ? Date.parse(verified.user.last_sign_in_at) : NaN;
+      const amrAuthMs = parseJwtInteractiveAuthMs(confirmGoogleToken.trim());
+      const now = Date.now();
+      const isLastSignInFresh =
+        Number.isFinite(lastSignInMs) &&
+        lastSignInMs <= now + 60_000 &&
+        now - lastSignInMs <= GOOGLE_REAUTH_MAX_AGE_MS;
+      const isAmrFresh =
+        amrAuthMs === null ||
+        (amrAuthMs <= now + 60_000 && now - amrAuthMs <= GOOGLE_REAUTH_MAX_AGE_MS);
+
+      if (!isLastSignInFresh || !isAmrFresh) {
+        recordAdminReauthFailure(adminUser.id);
+        return {
+          ok: false,
+          status: 401,
+          error: 'Google sign-in confirmation has expired (older than 3 minutes). Please sign in with Google again.',
+          code: 'REAUTH_GOOGLE_STALE',
+        };
+      }
+
+      clearAdminReauthFailures(adminUser.id);
       return { ok: true };
     }
+
     return {
       ok: false,
       status: 401,
-      error: 'Explicit administrator confirmation is required for this sensitive action.',
-      code: 'REAUTH_CONFIRM_REQUIRED',
+      error: 'Fresh Google sign-in confirmation (within 3 minutes) is required for this sensitive action.',
+      code: 'REAUTH_GOOGLE_REQUIRED',
     };
   }
 
@@ -773,6 +1082,7 @@ async function verifyAdminReauth(
     password: confirmPassword,
   });
   if (verifyErr) {
+    recordAdminReauthFailure(adminUser.id);
     return {
       ok: false,
       status: 401,
@@ -780,7 +1090,116 @@ async function verifyAdminReauth(
       code: 'REAUTH_INVALID_PASSWORD',
     };
   }
+  clearAdminReauthFailures(adminUser.id);
   return { ok: true };
+}
+
+function maskEmail(rawEmail: string | null | undefined): string | null {
+  const email = String(rawEmail || '').trim().toLowerCase();
+  if (!email) return null;
+  const atIndex = email.indexOf('@');
+  if (atIndex <= 0) return '***';
+  const local = email.slice(0, atIndex);
+  const domain = email.slice(atIndex + 1);
+  if (local.length <= 2) return `${local[0] || '*'}***@${domain}`;
+  return `${local.slice(0, 2)}***@${domain}`;
+}
+
+function getAuditLogRetentionMonths(): number {
+  const parsed = Number(process.env.AUDIT_LOG_RETENTION_MONTHS || 24);
+  if (!Number.isFinite(parsed) || parsed < 1) return 24;
+  return Math.min(Math.floor(parsed), 120);
+}
+
+async function cleanupExpiredAuditLogs(): Promise<void> {
+  try {
+    const sb = getSupabaseAdmin();
+    if (!sb) return;
+    const retentionMonths = getAuditLogRetentionMonths();
+    const cutoff = new Date();
+    cutoff.setUTCMonth(cutoff.getUTCMonth() - retentionMonths);
+    const cutoffIso = cutoff.toISOString();
+    const { error } = await sb.from('audit_logs').delete().lt('created_at', cutoffIso);
+    if (error) {
+      console.warn('[audit_log] retention cleanup warning:', error.message);
+    }
+  } catch (err) {
+    console.warn('[audit_log] retention cleanup error:', err instanceof Error ? err.message : err);
+  }
+}
+
+const AUDIT_PII_KEYS = ['email', 'name_ar', 'full_name_ar', 'student_name', 'student_email'] as const;
+
+function auditActorName(user: { id: string; role?: string | null; full_name?: string | null }): string {
+  const role = String(user.role || '').toLowerCase();
+  if (role === 'student' || role === 'guardian') {
+    const shortId = String(user.id || '').slice(0, 8) || 'unknown';
+    return `${role}#${shortId}`;
+  }
+  return String(user.full_name || '').trim() || `${role || 'user'}#${String(user.id || '').slice(0, 8)}`;
+}
+
+async function anonymizeAuditSubject(params: {
+  profileId?: string | null;
+  entityType?: string;
+  entityId?: string | number | null;
+}): Promise<void> {
+  try {
+    const sb = getSupabaseAdmin();
+    if (!sb) return;
+    const { profileId, entityType, entityId } = params;
+
+    if (profileId) {
+      const { error: actorErr } = await sb
+        .from('audit_logs')
+        .update({ actor_name: 'deleted-user' })
+        .eq('actor_id', profileId);
+      if (actorErr) {
+        console.warn('[audit_log] anonymize actor_name warning:', actorErr.message);
+      }
+    }
+
+    if (entityType && entityId !== undefined && entityId !== null && String(entityId).length > 0) {
+      const { data: rows, error: selErr } = await sb
+        .from('audit_logs')
+        .select('id, details_json')
+        .eq('entity_type', entityType)
+        .eq('entity_id', String(entityId));
+      if (selErr) {
+        console.warn('[audit_log] anonymize select details warning:', selErr.message);
+        return;
+      }
+      const updates: PromiseLike<unknown>[] = [];
+      for (const row of (rows || []) as Array<{ id: number; details_json?: Record<string, unknown> | null }>) {
+        const details = row.details_json;
+        if (!details || typeof details !== 'object' || Array.isArray(details)) continue;
+        let changed = false;
+        const cleaned: Record<string, unknown> = { ...details };
+        for (const key of AUDIT_PII_KEYS) {
+          if (Object.prototype.hasOwnProperty.call(cleaned, key)) {
+            delete cleaned[key];
+            changed = true;
+          }
+        }
+        if (changed) {
+          updates.push(
+            sb
+              .from('audit_logs')
+              .update({ details_json: cleaned })
+              .eq('id', row.id)
+              .then(({ error }) => {
+                if (error) console.warn(`[audit_log] anonymize row ${row.id} warning:`, error.message);
+              })
+          );
+        }
+      }
+      if (updates.length) {
+        await Promise.allSettled(updates);
+      }
+    }
+  } catch (err) {
+    console.warn('[audit_log] anonymizeAuditSubject warning:', err instanceof Error ? err.message : err);
+  }
 }
 
 async function writeAuditLog(
@@ -907,6 +1326,83 @@ async function findGuardianForUser(
   return (data as { id: number; profile_id: string | null; full_name: string; phone: string; email: string; relation: string } | null) || null;
 }
 
+const AUTH_SESSION_CACHE_TTL_MS = 60_000;
+const AUTH_SESSION_CACHE_MAX_ENTRIES = 5000;
+const authSessionCache = new Map<string, { user: AuthUser | null; userId: string; expiresAt: number }>();
+const authSessionInFlight = new Map<string, Promise<AuthUser | null>>();
+
+function getAuthSessionCacheKey(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function invalidateAuthSessionCacheForToken(token: string | null | undefined): void {
+  if (!token) return;
+  const key = getAuthSessionCacheKey(token);
+  authSessionCache.delete(key);
+  authSessionInFlight.delete(key);
+}
+
+function invalidateAuthSessionCacheForUser(userId: string | null | undefined): void {
+  if (!userId) return;
+  const target = String(userId);
+  for (const [key, entry] of authSessionCache.entries()) {
+    if (entry.userId === target) {
+      authSessionCache.delete(key);
+    }
+  }
+}
+
+async function resolveVerifiedAuthUserCached(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  token: string,
+  decoded: { id: string; role: string; guardianId?: number; tv?: number; exp: number }
+): Promise<AuthUser | null> {
+  const now = Date.now();
+  const key = getAuthSessionCacheKey(token);
+  const cached = authSessionCache.get(key);
+  if (cached && now < cached.expiresAt) {
+    return cached.user;
+  }
+  if (cached) {
+    authSessionCache.delete(key);
+  }
+
+  const existingFlight = authSessionInFlight.get(key);
+  if (existingFlight) {
+    return existingFlight;
+  }
+
+  const lookupPromise = resolveSessionAuthUser(sb, decoded)
+    .then((resolved) => {
+      const doneNow = Date.now();
+      if (authSessionCache.size > AUTH_SESSION_CACHE_MAX_ENTRIES) {
+        for (const [k, v] of authSessionCache.entries()) {
+          if (v.expiresAt <= doneNow) authSessionCache.delete(k);
+        }
+        while (authSessionCache.size > AUTH_SESSION_CACHE_MAX_ENTRIES) {
+          const oldest = authSessionCache.keys().next().value;
+          if (oldest === undefined) break;
+          authSessionCache.delete(oldest);
+        }
+      }
+      const expiresAt = Math.min(doneNow + AUTH_SESSION_CACHE_TTL_MS, decoded.exp);
+      if (expiresAt > doneNow) {
+        authSessionCache.set(key, {
+          user: resolved,
+          userId: String(decoded.id),
+          expiresAt,
+        });
+      }
+      return resolved;
+    })
+    .finally(() => {
+      authSessionInFlight.delete(key);
+    });
+
+  authSessionInFlight.set(key, lookupPromise);
+  return lookupPromise;
+}
+
 const authenticate = asyncHandler<AuthRequest>(async (req, res, next) => {
   const token = extractRequestToken(req);
   if (!token) {
@@ -915,12 +1411,13 @@ const authenticate = asyncHandler<AuthRequest>(async (req, res, next) => {
   }
   const decoded = verifyToken(token);
   if (!decoded) {
+    invalidateAuthSessionCacheForToken(token);
     res.status(401).json({ error: 'Invalid or expired session' });
     return;
   }
 
   const sb = requireSupabaseAdmin();
-  const user = await resolveSessionAuthUser(sb, decoded);
+  const user = await resolveVerifiedAuthUserCached(sb, token, decoded);
   if (!user) {
     res.status(403).json({ error: 'Account inactive or not found' });
     return;
@@ -948,9 +1445,12 @@ async function tryAuthenticateOptional(req: Request): Promise<AuthUser | null> {
     const token = extractRequestToken(req);
     if (!token) return null;
     const decoded = verifyToken(token);
-    if (!decoded) return null;
+    if (!decoded) {
+      invalidateAuthSessionCacheForToken(token);
+      return null;
+    }
     const sb = requireSupabaseAdmin();
-    return await resolveSessionAuthUser(sb, decoded);
+    return await resolveVerifiedAuthUserCached(sb, token, decoded);
   } catch {
     return null;
   }
@@ -1068,13 +1568,51 @@ app.get('/api/health', asyncHandler(async (req, res) => {
 // ============================================================================
 // PUBLIC ROUTES (No Auth Required)
 // ============================================================================
+const DASHBOARD_CACHE_TTL_MS = 30_000;
+const ROLE_DASHBOARD_CACHE_MAX_ENTRIES = 2000;
 let overviewCache: { payload: unknown; expiresAt: number } | null = null;
 const courseDetailCache = new Map<number, { payload: unknown; expiresAt: number }>();
 const teacherDetailCache = new Map<number, { payload: unknown; expiresAt: number }>();
+let adminDashboardSummaryCache: { payload: unknown; expiresAt: number } | null = null;
+let adminDashboardSummaryInFlight: Promise<unknown> | null = null;
+const roleDashboardCache = new Map<string, { payload: unknown; expiresAt: number }>();
+
+function getCachedRoleDashboard<T>(key: string): T | null {
+  const entry = roleDashboardCache.get(key);
+  if (!entry) return null;
+  if (Date.now() < entry.expiresAt) {
+    return entry.payload as T;
+  }
+  roleDashboardCache.delete(key);
+  return null;
+}
+
+function setCachedRoleDashboard(key: string, payload: unknown): void {
+  const now = Date.now();
+  if (roleDashboardCache.size > ROLE_DASHBOARD_CACHE_MAX_ENTRIES) {
+    for (const [k, v] of roleDashboardCache.entries()) {
+      if (v.expiresAt <= now) roleDashboardCache.delete(k);
+    }
+    while (roleDashboardCache.size > ROLE_DASHBOARD_CACHE_MAX_ENTRIES) {
+      const oldest = roleDashboardCache.keys().next().value;
+      if (oldest === undefined) break;
+      roleDashboardCache.delete(oldest);
+    }
+  }
+  roleDashboardCache.set(key, { payload, expiresAt: now + DASHBOARD_CACHE_TTL_MS });
+}
+
+function invalidateDashboardCaches(): void {
+  adminDashboardSummaryCache = null;
+  adminDashboardSummaryInFlight = null;
+  roleDashboardCache.clear();
+}
+
 function invalidateOverviewCache(): void {
   overviewCache = null;
   courseDetailCache.clear();
   teacherDetailCache.clear();
+  invalidateDashboardCaches();
 }
 
 app.get('/api/public/overview', asyncHandler(async (_req, res) => {
@@ -1170,7 +1708,11 @@ app.get('/api/public/overview', asyncHandler(async (_req, res) => {
     levels: levelsRes.data || [],
     games: gamesRes.data || [],
     testimonials: [],
-    legal: legalRes.data || [],
+    legal: (legalRes.data || []).map((doc: Record<string, unknown>) => ({
+      ...doc,
+      content_ar: normalizeLegacyDomainText(String(doc.content_ar || '')),
+      content_en: normalizeLegacyDomainText(String(doc.content_en || '')),
+    })),
   };
   overviewCache = { payload, expiresAt: Date.now() + 60_000 };
   res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
@@ -1669,14 +2211,19 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
   }
 
   const cleanEmail = email.trim().toLowerCase();
-  const lockoutKey = `${portalRole || 'any'}:${cleanEmail}`;
+  const clientIp = String(req.ip || 'unknown');
+  const lockoutKey = `${portalRole || 'any'}:${cleanEmail}:${clientIp}`;
   const lockStatus = checkAccountLockout(lockoutKey);
   if (lockStatus.locked) {
+    res.setHeader('Retry-After', String(lockStatus.retryAfterSec));
     res.status(429).json({
       error: `Too many failed sign-in attempts for this account. Please wait ${Math.ceil(lockStatus.retryAfterSec / 60)} minutes or reset your password.`,
       code: 'ACCOUNT_LOCKED',
     });
     return;
+  }
+  if (shouldDelayEmailLogin(cleanEmail)) {
+    await new Promise((resolve) => setTimeout(resolve, EMAIL_FAIL_DELAY_MS));
   }
 
   if (portalRole === 'guardian') {
@@ -1730,6 +2277,16 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
         res.status(403).json({ error: 'Linked academy account is pending or disabled.' });
         return;
       }
+      if (REQUIRE_EMAIL_VERIFICATION) {
+        const { data: uData } = await sb.auth.admin.getUserById(linkedProfile.id).catch(() => ({ data: { user: null } }));
+        if (!uData?.user?.email_confirmed_at) {
+          res.status(403).json({
+            code: 'EMAIL_NOT_CONFIRMED',
+            error: 'يرجى تأكيد بريدك الإلكتروني عبر رابط التفعيل المرسل إلى بريدك قبل تسجيل الدخول. / Please confirm your email address via the verification link sent to your inbox before signing in.',
+          });
+          return;
+        }
+      }
       profile = {
         id: linkedProfile.id,
         email: matchedVault.guardian.email || linkedProfile.email,
@@ -1750,7 +2307,7 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
         .maybeSingle();
 
       if (!profileRow || profileRow.role !== 'guardian') {
-        recordAccountFailure(lockoutKey);
+        recordAccountFailure(lockoutKey, cleanEmail);
         res.status(401).json({ error: 'Invalid credentials' });
         return;
       }
@@ -1761,13 +2318,33 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
         password,
       });
       if (authErr) {
-        recordAccountFailure(lockoutKey);
+        const errMsg = String(authErr.message || '');
+        const errCode = String((authErr as { code?: string }).code || '').toLowerCase();
+        const isEmailNotConfirmed = errCode === 'email_not_confirmed' || /email not confirmed/i.test(errMsg);
+        if (REQUIRE_EMAIL_VERIFICATION && isEmailNotConfirmed) {
+          if (!profileRow.is_active) {
+            const { data: linked } = await sb.from('guardians').select('id').eq('profile_id', profileRow.id).maybeSingle();
+            if (!linked) {
+              res.status(403).json({
+                error: 'Your application is pending administrator approval. Please wait until your account is activated.',
+                code: 'APPLICATION_PENDING',
+              });
+              return;
+            }
+          }
+          res.status(403).json({
+            code: 'EMAIL_NOT_CONFIRMED',
+            error: 'يرجى تأكيد بريدك الإلكتروني عبر رابط التفعيل المرسل إلى بريدك قبل تسجيل الدخول. / Please confirm your email address via the verification link sent to your inbox before signing in.',
+          });
+          return;
+        }
+        recordAccountFailure(lockoutKey, cleanEmail);
         res.status(401).json({ error: 'Invalid credentials' });
         return;
       }
       profile = profileRow as AuthUser;
     } else {
-      recordAccountFailure(lockoutKey);
+      recordAccountFailure(lockoutKey, cleanEmail);
       res.status(401).json({ error: 'Invalid credentials' });
       return;
     }
@@ -1780,7 +2357,7 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
       .maybeSingle();
 
     if (!profileRow) {
-      recordAccountFailure(lockoutKey);
+      recordAccountFailure(lockoutKey, cleanEmail);
       res.status(401).json({ error: 'Invalid credentials' });
       return;
     }
@@ -1801,12 +2378,37 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
     if (authErr) {
       const errMsg = String(authErr.message || '');
       const errStatus = Number((authErr as { status?: number }).status || 0);
+      const errCode = String((authErr as { code?: string }).code || '').toLowerCase();
       console.warn('[auth-login] signInWithPassword failed:', {
         email: profileRow.email,
         status: errStatus,
-        code: (authErr as { code?: string }).code,
+        code: errCode || undefined,
         message: errMsg,
       });
+
+      const isEmailNotConfirmed = errCode === 'email_not_confirmed' || /email not confirmed/i.test(errMsg);
+      if (REQUIRE_EMAIL_VERIFICATION && isEmailNotConfirmed) {
+        if (
+          !profileRow.is_active &&
+          (profileRow.role === 'student' || profileRow.role === 'teacher' || profileRow.role === 'guardian')
+        ) {
+          const table =
+            profileRow.role === 'student' ? 'students' : profileRow.role === 'teacher' ? 'teachers' : 'guardians';
+          const { data: linked } = await sb.from(table).select('id').eq('profile_id', profileRow.id).maybeSingle();
+          if (!linked) {
+            res.status(403).json({
+              error: 'Your application is pending administrator approval. Please wait until your account is activated.',
+              code: 'APPLICATION_PENDING',
+            });
+            return;
+          }
+        }
+        res.status(403).json({
+          code: 'EMAIL_NOT_CONFIRMED',
+          error: 'يرجى تأكيد بريدك الإلكتروني عبر رابط التفعيل المرسل إلى بريدك قبل تسجيل الدخول. / Please confirm your email address via the verification link sent to your inbox before signing in.',
+        });
+        return;
+      }
 
       if (/invalid api key|no api key/i.test(errMsg) || errStatus >= 500) {
         sendInternalError(res, 'auth-login-supabase-config', authErr, 'Authentication service configuration error');
@@ -1837,7 +2439,7 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
         });
         return;
       }
-      recordAccountFailure(lockoutKey);
+      recordAccountFailure(lockoutKey, cleanEmail);
       res.status(401).json({ error: 'Invalid credentials' });
       return;
     }
@@ -1845,7 +2447,7 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
   }
 
   if (!profile) {
-    recordAccountFailure(lockoutKey);
+    recordAccountFailure(lockoutKey, cleanEmail);
     res.status(401).json({ error: 'Invalid credentials' });
     return;
   }
@@ -1867,7 +2469,7 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
     return;
   }
 
-  clearAccountFailure(lockoutKey);
+  clearAccountFailure(lockoutKey, cleanEmail);
   const tv = await getProfileTokenVersion(sb, profile.id);
   const token = signToken({
     id: profile.id,
@@ -1893,6 +2495,7 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
 app.post('/api/auth/logout', (req, res) => {
   const token = extractRequestToken(req);
   if (token) {
+    invalidateAuthSessionCacheForToken(token);
     const decoded = verifyToken(token);
     if (decoded?.jti) {
       revokeTokenJti(decoded.jti, decoded.exp);
@@ -1905,12 +2508,13 @@ app.post('/api/auth/logout', (req, res) => {
 app.get('/api/auth/session', asyncHandler(async (req, res) => {
   const token = extractRequestToken(req);
   const decoded = token ? verifyToken(token) : null;
-  if (!decoded) {
+  if (!decoded || !token) {
+    if (token) invalidateAuthSessionCacheForToken(token);
     res.json({ user: null });
     return;
   }
   const sb = requireSupabaseAdmin();
-  const resolved = await resolveSessionAuthUser(sb, decoded);
+  const resolved = await resolveVerifiedAuthUserCached(sb, token, decoded);
   if (!resolved) {
     clearSessionCookie(req, res);
     res.json({ user: null });
@@ -1967,7 +2571,7 @@ app.post('/api/auth/change-password', authenticate, asyncHandler<AuthRequest>(as
         exp: Date.now() + SESSION_TTL_MS,
       });
       setSessionCookie(req, res, freshToken);
-      await writeAuditLog(req.user!.id, req.user!.full_name, 'CHANGE_PASSWORD', 'guardian', req.user!.guardian_id, {});
+      await writeAuditLog(req.user!.id, auditActorName(req.user!), 'CHANGE_PASSWORD', 'guardian', req.user!.guardian_id, {});
       res.json({ ok: true, token: freshToken });
       return;
     }
@@ -1999,7 +2603,7 @@ app.post('/api/auth/change-password', authenticate, asyncHandler<AuthRequest>(as
     exp: Date.now() + SESSION_TTL_MS,
   });
   setSessionCookie(req, res, freshToken);
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'CHANGE_PASSWORD', 'profile', req.user!.id, {});
+  await writeAuditLog(req.user!.id, auditActorName(req.user!), 'CHANGE_PASSWORD', 'profile', req.user!.id, {});
   res.json({ ok: true, token: freshToken });
 }));
 
@@ -2036,6 +2640,61 @@ app.post('/api/auth/forgot-password', loginLimiter, asyncHandler(async (req, res
   });
 }));
 
+app.post('/api/auth/resend-confirmation', resendConfirmIpLimiter, resendConfirmEmailLimiter, asyncHandler(async (req, res) => {
+  const schema = z.object({
+    email: z.string().trim().email().max(160),
+    turnstileToken: z.string().max(4096).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Valid email is required.' });
+    return;
+  }
+
+  const captchaCheck = await verifyTurnstileToken(parsed.data.turnstileToken, req.ip);
+  if (!captchaCheck.ok) {
+    res.status(400).json({ error: captchaCheck.reason || 'CAPTCHA verification failed.' });
+    return;
+  }
+
+  const cleanEmail = parsed.data.email.toLowerCase();
+  const now = Date.now();
+  for (const [k, ts] of resendConfirmationCooldownMap.entries()) {
+    if (now - ts >= RESEND_CONFIRM_COOLDOWN_MS) resendConfirmationCooldownMap.delete(k);
+  }
+  while (resendConfirmationCooldownMap.size > 5000) {
+    const oldest = resendConfirmationCooldownMap.keys().next().value;
+    if (oldest === undefined) break;
+    resendConfirmationCooldownMap.delete(oldest);
+  }
+
+  const lastSentAt = resendConfirmationCooldownMap.get(cleanEmail) || 0;
+  const withinCooldown = now - lastSentAt < RESEND_CONFIRM_COOLDOWN_MS;
+
+  if (!withinCooldown) {
+    resendConfirmationCooldownMap.set(cleanEmail, now);
+    if (REQUIRE_EMAIL_VERIFICATION) {
+      const sb = requireSupabaseAdmin();
+      const { data: profileRow } = await sb
+        .from('profiles')
+        .select('id, email, is_active')
+        .eq('email', cleanEmail)
+        .is('deleted_at', null)
+        .maybeSingle();
+
+      if (profileRow && profileRow.is_active) {
+        const redirectTo = `${resolvePublicBaseUrl(req)}/login?confirmed=1`;
+        await sendSignupConfirmationIfNeeded(sb, profileRow.id, profileRow.email, redirectTo);
+      }
+    }
+  }
+
+  res.json({
+    ok: true,
+    message: 'إذا كان البريد مسجلاً ومفعّلاً ولم يتم تأكيده بعد، فسيتم إرسال رابط التفعيل قريباً. / If this approved account still requires email confirmation, a verification link has been sent.',
+  });
+}));
+
 app.post('/api/auth/complete-password-reset', loginLimiter, asyncHandler(async (req, res) => {
   const schema = z.object({
     access_token: z.string().min(20).max(8192),
@@ -2056,7 +2715,7 @@ app.post('/api/auth/complete-password-reset', loginLimiter, asyncHandler(async (
 
   const { data: profile } = await sb
     .from('profiles')
-    .select('id, email, full_name, is_active')
+    .select('id, email, full_name, role, is_active')
     .eq('id', authData.user.id)
     .is('deleted_at', null)
     .maybeSingle();
@@ -2075,8 +2734,8 @@ app.post('/api/auth/complete-password-reset', loginLimiter, asyncHandler(async (
   }
 
   await bumpProfileTokenVersion(sb, profile.id);
-  await writeAuditLog(profile.id, profile.full_name, 'PASSWORD_RESET_COMPLETED', 'profile', profile.id, {
-    email: profile.email,
+  await writeAuditLog(profile.id, auditActorName(profile), 'PASSWORD_RESET_COMPLETED', 'profile', profile.id, {
+    masked_email: maskEmail(profile.email),
   });
   res.json({ ok: true, email: profile.email });
 }));
@@ -2291,12 +2950,19 @@ app.post('/api/auth/register-guardian', guardianVerifyLimiter, asyncHandler(asyn
     throw err;
   }
 
-  await writeAuditLog(userId, parsed.data.full_name, 'REGISTER_GUARDIAN_REQUEST', 'guardian', guardianRecord.id, {
-    request_id: reqId,
-    student_id: studentRow.id,
-    student_code: studentRow.student_code,
-    shared_student_email: sharedStudentEmail,
-  });
+  await writeAuditLog(
+    userId,
+    auditActorName({ id: userId, role: 'guardian', full_name: parsed.data.full_name }),
+    'REGISTER_GUARDIAN_REQUEST',
+    'guardian',
+    guardianRecord.id,
+    {
+      request_id: reqId,
+      student_id: studentRow.id,
+      student_code: studentRow.student_code,
+      shared_student_email: sharedStudentEmail,
+    }
+  );
   void broadcastRealtimeEvent('admission:created', { kind: 'guardian_request' });
 
   res.status(201).json({
@@ -2538,8 +3204,8 @@ app.post('/api/auth/google', loginLimiter, asyncHandler(async (req, res) => {
   const token = signToken({ id: profile.id, role: profile.role, tv, exp: Date.now() + SESSION_TTL_MS });
   setSessionCookie(req, res, token);
 
-  await writeAuditLog(profile.id, profile.full_name, 'LOGIN_GOOGLE_OAUTH', 'profile', profile.id, {
-    email: cleanEmail,
+  await writeAuditLog(profile.id, auditActorName(profile), 'LOGIN_GOOGLE_OAUTH', 'profile', profile.id, {
+    masked_email: maskEmail(cleanEmail),
     role: profile.role,
   });
 
@@ -2577,6 +3243,13 @@ app.post('/api/notifications/read-all', authenticate, asyncHandler<AuthRequest>(
 // STUDENT ROUTES (Strictly scoped to logged-in student)
 // ============================================================================
 app.get('/api/student/dashboard', authenticate, requireRole('student'), asyncHandler<AuthRequest>(async (req, res) => {
+  const cacheKey = `student:${req.user!.id}`;
+  const cachedPayload = getCachedRoleDashboard<Record<string, unknown>>(cacheKey);
+  if (cachedPayload) {
+    res.json(cachedPayload);
+    return;
+  }
+
   const sb = requireSupabaseAdmin();
   const { data: studentRow } = await sb
     .from('students')
@@ -2712,9 +3385,6 @@ app.get('/api/student/dashboard', authenticate, requireRole('student'), asyncHan
     .filter((l) => l.is_published);
 
   const lessonIds = lessons.map((l) => l.id);
-  const lessonLinks = lessonIds.length
-    ? (await sb.from('lesson_links').select('*').in('lesson_id', lessonIds)).data || []
-    : [];
 
   const attendance = (attendanceRes.data || [])
     .map((a: Record<string, unknown>) => {
@@ -2797,57 +3467,63 @@ app.get('/api/student/dashboard', authenticate, requireRole('student'), asyncHan
     resultByExamId.set(Number((er as Record<string, unknown>).exam_id), er as Record<string, unknown>);
   }
 
-  const exams = await Promise.all(
-    (courseExamsRes.data || []).map(async (ex: Record<string, unknown>) => {
-      const c = ex.courses as { title_ar?: string; title_en?: string } | null;
-      const { courses: _c, ...rest } = ex;
-      const eid = Number(rest.id);
-      const [cfg, sub, attempt] = await Promise.all([
-        getExamVaultConfig(sb, eid),
-        getExamSubmission(sb, eid, student.id),
-        getExamAttempt(sb, eid, student.id),
-      ]);
-      const resultRow = resultByExamId.get(eid) || null;
-      const hasSubmittedOrGraded = Boolean(sub || resultRow);
-      const canRevealAnswers = Boolean(hasSubmittedOrGraded && cfg.show_answers_after_submit);
-      const nowMs = Date.now();
-      const limitMin = Number(cfg.time_limit_minutes || 0);
-      const remainingSeconds =
-        attempt && limitMin > 0
-          ? Math.max(0, Math.floor((new Date(attempt.expires_at).getTime() - nowMs) / 1000))
-          : limitMin > 0
-          ? limitMin * 60
-          : null;
-      const isExpired = Boolean(attempt && limitMin > 0 && new Date(attempt.expires_at).getTime() <= nowMs);
-      return {
-        ...rest,
-        id: eid,
-        course_title_ar: c?.title_ar ?? null,
-        course_title_en: c?.title_en ?? null,
-        ...sanitizeExamConfigForViewer(cfg, { isPrivileged: false, canRevealAnswers }),
-        attempt: attempt
-          ? {
-              started_at: attempt.started_at,
-              expires_at: attempt.expires_at,
-              remaining_seconds: remainingSeconds,
-              is_expired: isExpired,
-            }
-          : null,
-        server_now: new Date(nowMs).toISOString(),
-        submission: sanitizeSubmissionForViewer(sub),
-        result: resultRow
-          ? {
-              score: resultRow.score,
-              feedback_ar: resultRow.feedback_ar,
-              feedback_en: resultRow.feedback_en,
-              graded_at: resultRow.graded_at,
-            }
-          : null,
-      };
-    })
-  );
+  const [lessonLinksRes, exams] = await Promise.all([
+    lessonIds.length
+      ? sb.from('lesson_links').select('*').in('lesson_id', lessonIds)
+      : Promise.resolve({ data: [] }),
+    Promise.all(
+      (courseExamsRes.data || []).map(async (ex: Record<string, unknown>) => {
+        const c = ex.courses as { title_ar?: string; title_en?: string } | null;
+        const { courses: _c, ...rest } = ex;
+        const eid = Number(rest.id);
+        const [cfg, sub, attempt] = await Promise.all([
+          getExamVaultConfig(sb, eid),
+          getExamSubmission(sb, eid, student.id),
+          getExamAttempt(sb, eid, student.id),
+        ]);
+        const resultRow = resultByExamId.get(eid) || null;
+        const hasSubmittedOrGraded = Boolean(sub || resultRow);
+        const canRevealAnswers = Boolean(hasSubmittedOrGraded && cfg.show_answers_after_submit);
+        const nowMs = Date.now();
+        const limitMin = Number(cfg.time_limit_minutes || 0);
+        const remainingSeconds =
+          attempt && limitMin > 0
+            ? Math.max(0, Math.floor((new Date(attempt.expires_at).getTime() - nowMs) / 1000))
+            : limitMin > 0
+            ? limitMin * 60
+            : null;
+        const isExpired = Boolean(attempt && limitMin > 0 && new Date(attempt.expires_at).getTime() <= nowMs);
+        return {
+          ...rest,
+          id: eid,
+          course_title_ar: c?.title_ar ?? null,
+          course_title_en: c?.title_en ?? null,
+          ...sanitizeExamConfigForViewer(cfg, { isPrivileged: false, canRevealAnswers }),
+          attempt: attempt
+            ? {
+                started_at: attempt.started_at,
+                expires_at: attempt.expires_at,
+                remaining_seconds: remainingSeconds,
+                is_expired: isExpired,
+              }
+            : null,
+          server_now: new Date(nowMs).toISOString(),
+          submission: sanitizeSubmissionForViewer(sub),
+          result: resultRow
+            ? {
+                score: resultRow.score,
+                feedback_ar: resultRow.feedback_ar,
+                feedback_en: resultRow.feedback_en,
+                graded_at: resultRow.graded_at,
+              }
+            : null,
+        };
+      })
+    ),
+  ]);
+  const lessonLinks = lessonLinksRes.data || [];
 
-  res.json({
+  const payload = {
     student,
     enrollments,
     lessons,
@@ -2860,7 +3536,9 @@ app.get('/api/student/dashboard', authenticate, requireRole('student'), asyncHan
     announcements,
     certificates,
     games,
-  });
+  };
+  setCachedRoleDashboard(cacheKey, payload);
+  res.json(payload);
 }));
 
 app.post('/api/student/games/progress', authenticate, requireRole('student'), asyncHandler<AuthRequest>(async (req, res) => {
@@ -2933,6 +3611,13 @@ app.post('/api/student/games/progress', authenticate, requireRole('student'), as
 // GUARDIAN / PARENT ROUTES (Strictly scoped to children of logged-in guardian)
 // ============================================================================
 app.get('/api/guardian/dashboard', authenticate, requireRole('guardian'), asyncHandler<AuthRequest>(async (req, res) => {
+  const cacheKey = `guardian:${req.user!.id}`;
+  const cachedPayload = getCachedRoleDashboard<Record<string, unknown>>(cacheKey);
+  if (cachedPayload) {
+    res.json(cachedPayload);
+    return;
+  }
+
   const sb = requireSupabaseAdmin();
   const guardian = await findGuardianForUser(sb, req.user!);
 
@@ -2963,7 +3648,7 @@ app.get('/api/guardian/dashboard', authenticate, requireRole('guardian'), asyncH
   const childIds = children.map((c) => c.id);
 
   if (!childIds.length) {
-    res.json({
+    const emptyPayload = {
       guardian,
       children: [],
       enrollments: [],
@@ -2973,7 +3658,9 @@ app.get('/api/guardian/dashboard', authenticate, requireRole('guardian'), asyncH
       examResults: [],
       evaluations: [],
       certificates: [],
-    });
+    };
+    setCachedRoleDashboard(cacheKey, emptyPayload);
+    res.json(emptyPayload);
     return;
   }
 
@@ -3102,14 +3789,6 @@ app.get('/api/guardian/dashboard', authenticate, requireRole('guardian'), asyncH
     guardianExamResultMap.set(`${Number(rec.exam_id)}:${Number(rec.student_id)}`, rec);
   }
 
-  const guardianExamConfigs = new Map<number, ExamVaultConfig>();
-  await Promise.all(
-    guardianExamsRaw.map(async (ex: Record<string, unknown>) => {
-      const eid = Number(ex.id);
-      guardianExamConfigs.set(eid, await getExamVaultConfig(sb, eid));
-    })
-  );
-
   const examSubPairs: Array<{ student_id: number; course_id: number; ex: Record<string, unknown> }> = [];
   for (const { student_id, course_id } of childCoursePairs) {
     const matching = guardianExamsRaw.filter((ex: Record<string, unknown>) => Number(ex.course_id) === course_id);
@@ -3118,38 +3797,49 @@ app.get('/api/guardian/dashboard', authenticate, requireRole('guardian'), asyncH
     }
   }
 
-  const guardianExams = await Promise.all(
-    examSubPairs.map(async ({ student_id, course_id, ex }) => {
-      const eid = Number(ex.id);
-      const c = ex.courses as { title_ar?: string; title_en?: string } | null;
-      const cfg = guardianExamConfigs.get(eid)!;
-      const sub = await getExamSubmission(sb, eid, student_id);
-      const resRow = guardianExamResultMap.get(`${eid}:${student_id}`) || null;
-      return {
-        id: eid,
-        student_id,
-        course_id,
-        title_ar: ex.title_ar,
-        title_en: ex.title_en,
-        exam_date: ex.exam_date,
-        max_score: ex.max_score,
-        course_title_ar: c?.title_ar ?? null,
-        course_title_en: c?.title_en ?? null,
-        ...sanitizeExamConfigForViewer(cfg, { isPrivileged: false, canRevealAnswers: false }),
-        submission: sanitizeSubmissionForViewer(sub),
-        result: resRow
-          ? {
-              score: resRow.score,
-              feedback_ar: resRow.feedback_ar,
-              feedback_en: resRow.feedback_en,
-              graded_at: resRow.graded_at,
-            }
-          : null,
-      };
-    })
-  );
+  const guardianExamConfigs = new Map<number, ExamVaultConfig>();
+  const [, guardianSubmissions] = await Promise.all([
+    Promise.all(
+      guardianExamsRaw.map(async (ex: Record<string, unknown>) => {
+        const eid = Number(ex.id);
+        guardianExamConfigs.set(eid, await getExamVaultConfig(sb, eid));
+      })
+    ),
+    Promise.all(
+      examSubPairs.map(({ student_id, ex }) => getExamSubmission(sb, Number(ex.id), student_id))
+    ),
+  ]);
 
-  res.json({
+  const guardianExams = examSubPairs.map(({ student_id, course_id, ex }, idx) => {
+    const eid = Number(ex.id);
+    const c = ex.courses as { title_ar?: string; title_en?: string } | null;
+    const cfg = guardianExamConfigs.get(eid)!;
+    const sub = guardianSubmissions[idx];
+    const resRow = guardianExamResultMap.get(`${eid}:${student_id}`) || null;
+    return {
+      id: eid,
+      student_id,
+      course_id,
+      title_ar: ex.title_ar,
+      title_en: ex.title_en,
+      exam_date: ex.exam_date,
+      max_score: ex.max_score,
+      course_title_ar: c?.title_ar ?? null,
+      course_title_en: c?.title_en ?? null,
+      ...sanitizeExamConfigForViewer(cfg, { isPrivileged: false, canRevealAnswers: false }),
+      submission: sanitizeSubmissionForViewer(sub),
+      result: resRow
+        ? {
+            score: resRow.score,
+            feedback_ar: resRow.feedback_ar,
+            feedback_en: resRow.feedback_en,
+            graded_at: resRow.graded_at,
+          }
+        : null,
+    };
+  });
+
+  const payload = {
     guardian,
     children,
     enrollments,
@@ -3159,7 +3849,9 @@ app.get('/api/guardian/dashboard', authenticate, requireRole('guardian'), asyncH
     examResults,
     evaluations,
     certificates,
-  });
+  };
+  setCachedRoleDashboard(cacheKey, payload);
+  res.json(payload);
 }));
 
 app.post('/api/guardian/link-child', authenticate, requireRole('guardian'), guardianVerifyLimiter, asyncHandler<AuthRequest>(async (req, res) => {
@@ -3228,7 +3920,7 @@ app.post('/api/guardian/link-child', authenticate, requireRole('guardian'), guar
     await sb.from('students').update({ guardian_id: myGuardian.id }).eq('id', studentRow.id);
   }
 
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'GUARDIAN_LINK_CHILD', 'student', studentRow.id, {
+  await writeAuditLog(req.user!.id, auditActorName(req.user!), 'GUARDIAN_LINK_CHILD', 'student', studentRow.id, {
     student_code: studentRow.student_code,
     guardian_id: myGuardian.id,
   });
@@ -3248,6 +3940,108 @@ async function getTeacherByProfile(profileId: string) {
     .is('deleted_at', null)
     .maybeSingle();
   return data as { id: number; name_ar: string } | null;
+}
+
+const ADMIN_TEACHER_PREFIX = 'admin:';
+const ADMIN_TEACHER_REF_REGEX = /^admin:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function ensureTeacherForAdminProfile(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  profileId: string
+): Promise<{ id: number; name_ar: string; created: boolean }> {
+  const { data: profile, error: profErr } = await sb
+    .from('profiles')
+    .select('id, email, full_name, role, is_active, deleted_at')
+    .eq('id', profileId)
+    .maybeSingle();
+  if (profErr || !profile || profile.deleted_at || !profile.is_active || profile.role !== 'admin') {
+    throw new AppError(400, 'Selected administrator account is not active');
+  }
+
+  const { data: existingTeacher } = await sb
+    .from('teachers')
+    .select('id, name_ar')
+    .eq('profile_id', profileId)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (existingTeacher) {
+    return {
+      id: Number(existingTeacher.id),
+      name_ar: String(existingTeacher.name_ar || profile.full_name || 'المدير'),
+      created: false,
+    };
+  }
+
+  const displayName = String(profile.full_name || profile.email || 'المدير').trim() || 'المدير';
+  const inserted = await insertRowSafe<{ id: number }>('teachers', {
+    profile_id: profileId,
+    name_ar: displayName,
+    name_en: displayName,
+    bio_ar: '',
+    bio_en: '',
+    qualifications_ar: '',
+    qualifications_en: '',
+    specialty_ar: 'إدارة وتعليم القرآن والعلوم الشرعية',
+    specialty_en: 'Academy Director & Instructor',
+    avatar_url: '/assets/images/teacher_portrait_1.webp',
+    hourly_rate: 0,
+    is_public: true,
+  });
+
+  return { id: inserted.id, name_ar: displayName, created: true };
+}
+
+async function resolveTeacherRefToId(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  raw: number | string | null | undefined
+): Promise<number | null> {
+  if (raw === null || raw === undefined || raw === '') return null;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    if (trimmed.toLowerCase().startsWith(ADMIN_TEACHER_PREFIX)) {
+      const uuid = trimmed.slice(ADMIN_TEACHER_PREFIX.length).trim();
+      if (!z.string().uuid().safeParse(uuid).success) {
+        throw new AppError(400, 'Invalid administrator teacher reference');
+      }
+      const linked = await ensureTeacherForAdminProfile(sb, uuid);
+      return linked.id;
+    }
+    const parsedNum = Number(trimmed);
+    if (!Number.isInteger(parsedNum) || parsedNum <= 0) {
+      throw new AppError(400, 'Invalid teacher ID');
+    }
+    raw = parsedNum;
+  }
+  const tid = Number(raw);
+  if (!Number.isInteger(tid) || tid <= 0) {
+    throw new AppError(400, 'Invalid teacher ID');
+  }
+  const { data: teacherRow } = await sb
+    .from('teachers')
+    .select('id')
+    .eq('id', tid)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (!teacherRow) {
+    throw new AppError(400, 'Selected teacher does not exist');
+  }
+  return tid;
+}
+
+async function assertCourseHasStudent(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  courseId: number,
+  studentId: number
+): Promise<boolean> {
+  const { data } = await sb
+    .from('enrollments')
+    .select('id')
+    .eq('course_id', courseId)
+    .eq('student_id', studentId)
+    .is('deleted_at', null)
+    .limit(1);
+  return Boolean(data && data.length > 0);
 }
 
 async function assertTeacherOwnsCourse(teacherId: number, courseId: number): Promise<boolean> {
@@ -3304,6 +4098,13 @@ async function assertTeacherTeachesStudent(teacherId: number, studentId: number,
 }
 
 app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+  const cacheKey = `teacher:${req.user!.id}`;
+  const cachedPayload = getCachedRoleDashboard<Record<string, unknown>>(cacheKey);
+  if (cachedPayload) {
+    res.json(cachedPayload);
+    return;
+  }
+
   const teacher = await getTeacherByProfile(req.user!.id);
   if (!teacher) {
     res.status(404).json({ error: 'Teacher profile not found' });
@@ -3434,13 +4235,29 @@ app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), asyncHan
   });
 
   const lessonIds = lessons.map((l) => l.id);
-  const [attendanceRes, lessonLinksRes] = await Promise.all([
+  const rawExams = examsRes.data || [];
+  const rawExamIds = rawExams.map((ex: Record<string, unknown>) => Number(ex.id));
+
+  const [attendanceRes, lessonLinksRes, examResultsRes, examVaultBundles] = await Promise.all([
     lessonIds.length
       ? sb.from('attendance').select('*, lessons!inner(course_id)').in('lesson_id', lessonIds)
       : Promise.resolve({ data: [] }),
     lessonIds.length
       ? sb.from('lesson_links').select('*').in('lesson_id', lessonIds).order('id', { ascending: true })
       : Promise.resolve({ data: [] }),
+    rawExamIds.length
+      ? sb.from('exam_results').select('*, exams(course_id, title_ar), students(full_name_ar)').in('exam_id', rawExamIds)
+      : Promise.resolve({ data: [] }),
+    Promise.all(
+      rawExams.map(async (ex: Record<string, unknown>) => {
+        const eid = Number(ex.id);
+        const [cfg, subs] = await Promise.all([
+          getExamVaultConfig(sb, eid),
+          listExamSubmissionsForExam(sb, eid),
+        ]);
+        return { eid, cfg, subs };
+      })
+    ),
   ]);
 
   const attendance = (attendanceRes.data || []).map((a: Record<string, unknown>) => {
@@ -3449,12 +4266,7 @@ app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), asyncHan
     return { ...rest, course_id: l?.course_id ?? null };
   });
   const lessonLinks = lessonLinksRes.data || [];
-
-  const rawExams = examsRes.data || [];
-  const rawExamIds = rawExams.map((ex: Record<string, unknown>) => Number(ex.id));
-  const examResultsRows = rawExamIds.length
-    ? ((await sb.from('exam_results').select('*, exams(course_id, title_ar), students(full_name_ar)').in('exam_id', rawExamIds)).data || [])
-    : [];
+  const examResultsRows = examResultsRes.data || [];
 
   const examResults = examResultsRows.map((er: Record<string, unknown>) => {
     const ex = er.exams as { course_id?: number; title_ar?: string } | null;
@@ -3468,28 +4280,27 @@ app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), asyncHan
     };
   });
 
-  const exams = await Promise.all(
-    rawExams.map(async (ex: Record<string, unknown>) => {
-      const c = ex.courses as { title_ar?: string; title_en?: string } | null;
-      const { courses: _c, ...rest } = ex;
-      const eid = Number(rest.id);
-      const [cfg, subs] = await Promise.all([
-        getExamVaultConfig(sb, eid),
-        listExamSubmissionsForExam(sb, eid),
-      ]);
-      const gradedCount = examResultsRows.filter((er: Record<string, unknown>) => Number(er.exam_id) === eid).length;
-      return {
-        ...rest,
-        id: eid,
-        course_title_ar: c?.title_ar ?? null,
-        course_title_en: c?.title_en ?? null,
-        ...sanitizeExamConfigForViewer(cfg, { isPrivileged: true }),
-        submission_count: subs.length,
-        pending_grading_count: subs.filter((s) => s.status === 'submitted_pending').length,
-        graded_count: gradedCount,
-      };
-    })
-  );
+  const gradedByExamId = new Map<number, number>();
+  for (const er of examResultsRows as Array<Record<string, unknown>>) {
+    const eid = Number(er.exam_id);
+    gradedByExamId.set(eid, (gradedByExamId.get(eid) || 0) + 1);
+  }
+
+  const exams = rawExams.map((ex: Record<string, unknown>, idx: number) => {
+    const c = ex.courses as { title_ar?: string; title_en?: string } | null;
+    const { courses: _c, ...rest } = ex;
+    const { eid, cfg, subs } = examVaultBundles[idx];
+    return {
+      ...rest,
+      id: eid,
+      course_title_ar: c?.title_ar ?? null,
+      course_title_en: c?.title_en ?? null,
+      ...sanitizeExamConfigForViewer(cfg, { isPrivileged: true }),
+      submission_count: subs.length,
+      pending_grading_count: subs.filter((s) => s.status === 'submitted_pending').length,
+      graded_count: gradedByExamId.get(eid) || 0,
+    };
+  });
 
   const recitations = (recRes.data || []).map((r: Record<string, unknown>) => {
     const s = r.students as { full_name_ar?: string } | null;
@@ -3521,7 +4332,7 @@ app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), asyncHan
       }
     : null;
 
-  res.json({
+  const payload = {
     teacher,
     courses,
     students,
@@ -3534,7 +4345,9 @@ app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), asyncHan
     evaluations,
     payroll: payrollRes.data || [],
     payoutDetails,
-  });
+  };
+  setCachedRoleDashboard(cacheKey, payload);
+  res.json(payload);
 }));
 
 app.get('/api/teacher/students/:studentId', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
@@ -3553,7 +4366,7 @@ app.get('/api/teacher/students/:studentId', authenticate, requireRole('teacher')
   res.json({ student });
 }));
 
-app.post('/api/teacher/attendance', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+app.post('/api/teacher/attendance', authenticate, requireRole('teacher', 'admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const schema = z.object({
     lesson_id: z.coerce.number().int().positive(),
     student_id: z.coerce.number().int().positive(),
@@ -3565,7 +4378,6 @@ app.post('/api/teacher/attendance', authenticate, requireRole('teacher'), asyncH
     res.status(400).json({ error: 'Invalid attendance payload.' });
     return;
   }
-  const teacher = await getTeacherByProfile(req.user!.id);
   const { lesson_id, student_id, status, notes } = parsed.data;
   const sb = requireSupabaseAdmin();
   const { data: lesson } = await sb
@@ -3575,14 +4387,26 @@ app.post('/api/teacher/attendance', authenticate, requireRole('teacher'), asyncH
     .is('deleted_at', null)
     .maybeSingle();
 
-  if (
-    !teacher ||
-    !lesson ||
-    !(await assertTeacherOwnsCourse(teacher.id, lesson.course_id)) ||
-    !(await assertTeacherTeachesStudent(teacher.id, student_id, lesson.course_id))
-  ) {
-    res.status(403).json({ error: 'Forbidden: cannot record attendance outside your courses' });
+  if (!lesson) {
+    res.status(404).json({ error: 'Lesson not found' });
     return;
+  }
+
+  if (req.user!.role === 'admin') {
+    if (!(await assertCourseHasStudent(sb, lesson.course_id, student_id))) {
+      res.status(400).json({ error: 'Student is not enrolled in this course' });
+      return;
+    }
+  } else {
+    const teacher = await getTeacherByProfile(req.user!.id);
+    if (
+      !teacher ||
+      !(await assertTeacherOwnsCourse(teacher.id, lesson.course_id)) ||
+      !(await assertTeacherTeachesStudent(teacher.id, student_id, lesson.course_id))
+    ) {
+      res.status(403).json({ error: 'Forbidden: cannot record attendance outside your courses' });
+      return;
+    }
   }
 
   const { data: existing } = await sb
@@ -3618,7 +4442,7 @@ app.post('/api/teacher/attendance', authenticate, requireRole('teacher'), asyncH
   res.json({ ok: true });
 }));
 
-app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+app.post('/api/teacher/exam-results', authenticate, requireRole('teacher', 'admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const schema = z.object({
     exam_id: z.coerce.number().int().positive(),
     student_id: z.coerce.number().int().positive(),
@@ -3631,7 +4455,6 @@ app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyn
     res.status(400).json({ error: 'Invalid exam result payload.' });
     return;
   }
-  const teacher = await getTeacherByProfile(req.user!.id);
   const { exam_id, student_id, score, feedback_ar, feedback_en } = parsed.data;
   const sb = requireSupabaseAdmin();
   const { data: exam } = await sb
@@ -3641,14 +4464,26 @@ app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyn
     .is('deleted_at', null)
     .maybeSingle();
 
-  if (
-    !teacher ||
-    !exam ||
-    !(await assertTeacherOwnsCourse(teacher.id, exam.course_id)) ||
-    !(await assertTeacherTeachesStudent(teacher.id, student_id, exam.course_id))
-  ) {
-    res.status(403).json({ error: 'Forbidden: cannot grade outside your courses' });
+  if (!exam) {
+    res.status(404).json({ error: 'Exam not found' });
     return;
+  }
+
+  if (req.user!.role === 'admin') {
+    if (!(await assertCourseHasStudent(sb, exam.course_id, student_id))) {
+      res.status(400).json({ error: 'Student is not enrolled in this course' });
+      return;
+    }
+  } else {
+    const teacher = await getTeacherByProfile(req.user!.id);
+    if (
+      !teacher ||
+      !(await assertTeacherOwnsCourse(teacher.id, exam.course_id)) ||
+      !(await assertTeacherTeachesStudent(teacher.id, student_id, exam.course_id))
+    ) {
+      res.status(403).json({ error: 'Forbidden: cannot grade outside your courses' });
+      return;
+    }
   }
 
   const maxScore = Number(exam.max_score || 100);
@@ -3714,7 +4549,7 @@ app.post('/api/teacher/exam-results', authenticate, requireRole('teacher'), asyn
   res.json({ ok: true });
 }));
 
-app.post('/api/teacher/recitations', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+app.post('/api/teacher/recitations', authenticate, requireRole('teacher', 'admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const schema = z.object({
     student_id: z.coerce.number().int().positive(),
     course_id: z.coerce.number().int().positive(),
@@ -3730,16 +4565,24 @@ app.post('/api/teacher/recitations', authenticate, requireRole('teacher'), async
     res.status(400).json({ error: 'Invalid recitation record payload.' });
     return;
   }
-  const teacher = await getTeacherByProfile(req.user!.id);
+  const sb = requireSupabaseAdmin();
   const { student_id, course_id, surah_name, ayah_from, ayah_to, tajweed_score, memorization_score, notes_ar } = parsed.data;
 
-  if (
-    !teacher ||
-    !(await assertTeacherOwnsCourse(teacher.id, course_id)) ||
-    !(await assertTeacherTeachesStudent(teacher.id, student_id, course_id))
-  ) {
-    res.status(403).json({ error: 'Forbidden: student not in your course' });
-    return;
+  if (req.user!.role === 'admin') {
+    if (!(await assertCourseHasStudent(sb, course_id, student_id))) {
+      res.status(400).json({ error: 'Student is not enrolled in this course' });
+      return;
+    }
+  } else {
+    const teacher = await getTeacherByProfile(req.user!.id);
+    if (
+      !teacher ||
+      !(await assertTeacherOwnsCourse(teacher.id, course_id)) ||
+      !(await assertTeacherTeachesStudent(teacher.id, student_id, course_id))
+    ) {
+      res.status(403).json({ error: 'Forbidden: student not in your course' });
+      return;
+    }
   }
 
   const inserted = await insertRowSafe<{ id: number }>('recitations', {
@@ -3759,7 +4602,7 @@ app.post('/api/teacher/recitations', authenticate, requireRole('teacher'), async
   res.status(201).json({ id: inserted.id });
 }));
 
-app.post('/api/teacher/evaluations', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+app.post('/api/teacher/evaluations', authenticate, requireRole('teacher', 'admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const schema = z.object({
     student_id: z.coerce.number().int().positive(),
     course_id: z.coerce.number().int().positive(),
@@ -3774,16 +4617,24 @@ app.post('/api/teacher/evaluations', authenticate, requireRole('teacher'), async
     res.status(400).json({ error: 'Invalid evaluation payload.' });
     return;
   }
-  const teacher = await getTeacherByProfile(req.user!.id);
+  const sb = requireSupabaseAdmin();
   const { student_id, course_id, period, behavior_score, participation_score, summary_ar, summary_en } = parsed.data;
 
-  if (
-    !teacher ||
-    !(await assertTeacherOwnsCourse(teacher.id, course_id)) ||
-    !(await assertTeacherTeachesStudent(teacher.id, student_id, course_id))
-  ) {
-    res.status(403).json({ error: 'Forbidden: student not in your course' });
-    return;
+  if (req.user!.role === 'admin') {
+    if (!(await assertCourseHasStudent(sb, course_id, student_id))) {
+      res.status(400).json({ error: 'Student is not enrolled in this course' });
+      return;
+    }
+  } else {
+    const teacher = await getTeacherByProfile(req.user!.id);
+    if (
+      !teacher ||
+      !(await assertTeacherOwnsCourse(teacher.id, course_id)) ||
+      !(await assertTeacherTeachesStudent(teacher.id, student_id, course_id))
+    ) {
+      res.status(403).json({ error: 'Forbidden: student not in your course' });
+      return;
+    }
   }
 
   const inserted = await insertRowSafe<{ id: number }>('evaluations', {
@@ -4770,74 +5621,91 @@ app.post(
       return;
     }
 
-    if (cfg.time_limit_minutes && cfg.time_limit_minutes > 0) {
-      const attempt = await getExamAttempt(sb, examId, studentId);
-      if (attempt && Date.now() > new Date(attempt.expires_at).getTime() + 45_000) {
-        res.status(403).json({ error: 'Exam time limit has expired and the exam is locked.' });
-        return;
-      }
-    }
-
-    const [{ data: existingResult }, existingSub] = await Promise.all([
-      sb.from('exam_results').select('id').eq('exam_id', examId).eq('student_id', studentId).maybeSingle(),
-      getExamSubmission(sb, examId, studentId),
-    ]);
-    if (existingResult || existingSub?.status === 'graded') {
-      res.status(409).json({ error: 'This exam has already been graded. Ask your teacher if a re-submission is needed.' });
+    const limitMin = Number(cfg.time_limit_minutes || 0);
+    const fallbackDurationMs = limitMin > 0 ? limitMin * 60_000 : 24 * 60 * 60_000;
+    const fallbackExpiresAtIso = new Date(Date.now() + fallbackDurationMs).toISOString();
+    const claim = await claimExamAttemptForSubmit(sb, examId, studentId, fallbackExpiresAtIso);
+    if (claim.mode === 'already_submitted') {
+      res.status(409).json({ error: 'A solution has already been submitted for this exam.' });
       return;
     }
+    const claimedInDb = claim.mode === 'claimed';
 
-    const uploadedMeta = await uploadExamBinaryFile({
-      sb,
-      folder: `submissions/${examId}/${studentId}`,
-      fileName: parsed.data.fileName,
-      mimeType: parsed.data.mimeType,
-      base64Data: parsed.data.base64Data,
-    });
-
-    if (existingSub?.solution_file?.path) {
-      await removeExamBinaryFile(sb, existingSub.solution_file.path);
-    }
-
-    const nowIso = new Date().toISOString();
-    await saveExamSubmission(sb, {
-      exam_id: examId,
-      student_id: studentId,
-      status: 'submitted_pending',
-      submitted_at: nowIso,
-      is_late: pastDeadline,
-      solution_file: uploadedMeta,
-      student_notes: parsed.data.student_notes || existingSub?.student_notes || '',
-      quiz_answers: existingSub?.quiz_answers || [],
-      auto_score: existingSub?.auto_score ?? null,
-      graded_file: existingSub?.graded_file || null,
-      graded_at: null,
-    });
-
-    // Notify course teacher
-    const rawCourse = Array.isArray(exam.courses) ? exam.courses[0] : exam.courses;
-    const teacherId = (rawCourse as { teacher_id?: number | null } | null)?.teacher_id;
-    if (teacherId) {
-      const { data: teacherRow } = await sb.from('teachers').select('profile_id').eq('id', teacherId).maybeSingle();
-      if (teacherRow?.profile_id) {
-        await insertRowSafe('notifications', {
-          profile_id: teacherRow.profile_id,
-          title_ar: `تسليم حل امتحان: ${exam.title_ar}`,
-          title_en: `Exam Solution Submitted: ${exam.title_en}`,
-          body_ar: `قام الطالب ${req.user!.full_name} برفع ملف الحل وهو بانتظار التصحيح ورصد الدرجة.`,
-          body_en: `${req.user!.full_name} uploaded an exam solution awaiting grading.`,
-        }).catch(() => {});
+    try {
+      if (limitMin > 0 && claim.attempt) {
+        if (Date.now() > new Date(claim.attempt.expires_at).getTime() + 45_000) {
+          if (claimedInDb) await releaseExamAttemptClaim(sb, examId, studentId);
+          res.status(403).json({ error: 'Exam time limit has expired and the exam is locked.' });
+          return;
+        }
       }
+
+      const [{ data: existingResult }, existingSub] = await Promise.all([
+        sb.from('exam_results').select('id').eq('exam_id', examId).eq('student_id', studentId).maybeSingle(),
+        getExamSubmission(sb, examId, studentId),
+      ]);
+      if (existingResult || existingSub?.status === 'graded') {
+        res.status(409).json({ error: 'This exam has already been graded. Ask your teacher if a re-submission is needed.' });
+        return;
+      }
+
+      const uploadedMeta = await uploadExamBinaryFile({
+        sb,
+        folder: `submissions/${examId}/${studentId}`,
+        fileName: parsed.data.fileName,
+        mimeType: parsed.data.mimeType,
+        base64Data: parsed.data.base64Data,
+      });
+
+      if (existingSub?.solution_file?.path) {
+        await removeExamBinaryFile(sb, existingSub.solution_file.path);
+      }
+
+      const nowIso = new Date().toISOString();
+      await saveExamSubmission(sb, {
+        exam_id: examId,
+        student_id: studentId,
+        status: 'submitted_pending',
+        submitted_at: nowIso,
+        is_late: pastDeadline,
+        solution_file: uploadedMeta,
+        student_notes: parsed.data.student_notes || existingSub?.student_notes || '',
+        quiz_answers: existingSub?.quiz_answers || [],
+        auto_score: existingSub?.auto_score ?? null,
+        graded_file: existingSub?.graded_file || null,
+        graded_at: null,
+      });
+
+      // Notify course teacher
+      const rawCourse = Array.isArray(exam.courses) ? exam.courses[0] : exam.courses;
+      const teacherId = (rawCourse as { teacher_id?: number | null } | null)?.teacher_id;
+      if (teacherId) {
+        const { data: teacherRow } = await sb.from('teachers').select('profile_id').eq('id', teacherId).maybeSingle();
+        if (teacherRow?.profile_id) {
+          await insertRowSafe('notifications', {
+            profile_id: teacherRow.profile_id,
+            title_ar: `تسليم حل امتحان: ${exam.title_ar}`,
+            title_en: `Exam Solution Submitted: ${exam.title_en}`,
+            body_ar: `قام الطالب ${req.user!.full_name} برفع ملف الحل وهو بانتظار التصحيح ورصد الدرجة.`,
+            body_en: `${req.user!.full_name} uploaded an exam solution awaiting grading.`,
+          }).catch(() => {});
+        }
+      }
+
+      await writeAuditLog(req.user!.id, auditActorName(req.user!), 'SUBMIT_EXAM_FILE', 'exam', examId, {
+        student_id: studentId,
+        fileName: uploadedMeta.name,
+        is_late: pastDeadline,
+      });
+      void broadcastRealtimeEvent('academic:updated', { kind: 'exam_submission' });
+
+      res.status(201).json({ ok: true, fileName: uploadedMeta.name, is_late: pastDeadline });
+    } catch (err) {
+      if (claimedInDb) {
+        await releaseExamAttemptClaim(sb, examId, studentId);
+      }
+      throw err;
     }
-
-    await writeAuditLog(req.user!.id, req.user!.full_name, 'SUBMIT_EXAM_FILE', 'exam', examId, {
-      student_id: studentId,
-      fileName: uploadedMeta.name,
-      is_late: pastDeadline,
-    });
-    void broadcastRealtimeEvent('academic:updated', { kind: 'exam_submission' });
-
-    res.status(201).json({ ok: true, fileName: uploadedMeta.name, is_late: pastDeadline });
   })
 );
 
@@ -4899,15 +5767,17 @@ app.post(
       started_at: startedAt.toISOString(),
       expires_at: expiresAt.toISOString(),
     };
-    await saveExamAttempt(sb, attempt);
+    const persistedAttempt = await saveExamAttempt(sb, attempt);
+    const persistedExpiresMs = new Date(persistedAttempt.expires_at).getTime();
+    const persistedRemaining = limitMin > 0 ? Math.max(0, Math.floor((persistedExpiresMs - Date.now()) / 1000)) : null;
 
-    res.status(201).json({
+    res.status(persistedAttempt.started_at === attempt.started_at ? 201 : 200).json({
       attempt: {
-        ...attempt,
-        remaining_seconds: limitMin > 0 ? limitMin * 60 : null,
-        is_expired: false,
+        ...persistedAttempt,
+        remaining_seconds: persistedRemaining,
+        is_expired: Boolean(limitMin > 0 && persistedExpiresMs <= Date.now()),
       },
-      server_now: startedAt.toISOString(),
+      server_now: new Date().toISOString(),
     });
   })
 );
@@ -4967,33 +5837,45 @@ app.post(
     inFlightQuizSubmits.add(quizSubmitKey);
 
     try {
-      const [{ data: existingResult }, existingSub, attempt] = await Promise.all([
-        sb.from('exam_results').select('id').eq('exam_id', examId).eq('student_id', studentId).maybeSingle(),
-        getExamSubmission(sb, examId, studentId),
-        getExamAttempt(sb, examId, studentId),
-      ]);
-      if (existingResult || existingSub?.status === 'graded') {
-        res.status(409).json({ error: 'This exam has already been graded.' });
-        return;
-      }
-      if (existingSub && existingSub.quiz_answers.length > 0) {
+      const limitMin = Number(cfg.time_limit_minutes || 0);
+      const fallbackDurationMs = limitMin > 0 ? limitMin * 60_000 : 24 * 60 * 60_000;
+      const fallbackExpiresAtIso = new Date(Date.now() + fallbackDurationMs).toISOString();
+      const claim = await claimExamAttemptForSubmit(sb, examId, studentId, fallbackExpiresAtIso);
+      if (claim.mode === 'already_submitted') {
         res.status(409).json({ error: 'Quiz answers have already been submitted for this exam.' });
         return;
       }
+      const claimedInDb = claim.mode === 'claimed';
+      const attempt = claim.attempt;
 
-      let isTimedOutSubmission = Boolean(parsed.data.timed_out);
-      if (cfg.time_limit_minutes && cfg.time_limit_minutes > 0 && attempt) {
-        const expiresMs = new Date(attempt.expires_at).getTime();
-        const nowMs = Date.now();
-        if (nowMs >= expiresMs) {
-          isTimedOutSubmission = true;
-        }
-        const allowedGraceMs = parsed.data.timed_out ? 180_000 : 45_000;
-        if (nowMs > expiresMs + allowedGraceMs) {
-          res.status(403).json({ error: 'Exam countdown expired and submissions are locked.' });
+      try {
+        const [{ data: existingResult }, existingSub] = await Promise.all([
+          sb.from('exam_results').select('id').eq('exam_id', examId).eq('student_id', studentId).maybeSingle(),
+          getExamSubmission(sb, examId, studentId),
+        ]);
+        if (existingResult || existingSub?.status === 'graded') {
+          res.status(409).json({ error: 'This exam has already been graded.' });
           return;
         }
-      }
+        if (existingSub && existingSub.quiz_answers.length > 0) {
+          res.status(409).json({ error: 'Quiz answers have already been submitted for this exam.' });
+          return;
+        }
+
+        let isTimedOutSubmission = Boolean(parsed.data.timed_out);
+        if (limitMin > 0 && attempt) {
+          const expiresMs = new Date(attempt.expires_at).getTime();
+          const nowMs = Date.now();
+          if (nowMs >= expiresMs) {
+            isTimedOutSubmission = true;
+          }
+          const allowedGraceMs = parsed.data.timed_out ? 180_000 : 45_000;
+          if (nowMs > expiresMs + allowedGraceMs) {
+            if (claimedInDb) await releaseExamAttemptClaim(sb, examId, studentId);
+            res.status(403).json({ error: 'Exam countdown expired and submissions are locked.' });
+            return;
+          }
+        }
 
       // 100% Server-side authoritative grading
       const answerById = new Map<string, number>();
@@ -5102,7 +5984,7 @@ app.post(
         );
       }
 
-      await writeAuditLog(req.user!.id, req.user!.full_name, 'SUBMIT_EXAM_QUIZ', 'exam', examId, {
+      await writeAuditLog(req.user!.id, auditActorName(req.user!), 'SUBMIT_EXAM_QUIZ', 'exam', examId, {
         student_id: studentId,
         auto_score: computedScore,
         pure_quiz: isPureQuiz,
@@ -5116,6 +5998,12 @@ app.post(
         max_score: maxScore,
         finalized: isPureQuiz,
       });
+      } catch (err) {
+        if (claimedInDb) {
+          await releaseExamAttemptClaim(sb, examId, studentId);
+        }
+        throw err;
+      }
     } finally {
       inFlightQuizSubmits.delete(quizSubmitKey);
     }
@@ -5330,121 +6218,434 @@ app.post('/api/exams/:examId/submissions/:studentId/reset', authenticate, requir
 // ============================================================================
 // ADMIN ROUTES (Strictly role === 'admin')
 // ============================================================================
-app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler(async (_req, res) => {
-  const sb = requireSupabaseAdmin();
+let devEndpointTimingSeq = 0;
+
+function startDevEndpointTimer(label: string): (() => void) | null {
+  if (IS_PRODUCTION) return null;
+  const timerId = `[dev-timing] ${label} #${++devEndpointTimingSeq}`;
+  console.time(timerId);
+  return () => {
+    console.timeEnd(timerId);
+  };
+}
+
+function parseAdminListQuery(req: express.Request) {
+  const page = Math.max(1, Number.parseInt(String(req.query.page || '1'), 10) || 1);
+  const limit = Math.min(100, Math.max(1, Number.parseInt(String(req.query.limit || '25'), 10) || 25));
+  const q = String(req.query.q || '').trim().slice(0, 120);
+  const from = (page - 1) * limit;
+  const to = from + limit - 1;
+  return { page, limit, q, from, to };
+}
+
+function sanitizePostgrestOrSearch(q: string): string {
+  return q
+    .replace(/[\\%_]/g, (m) => `\\${m}`)
+    .replace(/[(),]/g, ' ')
+    .trim();
+}
+
+async function buildAdminDashboardSummaryPayload(sb: ReturnType<typeof requireSupabaseAdmin>) {
   const [
-    profilesRes,
+    studentsCountRes,
+    teachersCountRes,
+    coursesCountRes,
+    lessonsCountRes,
+    pendingAdmissionsRes,
     levelsRes,
-    teachersRes,
-    studentsRes,
-    coursesRes,
-    lessonsRes,
-    lessonLinksRes,
-    enrollmentsRes,
-    admissionsRes,
-    announcementsRes,
-    examsRes,
-    certificatesRes,
-    payrollRes,
-    payoutDetailsRes,
     gamesRes,
     legalRes,
-    auditLogsRes,
+    studentOptsRes,
+    teacherOptsRes,
+    adminProfilesRes,
+    courseOptsRes,
+    enrollmentsCourseIdsRes,
+    examIdsRes,
+    examResultsRes,
+    teacherApps,
+    guardianReqs,
+    suggestionsList,
   ] = await Promise.all([
-    sb.from('profiles').select('id, email, full_name, role, is_active, created_at').is('deleted_at', null).order('created_at', { ascending: true }),
-    sb.from('levels').select('*').order('order_index', { ascending: true }),
-    sb.from('teachers').select('*').is('deleted_at', null).order('id', { ascending: true }),
-    sb
-      .from('students')
-      .select('*, levels(name_ar, name_en), guardians(full_name, phone, email, profile_id), profiles(email)')
-      .is('deleted_at', null)
-      .order('id', { ascending: false }),
-    sb
-      .from('courses')
-      .select('*, levels(name_ar), teachers(name_ar)')
-      .is('deleted_at', null)
-      .order('id', { ascending: false }),
+    sb.from('students').select('id', { count: 'exact', head: true }).is('deleted_at', null),
+    sb.from('teachers').select('id', { count: 'exact', head: true }).is('deleted_at', null),
+    sb.from('courses').select('id', { count: 'exact', head: true }).is('deleted_at', null),
     sb
       .from('lessons')
-      .select('*, courses!inner(title_ar, deleted_at)')
+      .select('id, courses!inner(deleted_at)', { count: 'exact', head: true })
       .is('deleted_at', null)
-      .is('courses.deleted_at', null)
-      .order('lesson_date', { ascending: false }),
-    sb.from('lesson_links').select('*'),
-    sb
-      .from('enrollments')
-      .select('*, students(full_name_ar), courses(title_ar)')
-      .is('deleted_at', null),
-    sb
-      .from('admission_requests')
-      .select('*, courses(title_ar), levels(name_ar)')
-      .order('created_at', { ascending: false }),
-    sb
-      .from('announcements')
-      .select('*, courses(title_ar)')
-      .is('deleted_at', null)
-      .order('created_at', { ascending: false }),
-    sb
-      .from('exams')
-      .select('*, courses!inner(title_ar, deleted_at)')
-      .is('deleted_at', null)
-      .is('courses.deleted_at', null)
-      .order('exam_date', { ascending: false }),
-    sb
-      .from('certificates')
-      .select('*, students(full_name_ar), courses(title_ar)')
-      .order('issued_at', { ascending: false }),
-    sb
-      .from('payroll')
-      .select('*, teachers(name_ar)')
-      .order('month_year', { ascending: false })
-      .order('id', { ascending: false }),
-    sb.from('teacher_payout_details').select('teacher_id, bank_name, iban'),
-    sb.from('games').select('*').order('id', { ascending: true }),
-    sb.from('legal_documents').select('*').order('id', { ascending: true }),
-    sb.from('audit_logs').select('*').order('id', { ascending: false }).limit(100),
+      .is('courses.deleted_at', null),
+    sb.from('admission_requests').select('id', { count: 'exact', head: true }).eq('status', 'pending'),
+    sb.from('levels').select('id, code, name_ar, name_en, age_range').order('order_index', { ascending: true }).limit(100),
+    sb.from('games').select('id, slug, title_ar, title_en, category, is_active').order('id', { ascending: true }).limit(100),
+    sb.from('legal_documents').select('doc_type, version, title_ar, title_en, content_ar, content_en').order('id', { ascending: true }).limit(50),
+    sb.from('students').select('id, full_name_ar, student_code').is('deleted_at', null).order('id', { ascending: false }).limit(500),
+    sb.from('teachers').select('id, profile_id, name_ar').is('deleted_at', null).order('id', { ascending: true }).limit(500),
+    sb.from('profiles').select('id, full_name, email').eq('role', 'admin').eq('is_active', true).is('deleted_at', null).order('created_at', { ascending: true }).limit(50),
+    sb.from('courses').select('id, title_ar, capacity').is('deleted_at', null).order('id', { ascending: false }).limit(500),
+    sb.from('enrollments').select('course_id').is('deleted_at', null).limit(50000),
+    sb.from('exams').select('id, courses!inner(deleted_at)').is('deleted_at', null).is('courses.deleted_at', null).limit(500),
+    sb.from('exam_results').select('exam_id').limit(50000),
+    listTeacherApplications(sb),
+    listGuardianRequests(sb),
+    listAllSuggestions(sb),
   ]);
 
-  const students = (studentsRes.data || []).map((s: Record<string, unknown>) => {
-    const l = s.levels as { name_ar?: string; name_en?: string } | null;
+  const activeAdminProfiles = (adminProfilesRes.data || []) as Array<{ id: string; full_name: string | null; email: string }>;
+  const adminProfileSet = new Set(activeAdminProfiles.map((a) => String(a.id)));
+  const linkedAdminProfileIds = new Set<string>();
+  const teacherOptionRows = (teacherOptsRes.data || []) as Array<{ id: number; profile_id: string | null; name_ar: string }>;
+  for (const t of teacherOptionRows) {
+    if (t.profile_id && adminProfileSet.has(String(t.profile_id))) {
+      linkedAdminProfileIds.add(String(t.profile_id));
+    }
+  }
+  const unlinkedAdmins = activeAdminProfiles
+    .filter((a) => !linkedAdminProfileIds.has(String(a.id)))
+    .map((a) => {
+      const displayName = String(a.full_name || a.email || 'المدير').trim();
+      return {
+        profile_id: String(a.id),
+        full_name: displayName,
+        label: `${displayName} (المدير)`,
+      };
+    });
+
+  const gradedByExam = new Map<number, number>();
+  for (const row of (examResultsRes.data || []) as Array<{ exam_id: number }>) {
+    const eid = Number(row.exam_id);
+    gradedByExam.set(eid, (gradedByExam.get(eid) || 0) + 1);
+  }
+
+  const examIds = ((examIdsRes.data || []) as Array<{ id: number }>).map((r) => Number(r.id)).filter((id) => id > 0);
+  const subCounts = examIds.length
+    ? await Promise.all(examIds.map((eid) => countExamSubmissionFiles(sb, eid)))
+    : [];
+  let pendingGrading = 0;
+  for (let i = 0; i < examIds.length; i++) {
+    const subCount = subCounts[i] || 0;
+    const gradedCount = gradedByExam.get(examIds[i]) || 0;
+    pendingGrading += Math.max(0, subCount - gradedCount);
+  }
+
+  const enrolledByCourse = new Map<number, number>();
+  for (const row of (enrollmentsCourseIdsRes.data || []) as Array<{ course_id: number }>) {
+    const cid = Number(row.course_id);
+    enrolledByCourse.set(cid, (enrolledByCourse.get(cid) || 0) + 1);
+  }
+
+  const courseRows = (courseOptsRes.data || []) as Array<{ id: number; title_ar: string; capacity: number }>;
+  const courseChart = courseRows.map((c) => ({
+    id: Number(c.id),
+    title_ar: String(c.title_ar || ''),
+    capacity: Number(c.capacity || 0),
+    enrolled_count: enrolledByCourse.get(Number(c.id)) || 0,
+  }));
+
+  const studentsCount = studentsCountRes.count || 0;
+  const teachersCount = teachersCountRes.count || 0;
+  const coursesCount = coursesCountRes.count || 0;
+  const lessonsCount = lessonsCountRes.count || 0;
+  const pendingSuggestionsCount = suggestionsList.filter((s) => s.status === 'pending').length;
+
+  return {
+    counts: {
+      students: studentsCount,
+      teachers: teachersCount,
+      courses: coursesCount,
+      lessons: lessonsCount,
+      pendingAdmissions:
+        (pendingAdmissionsRes.count || 0) +
+        teacherApps.filter((t) => t.status === 'pending').length +
+        guardianReqs.filter((g) => g.status === 'pending').length,
+      pendingGrading,
+      pendingSuggestions: pendingSuggestionsCount,
+    },
+    overview: {
+      stats: {
+        students: studentsCount,
+        teachers: teachersCount,
+        courses: coursesCount,
+        lessons: lessonsCount,
+      },
+    },
+    levels: levelsRes.data || [],
+    games: gamesRes.data || [],
+    legal: (legalRes.data || []).map((doc: Record<string, unknown>) => ({
+      ...doc,
+      content_ar: normalizeLegacyDomainText(String(doc.content_ar || '')),
+      content_en: normalizeLegacyDomainText(String(doc.content_en || '')),
+    })),
+    courseChart,
+    options: {
+      students: ((studentOptsRes.data || []) as Array<{ id: number; full_name_ar: string; student_code: string }>).map((s) => ({
+        id: Number(s.id),
+        label: `${s.full_name_ar} (${s.student_code})`,
+        full_name_ar: s.full_name_ar,
+        student_code: s.student_code,
+      })),
+      teachers: teacherOptionRows.map((t) => {
+        const isAdmin = Boolean(t.profile_id && adminProfileSet.has(String(t.profile_id)));
+        const baseName = String(t.name_ar || '');
+        return {
+          id: Number(t.id),
+          label: isAdmin ? `${baseName} (المدير)` : baseName,
+          is_admin: isAdmin,
+        };
+      }),
+      unlinkedAdmins,
+      courses: courseRows.map((c) => ({
+        id: Number(c.id),
+        label: String(c.title_ar || ''),
+      })),
+    },
+  };
+}
+
+app.get('/api/admin/dashboard/summary', authenticate, requireRole('admin'), asyncHandler(async (_req, res) => {
+  const stopTimer = startDevEndpointTimer('GET /api/admin/dashboard/summary');
+  try {
+    if (adminDashboardSummaryCache && Date.now() < adminDashboardSummaryCache.expiresAt) {
+      res.json(adminDashboardSummaryCache.payload);
+      return;
+    }
+
+    const sb = requireSupabaseAdmin();
+    if (!adminDashboardSummaryInFlight) {
+      adminDashboardSummaryInFlight = buildAdminDashboardSummaryPayload(sb)
+        .then((payload) => {
+          adminDashboardSummaryCache = {
+            payload,
+            expiresAt: Date.now() + DASHBOARD_CACHE_TTL_MS,
+          };
+          return payload;
+        })
+        .finally(() => {
+          adminDashboardSummaryInFlight = null;
+        });
+    }
+
+    const payload = await adminDashboardSummaryInFlight;
+    res.json(payload);
+  } finally {
+    stopTimer?.();
+  }
+}));
+
+app.get('/api/admin/students', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const stopTimer = startDevEndpointTimer('GET /api/admin/students');
+  try {
+    const sb = requireSupabaseAdmin();
+    const { page, limit, q, from, to } = parseAdminListQuery(req);
+    const safeQ = sanitizePostgrestOrSearch(q);
+
+  let query = sb
+    .from('students')
+    .select(
+      'id, student_code, full_name_ar, full_name_en, age, level_id, status, levels(name_ar), guardians(full_name, phone, email, profile_id)',
+      { count: 'exact' }
+    )
+    .is('deleted_at', null);
+
+  if (safeQ) {
+    const { data: matchingGuardians } = await sb
+      .from('guardians')
+      .select('id')
+      .is('deleted_at', null)
+      .or(`full_name.ilike.%${safeQ}%,email.ilike.%${safeQ}%`)
+      .limit(200);
+    const guardianIds = ((matchingGuardians || []) as Array<{ id: number }>)
+      .map((g) => Number(g.id))
+      .filter((id) => id > 0);
+    const orParts = [
+      `full_name_ar.ilike.%${safeQ}%`,
+      `full_name_en.ilike.%${safeQ}%`,
+      `student_code.ilike.%${safeQ}%`,
+    ];
+    if (guardianIds.length > 0) {
+      orParts.push(`guardian_id.in.(${guardianIds.join(',')})`);
+    }
+    query = query.or(orParts.join(','));
+  }
+
+  const { data, count, error } = await query
+    .order('id', { ascending: false })
+    .range(from, to);
+  if (error) {
+    throw new AppError(500, process.env.NODE_ENV === 'production' ? 'Failed to fetch students' : error.message);
+  }
+
+  const items = (data || []).map((s: Record<string, unknown>) => {
+    const l = s.levels as { name_ar?: string } | null;
     const g = s.guardians as { full_name?: string; phone?: string; email?: string; profile_id?: string | null } | null;
-    const p = s.profiles as { email?: string } | null;
-    const { levels: _l, guardians: _g, profiles: _p, ...rest } = s;
+    const { levels: _l, guardians: _g, ...rest } = s;
     return {
       ...rest,
       level_name_ar: l?.name_ar ?? null,
-      level_name_en: l?.name_en ?? null,
       guardian_name: g?.full_name ?? null,
       guardian_phone: g?.phone ?? null,
       guardian_email: g?.email ?? null,
       guardian_linked: Boolean(g?.profile_id),
-      student_email: p?.email ?? null,
     };
   });
 
-  const [admissionMetaMap, teacherApplications, guardianRequests, courseMetasMap, lessonMetasMap] = await Promise.all([
-    listAdmissionMetas(sb),
-    listTeacherApplications(sb),
-    listGuardianRequests(sb),
-    listCourseMetas(sb),
-    listLessonMetas(sb),
-  ]);
+  const total = count || 0;
+  res.json({
+    items,
+    page,
+    limit,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / limit)),
+  });
+  } finally {
+    stopTimer?.();
+  }
+}));
 
-  const adminTeacherById = new Map<number, { name_ar: string; name_en: string }>();
-  for (const t of teachersRes.data || []) {
-    adminTeacherById.set(Number((t as { id: number }).id), {
-      name_ar: String((t as { name_ar?: string }).name_ar || ''),
-      name_en: String((t as { name_en?: string }).name_en || ''),
-    });
+app.get('/api/admin/teachers', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const stopTimer = startDevEndpointTimer('GET /api/admin/teachers');
+  try {
+    const sb = requireSupabaseAdmin();
+    const { page, limit, q, from, to } = parseAdminListQuery(req);
+    const safeQ = sanitizePostgrestOrSearch(q);
+
+  let query = sb
+    .from('teachers')
+    .select(
+      'id, profile_id, name_ar, name_en, specialty_ar, qualifications_ar, bio_ar, hourly_rate, is_public',
+      { count: 'exact' }
+    )
+    .is('deleted_at', null);
+
+  if (safeQ) {
+    query = query.or(
+      `name_ar.ilike.%${safeQ}%,name_en.ilike.%${safeQ}%,specialty_ar.ilike.%${safeQ}%`
+    );
   }
 
-  const courses = (coursesRes.data || []).map((c: Record<string, unknown>) => {
+  const [{ data, count, error }, { data: adminProfs }] = await Promise.all([
+    query.order('id', { ascending: true }).range(from, to),
+    sb.from('profiles').select('id').eq('role', 'admin').is('deleted_at', null).limit(100),
+  ]);
+  if (error) {
+    throw new AppError(500, process.env.NODE_ENV === 'production' ? 'Failed to fetch teachers' : error.message);
+  }
+
+  const adminIdSet = new Set(((adminProfs || []) as Array<{ id: string }>).map((p) => String(p.id)));
+  const items = ((data || []) as Array<Record<string, unknown>>).map(({ profile_id, ...rest }) => ({
+    ...rest,
+    is_admin: Boolean(profile_id && adminIdSet.has(String(profile_id))),
+  }));
+
+  const total = count || 0;
+  res.json({
+    items,
+    page,
+    limit,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / limit)),
+  });
+  } finally {
+    stopTimer?.();
+  }
+}));
+
+app.get('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const stopTimer = startDevEndpointTimer('GET /api/admin/courses');
+  try {
+    const sb = requireSupabaseAdmin();
+    const { page, limit, q, from, to } = parseAdminListQuery(req);
+    const safeQ = sanitizePostgrestOrSearch(q);
+
+  let query = sb
+    .from('courses')
+    .select(
+      'id, title_ar, title_en, description_ar, level_id, teacher_id, schedule_ar, price_monthly, capacity, is_featured, levels(name_ar), teachers(name_ar)',
+      { count: 'exact' }
+    )
+    .is('deleted_at', null);
+
+  if (safeQ) {
+    const { data: matchingTeachers } = await sb
+      .from('teachers')
+      .select('id')
+      .is('deleted_at', null)
+      .or(`name_ar.ilike.%${safeQ}%,name_en.ilike.%${safeQ}%`)
+      .limit(200);
+    const teacherIds = ((matchingTeachers || []) as Array<{ id: number }>)
+      .map((t) => Number(t.id))
+      .filter((id) => id > 0);
+    const orParts = [
+      `title_ar.ilike.%${safeQ}%`,
+      `title_en.ilike.%${safeQ}%`,
+    ];
+    if (teacherIds.length > 0) {
+      orParts.push(`teacher_id.in.(${teacherIds.join(',')})`);
+    }
+    query = query.or(orParts.join(','));
+  }
+
+  const { data: coursesData, count, error } = await query
+    .order('id', { ascending: false })
+    .range(from, to);
+  if (error) {
+    throw new AppError(500, process.env.NODE_ENV === 'production' ? 'Failed to fetch courses' : error.message);
+  }
+
+  const pageRows = (coursesData || []) as Array<Record<string, unknown>>;
+  const pageCourseIds = pageRows.map((c) => Number(c.id)).filter((id) => id > 0);
+
+  const [courseMetasMap, lessonRowsRes, examRowsRes, enrollRowsRes] = pageCourseIds.length
+    ? await Promise.all([
+        listCourseMetas(sb),
+        sb.from('lessons').select('course_id').is('deleted_at', null).in('course_id', pageCourseIds),
+        sb.from('exams').select('course_id').is('deleted_at', null).in('course_id', pageCourseIds),
+        sb.from('enrollments').select('course_id').is('deleted_at', null).in('course_id', pageCourseIds),
+      ])
+    : [new Map(), { data: [] }, { data: [] }, { data: [] }];
+
+  const coTeacherIdsNeeded = new Set<number>();
+  for (const cid of pageCourseIds) {
+    const meta = courseMetasMap.get(cid);
+    for (const tid of meta?.co_teacher_ids || []) {
+      coTeacherIdsNeeded.add(tid);
+    }
+  }
+
+  const coTeacherNameMap = new Map<number, string>();
+  if (coTeacherIdsNeeded.size > 0) {
+    const { data: coTeachers } = await sb
+      .from('teachers')
+      .select('id, name_ar')
+      .is('deleted_at', null)
+      .in('id', Array.from(coTeacherIdsNeeded));
+    for (const t of (coTeachers || []) as Array<{ id: number; name_ar: string }>) {
+      coTeacherNameMap.set(Number(t.id), String(t.name_ar || ''));
+    }
+  }
+
+  const lessonCounts = new Map<number, number>();
+  for (const r of (lessonRowsRes.data || []) as Array<{ course_id: number }>) {
+    const cid = Number(r.course_id);
+    lessonCounts.set(cid, (lessonCounts.get(cid) || 0) + 1);
+  }
+  const examCounts = new Map<number, number>();
+  for (const r of (examRowsRes.data || []) as Array<{ course_id: number }>) {
+    const cid = Number(r.course_id);
+    examCounts.set(cid, (examCounts.get(cid) || 0) + 1);
+  }
+  const enrollCounts = new Map<number, number>();
+  for (const r of (enrollRowsRes.data || []) as Array<{ course_id: number }>) {
+    const cid = Number(r.course_id);
+    enrollCounts.set(cid, (enrollCounts.get(cid) || 0) + 1);
+  }
+
+  const items = pageRows.map((c) => {
     const l = c.levels as { name_ar?: string } | null;
     const t = c.teachers as { name_ar?: string } | null;
     const { levels: _l, teachers: _t, ...rest } = c;
     const cid = Number(rest.id);
     const meta = courseMetasMap.get(cid);
-    const coIds = (meta?.co_teacher_ids || []).filter((id) => id !== Number(rest.teacher_id));
+    const coIds = (meta?.co_teacher_ids || []).filter((id: number) => id !== Number(rest.teacher_id));
     return {
       ...rest,
       level_name_ar: l?.name_ar ?? null,
@@ -5452,122 +6653,745 @@ app.get('/api/admin/dashboard', authenticate, requireRole('admin'), asyncHandler
       cover_url: meta?.cover_url ?? null,
       price_monthly_sar: meta?.price_monthly_sar ?? null,
       co_teacher_ids: coIds,
-      co_teacher_names_ar: coIds.map((id) => adminTeacherById.get(id)?.name_ar).filter(Boolean),
+      co_teacher_names_ar: coIds.map((id: number) => coTeacherNameMap.get(id)).filter(Boolean),
+      lesson_count: lessonCounts.get(cid) || 0,
+      exam_count: examCounts.get(cid) || 0,
+      enrolled_count: enrollCounts.get(cid) || 0,
     };
   });
 
-  const lessons = (lessonsRes.data || []).map((l: Record<string, unknown>) => {
-    const c = l.courses as { title_ar?: string } | null;
-    const { courses: _c, ...rest } = l;
-    const lid = Number(rest.id);
-    const lm = lessonMetasMap.get(lid);
-    return {
-      ...rest,
-      course_title_ar: c?.title_ar ?? null,
-      weekday_ar: lm?.weekday_ar ?? '',
-      is_published: lm ? lm.is_published : true,
-      published_at: lm?.published_at ?? null,
-    };
+  const total = count || 0;
+  res.json({
+    items,
+    page,
+    limit,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / limit)),
   });
+  } finally {
+    stopTimer?.();
+  }
+}));
 
-  const enrollments = (enrollmentsRes.data || []).map((e: Record<string, unknown>) => {
+app.get('/api/admin/profiles', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const stopTimer = startDevEndpointTimer('GET /api/admin/profiles');
+  try {
+    const sb = requireSupabaseAdmin();
+    const { page, limit, q, from, to } = parseAdminListQuery(req);
+    const safeQ = sanitizePostgrestOrSearch(q);
+
+  let query = sb
+    .from('profiles')
+    .select('id, email, full_name, role, is_active', { count: 'exact' })
+    .is('deleted_at', null);
+
+  if (safeQ) {
+    query = query.or(`full_name.ilike.%${safeQ}%,email.ilike.%${safeQ}%,role.ilike.%${safeQ}%`);
+  }
+
+  const { data, count, error } = await query
+    .order('created_at', { ascending: true })
+    .range(from, to);
+  if (error) {
+    throw new AppError(500, process.env.NODE_ENV === 'production' ? 'Failed to fetch profiles' : error.message);
+  }
+
+  const total = count || 0;
+  res.json({
+    items: data || [],
+    page,
+    limit,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / limit)),
+  });
+  } finally {
+    stopTimer?.();
+  }
+}));
+
+app.get('/api/admin/enrollments', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const stopTimer = startDevEndpointTimer('GET /api/admin/enrollments');
+  try {
+    const sb = requireSupabaseAdmin();
+    const { page, limit, q, from, to } = parseAdminListQuery(req);
+    const safeQ = sanitizePostgrestOrSearch(q);
+
+  let query = sb
+    .from('enrollments')
+    .select('id, student_id, course_id, status, students(full_name_ar), courses(title_ar)', { count: 'exact' })
+    .is('deleted_at', null);
+
+  if (safeQ) {
+    const [{ data: matchStudents }, { data: matchCourses }] = await Promise.all([
+      sb
+        .from('students')
+        .select('id')
+        .is('deleted_at', null)
+        .or(`full_name_ar.ilike.%${safeQ}%,student_code.ilike.%${safeQ}%`)
+        .limit(200),
+      sb
+        .from('courses')
+        .select('id')
+        .is('deleted_at', null)
+        .or(`title_ar.ilike.%${safeQ}%,title_en.ilike.%${safeQ}%`)
+        .limit(200),
+    ]);
+    const studentIds = ((matchStudents || []) as Array<{ id: number }>).map((s) => Number(s.id)).filter((id) => id > 0);
+    const courseIds = ((matchCourses || []) as Array<{ id: number }>).map((c) => Number(c.id)).filter((id) => id > 0);
+    const orParts: string[] = [];
+    if (studentIds.length > 0) orParts.push(`student_id.in.(${studentIds.join(',')})`);
+    if (courseIds.length > 0) orParts.push(`course_id.in.(${courseIds.join(',')})`);
+    if (orParts.length === 0) {
+      res.json({ items: [], page, limit, total: 0, totalPages: 1 });
+      return;
+    }
+    query = query.or(orParts.join(','));
+  }
+
+  const { data, count, error } = await query
+    .order('id', { ascending: false })
+    .range(from, to);
+  if (error) {
+    throw new AppError(500, process.env.NODE_ENV === 'production' ? 'Failed to fetch enrollments' : error.message);
+  }
+
+  const items = (data || []).map((e: Record<string, unknown>) => {
     const s = e.students as { full_name_ar?: string } | null;
     const c = e.courses as { title_ar?: string } | null;
     const { students: _s, courses: _c, ...rest } = e;
-    return { ...rest, student_name_ar: s?.full_name_ar ?? null, course_title_ar: c?.title_ar ?? null };
-  });
-
-  const admissionRequests = (admissionsRes.data || []).map((ar: Record<string, unknown>) => {
-    const c = ar.courses as { title_ar?: string } | null;
-    const l = ar.levels as { name_ar?: string } | null;
-    const { courses: _c, levels: _l, ...rest } = ar;
-    const meta = admissionMetaMap.get(Number(rest.id));
     return {
       ...rest,
+      student_name_ar: s?.full_name_ar ?? null,
       course_title_ar: c?.title_ar ?? null,
-      level_name_ar: l?.name_ar ?? null,
-      student_email: meta?.student_email ?? null,
     };
   });
 
-  const announcements = (announcementsRes.data || []).map((a: Record<string, unknown>) => {
-    const c = a.courses as { title_ar?: string } | null;
-    const { courses: _c, ...rest } = a;
-    return { ...rest, course_title_ar: c?.title_ar ?? null };
+  const total = count || 0;
+  res.json({
+    items,
+    page,
+    limit,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / limit)),
+  });
+  } finally {
+    stopTimer?.();
+  }
+}));
+
+app.get('/api/admin/courses/:courseId/workspace', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const stopTimer = startDevEndpointTimer('GET /api/admin/courses/:courseId/workspace');
+  try {
+    const courseId = parsePositiveIntParam(req.params.courseId, 'course id');
+    const sb = requireSupabaseAdmin();
+
+  const [courseRes, lessonsRes, examsRes, enrollmentsRes, courseMetasMap, lessonMetasMap] = await Promise.all([
+    sb
+      .from('courses')
+      .select('id, title_ar, title_en, description_ar, level_id, teacher_id, schedule_ar, price_monthly, capacity, is_featured, levels(name_ar), teachers(name_ar)')
+      .eq('id', courseId)
+      .is('deleted_at', null)
+      .maybeSingle(),
+    sb
+      .from('lessons')
+      .select('id, course_id, title_ar, title_en, lesson_date, start_time, duration_min, objectives_ar')
+      .eq('course_id', courseId)
+      .is('deleted_at', null)
+      .order('lesson_date', { ascending: false }),
+    sb
+      .from('exams')
+      .select('id, course_id, title_ar, title_en, exam_date, max_score')
+      .eq('course_id', courseId)
+      .is('deleted_at', null)
+      .order('exam_date', { ascending: false }),
+    sb
+      .from('enrollments')
+      .select('id, student_id, course_id, status, students(full_name_ar)')
+      .eq('course_id', courseId)
+      .is('deleted_at', null)
+      .order('id', { ascending: false }),
+    listCourseMetas(sb),
+    listLessonMetas(sb),
+  ]);
+
+  if (courseRes.error) {
+    throw new AppError(500, process.env.NODE_ENV === 'production' ? 'Failed to load course workspace' : courseRes.error.message);
+  }
+  if (!courseRes.data) {
+    res.status(404).json({ error: 'Course not found' });
+    return;
+  }
+
+  const courseRaw = courseRes.data as Record<string, unknown>;
+  const courseMeta = courseMetasMap.get(courseId);
+  const coIds = (courseMeta?.co_teacher_ids || []).filter((id) => id !== Number(courseRaw.teacher_id));
+
+  const lessonRows = (lessonsRes.data || []) as Array<Record<string, unknown>>;
+  const lessonIds = lessonRows.map((l) => Number(l.id)).filter((id) => id > 0);
+  const examRows = (examsRes.data || []) as Array<Record<string, unknown>>;
+  const examIds = examRows.map((e) => Number(e.id)).filter((id) => id > 0);
+
+  const lessonTeacherIdsNeeded = new Set<number>();
+  for (const l of lessonRows) {
+    const lm = lessonMetasMap.get(Number(l.id));
+    if (lm?.teacher_id) lessonTeacherIdsNeeded.add(Number(lm.teacher_id));
+  }
+  const teacherIdsForLookup = Array.from(new Set([...coIds, ...Array.from(lessonTeacherIdsNeeded)]));
+
+  const [lessonLinksRes, examResultsRes, teachersLookupRes, attendanceRes, recitationsRes, evaluationsRes] = await Promise.all([
+    lessonIds.length
+      ? sb.from('lesson_links').select('id, lesson_id, title_ar, title_en, url, link_type').in('lesson_id', lessonIds)
+      : Promise.resolve({ data: [] }),
+    examIds.length
+      ? sb.from('exam_results').select('exam_id').in('exam_id', examIds)
+      : Promise.resolve({ data: [] }),
+    teacherIdsForLookup.length
+      ? sb.from('teachers').select('id, name_ar').is('deleted_at', null).in('id', teacherIdsForLookup)
+      : Promise.resolve({ data: [] }),
+    lessonIds.length
+      ? sb.from('attendance').select('id, lesson_id, student_id, status, notes, recorded_at').in('lesson_id', lessonIds)
+      : Promise.resolve({ data: [] }),
+    sb
+      .from('recitations')
+      .select('id, student_id, course_id, surah_name, ayah_from, ayah_to, tajweed_score, memorization_score, notes_ar, recorded_at, students(full_name_ar)')
+      .eq('course_id', courseId)
+      .order('recorded_at', { ascending: false })
+      .limit(100),
+    sb
+      .from('evaluations')
+      .select('id, student_id, course_id, period, behavior_score, participation_score, summary_ar, created_at, students(full_name_ar)')
+      .eq('course_id', courseId)
+      .order('created_at', { ascending: false })
+      .limit(100),
+  ]);
+
+  const teacherNameLookup = new Map<number, string>();
+  for (const t of (teachersLookupRes.data || []) as Array<{ id: number; name_ar: string }>) {
+    teacherNameLookup.set(Number(t.id), String(t.name_ar || ''));
+  }
+
+  const cLevel = courseRaw.levels as { name_ar?: string } | null;
+  const cTeacher = courseRaw.teachers as { name_ar?: string } | null;
+  const { levels: _cl, teachers: _ct, ...courseBase } = courseRaw;
+  const courseTitleAr = String(courseRaw.title_ar || '');
+
+  const course = {
+    ...courseBase,
+    level_name_ar: cLevel?.name_ar ?? null,
+    teacher_name_ar: cTeacher?.name_ar ?? null,
+    cover_url: courseMeta?.cover_url ?? null,
+    price_monthly_sar: courseMeta?.price_monthly_sar ?? null,
+    co_teacher_ids: coIds,
+    co_teacher_names_ar: coIds.map((id: number) => teacherNameLookup.get(id)).filter(Boolean),
+  };
+
+  const lessons = lessonRows.map((l) => {
+    const lid = Number(l.id);
+    const lm = lessonMetasMap.get(lid);
+    const lTeacherId = lm?.teacher_id ?? null;
+    return {
+      ...l,
+      course_title_ar: courseTitleAr,
+      weekday_ar: lm?.weekday_ar ?? '',
+      is_published: lm ? lm.is_published : true,
+      published_at: lm?.published_at ?? null,
+      teacher_id: lTeacherId,
+      teacher_name_ar: lTeacherId ? teacherNameLookup.get(lTeacherId) ?? null : null,
+    };
   });
 
-  const examsRaw = examsRes.data || [];
-  const allExamResultsRows = examsRaw.length
-    ? (await sb.from('exam_results').select('exam_id, student_id')).data || []
-    : [];
+  const gradedByExam = new Map<number, number>();
+  for (const er of (examResultsRes.data || []) as Array<{ exam_id: number }>) {
+    const eid = Number(er.exam_id);
+    gradedByExam.set(eid, (gradedByExam.get(eid) || 0) + 1);
+  }
 
   const exams = await Promise.all(
-    examsRaw.map(async (ex: Record<string, unknown>) => {
-      const c = ex.courses as { title_ar?: string } | null;
-      const { courses: _c, ...rest } = ex;
-      const eid = Number(rest.id);
-      const [cfg, subs] = await Promise.all([
+    examRows.map(async (ex) => {
+      const eid = Number(ex.id);
+      const [cfg, submissionCount] = await Promise.all([
         getExamVaultConfig(sb, eid),
-        listExamSubmissionsForExam(sb, eid),
+        countExamSubmissionFiles(sb, eid),
       ]);
-      const gradedCount = allExamResultsRows.filter((er: Record<string, unknown>) => Number(er.exam_id) === eid).length;
+      const gradedCount = gradedByExam.get(eid) || 0;
       return {
-        ...rest,
+        ...ex,
         id: eid,
-        course_title_ar: c?.title_ar ?? null,
+        course_title_ar: courseTitleAr,
         ...sanitizeExamConfigForViewer(cfg, { isPrivileged: true }),
-        submission_count: subs.length,
-        pending_grading_count: subs.filter((s) => s.status === 'submitted_pending').length,
+        submission_count: submissionCount,
+        pending_grading_count: Math.max(0, submissionCount - gradedCount),
         graded_count: gradedCount,
       };
     })
   );
 
-  const certificates = (certificatesRes.data || []).map((cert: Record<string, unknown>) => {
-    const s = cert.students as { full_name_ar?: string } | null;
-    const c = cert.courses as { title_ar?: string } | null;
-    const { students: _s, courses: _c, ...rest } = cert;
-    return { ...rest, student_name_ar: s?.full_name_ar ?? null, course_title_ar: c?.title_ar ?? null };
-  });
-
-  const payoutMap = new Map<number, { bank_name: string; iban: string }>();
-  for (const pd of payoutDetailsRes.data || []) {
-    const row = pd as { teacher_id: number; bank_name: string; iban: string };
-    payoutMap.set(Number(row.teacher_id), { bank_name: row.bank_name, iban: row.iban });
-  }
-
-  const payroll = (payrollRes.data || []).map((p: Record<string, unknown>) => {
-    const t = p.teachers as { name_ar?: string } | null;
-    const pd = payoutMap.get(Number(p.teacher_id));
-    const { teachers: _t, ...rest } = p;
+  const enrollments = (enrollmentsRes.data || []).map((e: Record<string, unknown>) => {
+    const s = e.students as { full_name_ar?: string } | null;
+    const { students: _s, ...rest } = e;
     return {
       ...rest,
-      teacher_name_ar: t?.name_ar ?? null,
-      bank_name: pd?.bank_name ?? null,
-      masked_iban: pd?.iban ? maskIban(pd.iban) : null,
+      student_name_ar: s?.full_name_ar ?? null,
+      course_title_ar: courseTitleAr,
+    };
+  });
+
+  const recitations = ((recitationsRes.data || []) as Array<Record<string, unknown>>).map((r) => {
+    const s = r.students as { full_name_ar?: string } | null;
+    const { students: _s, ...rest } = r;
+    return {
+      ...rest,
+      student_name_ar: s?.full_name_ar ?? null,
+    };
+  });
+
+  const evaluations = ((evaluationsRes.data || []) as Array<Record<string, unknown>>).map((ev) => {
+    const s = ev.students as { full_name_ar?: string } | null;
+    const { students: _s, ...rest } = ev;
+    return {
+      ...rest,
+      student_name_ar: s?.full_name_ar ?? null,
     };
   });
 
   res.json({
-    profiles: profilesRes.data || [],
-    levels: levelsRes.data || [],
-    teachers: teachersRes.data || [],
-    students,
-    courses,
+    course,
     lessons,
     lessonLinks: lessonLinksRes.data || [],
-    enrollments,
-    admissionRequests,
-    teacherApplications,
-    guardianRequests,
-    announcements,
     exams,
-    certificates,
-    payroll,
-    games: gamesRes.data || [],
-    legal: legalRes.data || [],
-    auditLogs: auditLogsRes.data || [],
+    enrollments,
+    attendance: attendanceRes.data || [],
+    recitations,
+    evaluations,
   });
+  } finally {
+    stopTimer?.();
+  }
+}));
+
+app.get('/api/admin/admissions', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const stopTimer = startDevEndpointTimer('GET /api/admin/admissions');
+  try {
+    const sb = requireSupabaseAdmin();
+    const { page, limit, q, from, to } = parseAdminListQuery(req);
+    const safeQ = sanitizePostgrestOrSearch(q);
+    const rawStatus = String(req.query.status || '').trim();
+    const statusFilter = ['pending', 'approved', 'rejected'].includes(rawStatus) ? rawStatus : '';
+
+    let query = sb
+      .from('admission_requests')
+      .select(
+        'id, student_name, student_age, guardian_name, guardian_email, guardian_phone, preferred_course_id, recommended_level_id, status, created_at, courses(title_ar), levels(name_ar)',
+        { count: 'exact' }
+      );
+
+    if (statusFilter) {
+      query = query.eq('status', statusFilter);
+    }
+    if (safeQ) {
+      query = query.or(
+        `student_name.ilike.%${safeQ}%,guardian_name.ilike.%${safeQ}%,guardian_email.ilike.%${safeQ}%,guardian_phone.ilike.%${safeQ}%`
+      );
+    }
+
+    const { data, count, error } = await query
+      .order('created_at', { ascending: false })
+      .range(from, to);
+    if (error) {
+      throw new AppError(500, process.env.NODE_ENV === 'production' ? 'Failed to fetch admission requests' : error.message);
+    }
+
+    const pageRows = (data || []) as Array<Record<string, unknown>>;
+    const metas = await Promise.all(pageRows.map((ar) => getAdmissionMeta(sb, Number(ar.id))));
+
+    const items = pageRows.map((ar, idx) => {
+      const c = ar.courses as { title_ar?: string } | null;
+      const l = ar.levels as { name_ar?: string } | null;
+      const { courses: _c, levels: _l, ...rest } = ar;
+      return {
+        ...rest,
+        course_title_ar: c?.title_ar ?? null,
+        level_name_ar: l?.name_ar ?? null,
+        student_email: metas[idx]?.student_email ?? null,
+      };
+    });
+
+    const total = count || 0;
+    res.json({
+      items,
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    });
+  } finally {
+    stopTimer?.();
+  }
+}));
+
+app.get('/api/admin/teacher-applications', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const stopTimer = startDevEndpointTimer('GET /api/admin/teacher-applications');
+  try {
+    const sb = requireSupabaseAdmin();
+    const { page, limit, q, from, to } = parseAdminListQuery(req);
+    const rawStatus = String(req.query.status || '').trim();
+    const statusFilter = ['pending', 'approved', 'rejected'].includes(rawStatus) ? rawStatus : '';
+    const qLower = q.toLowerCase();
+
+    const allApps = await listTeacherApplications(sb);
+    const filtered = allApps.filter((t) => {
+      if (statusFilter && t.status !== statusFilter) return false;
+      if (!qLower) return true;
+      return (
+        String(t.name_ar || '').toLowerCase().includes(qLower) ||
+        String(t.name_en || '').toLowerCase().includes(qLower) ||
+        String(t.email || '').toLowerCase().includes(qLower) ||
+        String(t.specialty_ar || '').toLowerCase().includes(qLower) ||
+        String(t.phone || '').toLowerCase().includes(qLower)
+      );
+    });
+
+    const total = filtered.length;
+    const items = filtered.slice(from, to + 1);
+    res.json({
+      items,
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    });
+  } finally {
+    stopTimer?.();
+  }
+}));
+
+app.get('/api/admin/guardian-requests', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const stopTimer = startDevEndpointTimer('GET /api/admin/guardian-requests');
+  try {
+    const sb = requireSupabaseAdmin();
+    const { page, limit, q, from, to } = parseAdminListQuery(req);
+    const rawStatus = String(req.query.status || '').trim();
+    const statusFilter = ['pending', 'approved', 'rejected'].includes(rawStatus) ? rawStatus : '';
+    const qLower = q.toLowerCase();
+
+    const allReqs = await listGuardianRequests(sb);
+    const filtered = allReqs.filter((g) => {
+      if (statusFilter && g.status !== statusFilter) return false;
+      if (!qLower) return true;
+      return (
+        String(g.full_name || '').toLowerCase().includes(qLower) ||
+        String(g.email || '').toLowerCase().includes(qLower) ||
+        String(g.student_code || '').toLowerCase().includes(qLower) ||
+        String(g.student_name || '').toLowerCase().includes(qLower) ||
+        String(g.phone || '').toLowerCase().includes(qLower)
+      );
+    });
+
+    const total = filtered.length;
+    const items = filtered.slice(from, to + 1);
+    res.json({
+      items,
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    });
+  } finally {
+    stopTimer?.();
+  }
+}));
+
+app.get('/api/admin/announcements', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const stopTimer = startDevEndpointTimer('GET /api/admin/announcements');
+  try {
+    const sb = requireSupabaseAdmin();
+    const { page, limit, q, from, to } = parseAdminListQuery(req);
+    const safeQ = sanitizePostgrestOrSearch(q);
+
+    let query = sb
+      .from('announcements')
+      .select('id, title_ar, body_ar, target_scope, target_course_id, created_at, courses(title_ar)', { count: 'exact' })
+      .is('deleted_at', null);
+
+    if (safeQ) {
+      const { data: matchCourses } = await sb
+        .from('courses')
+        .select('id')
+        .is('deleted_at', null)
+        .or(`title_ar.ilike.%${safeQ}%,title_en.ilike.%${safeQ}%`)
+        .limit(200);
+      const courseIds = ((matchCourses || []) as Array<{ id: number }>).map((c) => Number(c.id)).filter((id) => id > 0);
+      const orParts = [
+        `title_ar.ilike.%${safeQ}%`,
+        `body_ar.ilike.%${safeQ}%`,
+        `target_scope.ilike.%${safeQ}%`,
+      ];
+      if (courseIds.length > 0) {
+        orParts.push(`target_course_id.in.(${courseIds.join(',')})`);
+      }
+      query = query.or(orParts.join(','));
+    }
+
+    const { data, count, error } = await query
+      .order('created_at', { ascending: false })
+      .range(from, to);
+    if (error) {
+      throw new AppError(500, process.env.NODE_ENV === 'production' ? 'Failed to fetch announcements' : error.message);
+    }
+
+    const items = (data || []).map((a: Record<string, unknown>) => {
+      const c = a.courses as { title_ar?: string } | null;
+      const { courses: _c, ...rest } = a;
+      return { ...rest, course_title_ar: c?.title_ar ?? null };
+    });
+
+    const total = count || 0;
+    res.json({
+      items,
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    });
+  } finally {
+    stopTimer?.();
+  }
+}));
+
+app.get('/api/admin/exams', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const stopTimer = startDevEndpointTimer('GET /api/admin/exams');
+  try {
+    const sb = requireSupabaseAdmin();
+    const { page, limit, q, from, to } = parseAdminListQuery(req);
+    const safeQ = sanitizePostgrestOrSearch(q);
+
+    let query = sb
+      .from('exams')
+      .select('id, course_id, title_ar, title_en, exam_date, max_score, courses!inner(title_ar, deleted_at)', { count: 'exact' })
+      .is('deleted_at', null)
+      .is('courses.deleted_at', null);
+
+    if (safeQ) {
+      const { data: matchCourses } = await sb
+        .from('courses')
+        .select('id')
+        .is('deleted_at', null)
+        .or(`title_ar.ilike.%${safeQ}%,title_en.ilike.%${safeQ}%`)
+        .limit(200);
+      const courseIds = ((matchCourses || []) as Array<{ id: number }>).map((c) => Number(c.id)).filter((id) => id > 0);
+      const orParts = [
+        `title_ar.ilike.%${safeQ}%`,
+        `title_en.ilike.%${safeQ}%`,
+      ];
+      if (courseIds.length > 0) {
+        orParts.push(`course_id.in.(${courseIds.join(',')})`);
+      }
+      query = query.or(orParts.join(','));
+    }
+
+    const { data: examsData, count, error } = await query
+      .order('exam_date', { ascending: false })
+      .range(from, to);
+    if (error) {
+      throw new AppError(500, process.env.NODE_ENV === 'production' ? 'Failed to fetch exams' : error.message);
+    }
+
+    const pageRows = (examsData || []) as Array<Record<string, unknown>>;
+    const pageExamIds = pageRows.map((ex) => Number(ex.id)).filter((id) => id > 0);
+    const { data: examResultsRows } = pageExamIds.length
+      ? await sb.from('exam_results').select('exam_id').in('exam_id', pageExamIds)
+      : { data: [] };
+
+    const gradedByExam = new Map<number, number>();
+    for (const er of (examResultsRows || []) as Array<{ exam_id: number }>) {
+      const eid = Number(er.exam_id);
+      gradedByExam.set(eid, (gradedByExam.get(eid) || 0) + 1);
+    }
+
+    const items = await Promise.all(
+      pageRows.map(async (ex) => {
+        const c = ex.courses as { title_ar?: string } | null;
+        const { courses: _c, ...rest } = ex;
+        const eid = Number(rest.id);
+        const [cfg, submissionCount] = await Promise.all([
+          getExamVaultConfig(sb, eid),
+          countExamSubmissionFiles(sb, eid),
+        ]);
+        const gradedCount = gradedByExam.get(eid) || 0;
+        return {
+          ...rest,
+          id: eid,
+          course_title_ar: c?.title_ar ?? null,
+          ...sanitizeExamConfigForViewer(cfg, { isPrivileged: true }),
+          submission_count: submissionCount,
+          pending_grading_count: Math.max(0, submissionCount - gradedCount),
+          graded_count: gradedCount,
+        };
+      })
+    );
+
+    const total = count || 0;
+    res.json({
+      items,
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    });
+  } finally {
+    stopTimer?.();
+  }
+}));
+
+app.get('/api/admin/certificates', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const stopTimer = startDevEndpointTimer('GET /api/admin/certificates');
+  try {
+    const sb = requireSupabaseAdmin();
+    const { page, limit, q, from, to } = parseAdminListQuery(req);
+    const safeQ = sanitizePostgrestOrSearch(q);
+
+    let query = sb
+      .from('certificates')
+      .select(
+        'id, verification_code, student_id, course_id, title_ar, title_en, grade_label, issued_at, revoked_at, students(full_name_ar), courses(title_ar)',
+        { count: 'exact' }
+      );
+
+    if (safeQ) {
+      const [{ data: matchStudents }, { data: matchCourses }] = await Promise.all([
+        sb
+          .from('students')
+          .select('id')
+          .is('deleted_at', null)
+          .or(`full_name_ar.ilike.%${safeQ}%,student_code.ilike.%${safeQ}%`)
+          .limit(200),
+        sb
+          .from('courses')
+          .select('id')
+          .is('deleted_at', null)
+          .or(`title_ar.ilike.%${safeQ}%,title_en.ilike.%${safeQ}%`)
+          .limit(200),
+      ]);
+      const studentIds = ((matchStudents || []) as Array<{ id: number }>).map((s) => Number(s.id)).filter((id) => id > 0);
+      const courseIds = ((matchCourses || []) as Array<{ id: number }>).map((c) => Number(c.id)).filter((id) => id > 0);
+      const orParts = [
+        `verification_code.ilike.%${safeQ}%`,
+        `title_ar.ilike.%${safeQ}%`,
+        `grade_label.ilike.%${safeQ}%`,
+      ];
+      if (studentIds.length > 0) orParts.push(`student_id.in.(${studentIds.join(',')})`);
+      if (courseIds.length > 0) orParts.push(`course_id.in.(${courseIds.join(',')})`);
+      query = query.or(orParts.join(','));
+    }
+
+    const { data, count, error } = await query
+      .order('issued_at', { ascending: false })
+      .range(from, to);
+    if (error) {
+      throw new AppError(500, process.env.NODE_ENV === 'production' ? 'Failed to fetch certificates' : error.message);
+    }
+
+    const items = (data || []).map((cert: Record<string, unknown>) => {
+      const s = cert.students as { full_name_ar?: string } | null;
+      const c = cert.courses as { title_ar?: string } | null;
+      const { students: _s, courses: _c, ...rest } = cert;
+      return {
+        ...rest,
+        student_name_ar: s?.full_name_ar ?? null,
+        course_title_ar: c?.title_ar ?? null,
+      };
+    });
+
+    const total = count || 0;
+    res.json({
+      items,
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    });
+  } finally {
+    stopTimer?.();
+  }
+}));
+
+app.get('/api/admin/payroll', authenticate, requireRole('admin'), asyncHandler(async (req, res) => {
+  const stopTimer = startDevEndpointTimer('GET /api/admin/payroll');
+  try {
+    const sb = requireSupabaseAdmin();
+    const { page, limit, q, from, to } = parseAdminListQuery(req);
+    const safeQ = sanitizePostgrestOrSearch(q);
+
+    let query = sb
+      .from('payroll')
+      .select(
+        'id, teacher_id, month_year, base_amount, bonus_amount, deduction_amount, net_amount, status, teachers(name_ar)',
+        { count: 'exact' }
+      );
+
+    if (safeQ) {
+      const { data: matchTeachers } = await sb
+        .from('teachers')
+        .select('id')
+        .is('deleted_at', null)
+        .or(`name_ar.ilike.%${safeQ}%,name_en.ilike.%${safeQ}%`)
+        .limit(200);
+      const teacherIds = ((matchTeachers || []) as Array<{ id: number }>).map((t) => Number(t.id)).filter((id) => id > 0);
+      const orParts = [
+        `month_year.ilike.%${safeQ}%`,
+        `status.ilike.%${safeQ}%`,
+      ];
+      if (teacherIds.length > 0) orParts.push(`teacher_id.in.(${teacherIds.join(',')})`);
+      query = query.or(orParts.join(','));
+    }
+
+    const { data, count, error } = await query
+      .order('month_year', { ascending: false })
+      .order('id', { ascending: false })
+      .range(from, to);
+    if (error) {
+      throw new AppError(500, process.env.NODE_ENV === 'production' ? 'Failed to fetch payroll records' : error.message);
+    }
+
+    const pageRows = (data || []) as Array<Record<string, unknown>>;
+    const pageTeacherIds = Array.from(
+      new Set(pageRows.map((p) => Number(p.teacher_id)).filter((id) => id > 0))
+    );
+    const payoutMap = new Map<number, { bank_name: string; iban: string }>();
+    if (pageTeacherIds.length > 0) {
+      const { data: payoutRows } = await sb
+        .from('teacher_payout_details')
+        .select('teacher_id, bank_name, iban')
+        .in('teacher_id', pageTeacherIds);
+      for (const pd of payoutRows || []) {
+        const row = pd as { teacher_id: number; bank_name: string; iban: string };
+        payoutMap.set(Number(row.teacher_id), { bank_name: row.bank_name, iban: row.iban });
+      }
+    }
+
+    const items = pageRows.map((p) => {
+      const t = p.teachers as { name_ar?: string } | null;
+      const pd = payoutMap.get(Number(p.teacher_id));
+      const { teachers: _t, ...rest } = p;
+      return {
+        ...rest,
+        teacher_name_ar: t?.name_ar ?? null,
+        bank_name: pd?.bank_name ?? null,
+        masked_iban: pd?.iban ? maskIban(pd.iban) : null,
+      };
+    });
+
+    const total = count || 0;
+    res.json({
+      items,
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    });
+  } finally {
+    stopTimer?.();
+  }
 }));
 
 function sanitizeCourseCoverUrlInput(raw?: string | null): string | null {
@@ -5578,6 +7402,13 @@ function sanitizeCourseCoverUrlInput(raw?: string | null): string | null {
   return null;
 }
 
+const teacherIdOrAdminSchema = z.union([
+  z.coerce.number().int().positive(),
+  z.string().trim().regex(ADMIN_TEACHER_REF_REGEX),
+  z.literal(''),
+  z.null(),
+]);
+
 app.post('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const schema = z.object({
     title_ar: z.string().trim().min(2).max(180),
@@ -5585,7 +7416,7 @@ app.post('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler<
     description_ar: z.string().trim().max(2500).optional(),
     description_en: z.string().trim().max(2500).optional(),
     level_id: z.coerce.number().int().positive(),
-    teacher_id: z.union([z.coerce.number().int().positive(), z.literal(''), z.null()]).optional().transform((v) => (v === '' || v === null || v === undefined ? null : v)),
+    teacher_id: teacherIdOrAdminSchema.optional().transform((v) => (v === '' || v === null || v === undefined ? null : v)),
     schedule_ar: z.string().trim().min(1).max(180),
     schedule_en: z.string().trim().max(180).optional(),
     price_monthly: z.coerce.number().min(0).max(100000),
@@ -5593,6 +7424,7 @@ app.post('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler<
     capacity: z.coerce.number().int().min(1).max(500).optional().default(10),
     cover_url: z.string().trim().max(600).nullable().optional(),
     co_teacher_ids: z.array(z.coerce.number().int().positive()).max(20).optional(),
+    co_teacher_admin_ids: z.array(z.string().uuid()).max(20).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -5606,7 +7438,7 @@ app.post('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler<
     description_ar,
     description_en,
     level_id,
-    teacher_id,
+    teacher_id: rawTeacherId,
     schedule_ar,
     schedule_en,
     price_monthly,
@@ -5614,6 +7446,7 @@ app.post('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler<
     capacity,
     cover_url,
     co_teacher_ids,
+    co_teacher_admin_ids,
   } = parsed.data;
 
   const sb = requireSupabaseAdmin();
@@ -5623,13 +7456,18 @@ app.post('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler<
     return;
   }
 
+  const resolvedTeacherId = await resolveTeacherRefToId(sb, rawTeacherId);
+  const resolvedAdminCoIds = Array.isArray(co_teacher_admin_ids) && co_teacher_admin_ids.length
+    ? await Promise.all(co_teacher_admin_ids.map(async (pid) => (await ensureTeacherForAdminProfile(sb, pid)).id))
+    : [];
+
   const inserted = await insertRowSafe<{ id: number }>('courses', {
     title_ar,
     title_en: title_en?.trim() || title_ar,
     description_ar: description_ar || '',
     description_en: description_en?.trim() || description_ar || '',
     level_id,
-    teacher_id,
+    teacher_id: resolvedTeacherId,
     schedule_ar,
     schedule_en: schedule_en?.trim() || schedule_ar,
     price_monthly,
@@ -5638,9 +7476,11 @@ app.post('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler<
   });
 
   const cleanCover = sanitizeCourseCoverUrlInput(cover_url);
-  const cleanCoTeachers = Array.isArray(co_teacher_ids)
-    ? Array.from(new Set(co_teacher_ids.filter((tid) => tid !== (teacher_id || 0))))
-    : [];
+  const combinedCoTeachers = [
+    ...(Array.isArray(co_teacher_ids) ? co_teacher_ids : []),
+    ...resolvedAdminCoIds,
+  ];
+  const cleanCoTeachers = Array.from(new Set(combinedCoTeachers.filter((tid) => tid !== (resolvedTeacherId || 0))));
   if (cleanCover || cleanCoTeachers.length > 0 || price_monthly_sar !== null) {
     await saveCourseMeta(sb, {
       course_id: inserted.id,
@@ -5664,7 +7504,7 @@ app.patch('/api/admin/courses/:id', authenticate, requireRole('admin'), asyncHan
     description_ar: z.string().trim().max(2000).optional(),
     description_en: z.string().trim().max(2000).optional(),
     level_id: z.coerce.number().int().positive().optional(),
-    teacher_id: z.union([z.coerce.number().int().positive(), z.literal(''), z.null()]).optional().transform((v) => (v === '' || v === null || v === undefined ? (v === undefined ? undefined : null) : v)),
+    teacher_id: teacherIdOrAdminSchema.optional().transform((v) => (v === '' || v === null ? null : v)),
     schedule_ar: z.string().trim().min(1).max(180).optional(),
     schedule_en: z.string().trim().min(1).max(180).optional(),
     price_monthly: z.coerce.number().min(0).max(100000).optional(),
@@ -5673,6 +7513,7 @@ app.patch('/api/admin/courses/:id', authenticate, requireRole('admin'), asyncHan
     is_featured: z.boolean().optional(),
     cover_url: z.string().trim().max(600).nullable().optional(),
     co_teacher_ids: z.array(z.coerce.number().int().positive()).max(20).optional(),
+    co_teacher_admin_ids: z.array(z.string().uuid()).max(20).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -5680,7 +7521,13 @@ app.patch('/api/admin/courses/:id', authenticate, requireRole('admin'), asyncHan
     return;
   }
   const sb = requireSupabaseAdmin();
-  const { cover_url, co_teacher_ids, price_monthly_sar, ...courseUpdates } = parsed.data;
+  const { cover_url, co_teacher_ids, co_teacher_admin_ids, price_monthly_sar, teacher_id: rawTeacherId, ...restUpdates } = parsed.data;
+  const resolvedTeacherId = rawTeacherId !== undefined ? await resolveTeacherRefToId(sb, rawTeacherId) : undefined;
+  const courseUpdates = {
+    ...restUpdates,
+    ...(resolvedTeacherId !== undefined ? { teacher_id: resolvedTeacherId } : {}),
+  };
+
   if (Object.keys(courseUpdates).length > 0) {
     const { error } = await sb.from('courses').update(courseUpdates).eq('id', id).is('deleted_at', null);
     if (error) {
@@ -5689,14 +7536,15 @@ app.patch('/api/admin/courses/:id', authenticate, requireRole('admin'), asyncHan
     }
   }
 
-  if (cover_url !== undefined || co_teacher_ids !== undefined || price_monthly_sar !== undefined) {
+  if (cover_url !== undefined || co_teacher_ids !== undefined || co_teacher_admin_ids !== undefined || price_monthly_sar !== undefined) {
     const existingMeta = await getCourseMeta(sb, id);
     const { data: curCourse } = await sb.from('courses').select('teacher_id').eq('id', id).maybeSingle();
-    const mainTeacherId = courseUpdates.teacher_id ?? Number(curCourse?.teacher_id || 0);
-    const nextCoIds =
-      co_teacher_ids !== undefined
-        ? Array.from(new Set(co_teacher_ids.filter((tid) => tid !== mainTeacherId)))
-        : existingMeta?.co_teacher_ids || [];
+    const mainTeacherId = resolvedTeacherId !== undefined ? (resolvedTeacherId ?? 0) : Number(curCourse?.teacher_id || 0);
+    const resolvedAdminCoIds = Array.isArray(co_teacher_admin_ids) && co_teacher_admin_ids.length
+      ? await Promise.all(co_teacher_admin_ids.map(async (pid) => (await ensureTeacherForAdminProfile(sb, pid)).id))
+      : [];
+    const baseCoIds = co_teacher_ids !== undefined ? co_teacher_ids : existingMeta?.co_teacher_ids || [];
+    const nextCoIds = Array.from(new Set([...baseCoIds, ...resolvedAdminCoIds].filter((tid) => tid !== mainTeacherId)));
     const nextCoverUrl =
       cover_url !== undefined ? sanitizeCourseCoverUrlInput(cover_url) : existingMeta?.cover_url ?? null;
     const nextSar =
@@ -5890,6 +7738,7 @@ app.post('/api/admin/lessons', authenticate, requireRole('admin'), asyncHandler<
     objectives_en: z.string().trim().max(1500).optional(),
     live_url: z.string().trim().max(600).optional(),
     weekday_ar: z.string().trim().max(80).optional(),
+    teacher_id: teacherIdOrAdminSchema.optional().transform((v) => (v === '' || v === null || v === undefined ? null : v)),
     is_published: z.boolean().optional(),
     publish_and_notify: z.boolean().optional(),
   });
@@ -5910,6 +7759,7 @@ app.post('/api/admin/lessons', authenticate, requireRole('admin'), asyncHandler<
     objectives_en,
     live_url,
     weekday_ar,
+    teacher_id: rawLessonTeacherId,
     is_published,
     publish_and_notify,
   } = parsed.data;
@@ -5925,6 +7775,8 @@ app.post('/api/admin/lessons', authenticate, requireRole('admin'), asyncHandler<
     res.status(404).json({ error: 'Target course not found' });
     return;
   }
+
+  const resolvedLessonTeacherId = await resolveTeacherRefToId(sb, rawLessonTeacherId);
 
   const lesson = await insertRowSafe<{ id: number }>('lessons', {
     course_id: courseIdNum,
@@ -5954,6 +7806,7 @@ app.post('/api/admin/lessons', authenticate, requireRole('admin'), asyncHandler<
     weekday_ar: cleanWeekday,
     is_published: shouldPublish,
     published_at: shouldPublish ? new Date().toISOString() : null,
+    teacher_id: resolvedLessonTeacherId,
   });
 
   let notifiedStudents = 0;
@@ -5974,6 +7827,7 @@ app.post('/api/admin/lessons', authenticate, requireRole('admin'), asyncHandler<
   await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_LESSON', 'lesson', lesson.id, {
     course_id: courseIdNum,
     is_published: shouldPublish,
+    teacher_id: resolvedLessonTeacherId,
     notifiedStudents,
   });
   res.status(201).json({ id: lesson.id, is_published: shouldPublish, notifiedStudents });
@@ -6000,6 +7854,7 @@ app.post('/api/admin/lessons/:id/publish', authenticate, requireRole('admin', 't
     weekday_ar: existingMeta?.weekday_ar || '',
     is_published: true,
     published_at: new Date().toISOString(),
+    teacher_id: existingMeta?.teacher_id ?? null,
   };
   await saveLessonMeta(sb, nextMeta);
 
@@ -6033,6 +7888,7 @@ app.patch('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHan
     objectives_ar: z.string().trim().max(1000).optional(),
     objectives_en: z.string().trim().max(1000).optional(),
     weekday_ar: z.string().trim().max(80).optional(),
+    teacher_id: teacherIdOrAdminSchema.optional().transform((v) => (v === '' || v === null ? null : v)),
     is_published: z.boolean().optional(),
   });
   const parsed = schema.safeParse(req.body);
@@ -6041,7 +7897,10 @@ app.patch('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHan
     return;
   }
   const sb = requireSupabaseAdmin();
-  const { weekday_ar, is_published, ...lessonUpdates } = parsed.data;
+  const { weekday_ar, is_published, teacher_id: rawLessonTeacherId, ...lessonUpdates } = parsed.data;
+  const resolvedLessonTeacherId =
+    rawLessonTeacherId !== undefined ? await resolveTeacherRefToId(sb, rawLessonTeacherId) : undefined;
+
   if (Object.keys(lessonUpdates).length > 0) {
     const { error } = await sb.from('lessons').update(lessonUpdates).eq('id', id).is('deleted_at', null);
     if (error) {
@@ -6050,7 +7909,7 @@ app.patch('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHan
     }
   }
 
-  if (weekday_ar !== undefined || is_published !== undefined) {
+  if (weekday_ar !== undefined || is_published !== undefined || resolvedLessonTeacherId !== undefined) {
     const existingMeta = await getLessonMeta(sb, id);
     const nextPublished = is_published !== undefined ? is_published : existingMeta ? existingMeta.is_published : true;
     await saveLessonMeta(sb, {
@@ -6058,6 +7917,7 @@ app.patch('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHan
       weekday_ar: weekday_ar !== undefined ? weekday_ar : existingMeta?.weekday_ar || '',
       is_published: nextPublished,
       published_at: nextPublished ? existingMeta?.published_at || new Date().toISOString() : null,
+      teacher_id: resolvedLessonTeacherId !== undefined ? resolvedLessonTeacherId : existingMeta?.teacher_id ?? null,
     });
   }
 
@@ -6077,6 +7937,28 @@ app.delete('/api/admin/lessons/:id', authenticate, requireRole('admin'), asyncHa
   invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'DELETE_LESSON', 'lesson', id, {});
   res.json({ ok: true });
+}));
+
+app.post('/api/admin/teachers/ensure-admin', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+  const schema = z.object({
+    profile_id: z.string().uuid().optional(),
+  });
+  const parsed = schema.safeParse(req.body || {});
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid administrator profile ID' });
+    return;
+  }
+  const sb = requireSupabaseAdmin();
+  const targetProfileId = parsed.data.profile_id || req.user!.id;
+  const linked = await ensureTeacherForAdminProfile(sb, targetProfileId);
+  invalidateOverviewCache();
+  if (linked.created) {
+    await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_TEACHER', 'teacher', linked.id, {
+      teacher_id: linked.id,
+      admin_profile_id: targetProfileId,
+    });
+  }
+  res.json({ id: linked.id, name_ar: linked.name_ar, created: linked.created });
 }));
 
 app.post('/api/admin/teachers', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
@@ -6101,9 +7983,50 @@ app.post('/api/admin/teachers', authenticate, requireRole('admin'), asyncHandler
   const { email, name_ar, name_en, bio_ar, bio_en, qualifications_ar, qualifications_en, specialty_ar, specialty_en, hourly_rate } = parsed.data;
   const cleanEmail = email.toLowerCase();
   const cleanName = name_ar;
-  const tempPassword = generateTempPassword();
   const sb = requireSupabaseAdmin();
 
+  const { data: existingProfile } = await sb
+    .from('profiles')
+    .select('id, role, is_active, deleted_at')
+    .eq('email', cleanEmail)
+    .is('deleted_at', null)
+    .maybeSingle();
+
+  if (existingProfile && existingProfile.role === 'admin') {
+    const { data: existingTeacher } = await sb
+      .from('teachers')
+      .select('id')
+      .eq('profile_id', existingProfile.id)
+      .is('deleted_at', null)
+      .maybeSingle();
+    if (existingTeacher) {
+      res.status(200).json({ id: Number(existingTeacher.id), linked_existing_admin: true });
+      return;
+    }
+    const teacher = await insertRowSafe<{ id: number }>('teachers', {
+      profile_id: existingProfile.id,
+      name_ar: cleanName,
+      name_en: name_en?.trim() || cleanName,
+      bio_ar: bio_ar || '',
+      bio_en: bio_en || '',
+      qualifications_ar: qualifications_ar || '',
+      qualifications_en: qualifications_en || '',
+      specialty_ar: specialty_ar || '',
+      specialty_en: specialty_en || '',
+      avatar_url: '/assets/images/teacher_portrait_1.webp',
+      hourly_rate,
+      is_public: true,
+    });
+    invalidateOverviewCache();
+    await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_TEACHER', 'teacher', teacher.id, {
+      teacher_id: teacher.id,
+      linked_existing_admin: true,
+    });
+    res.status(201).json({ id: teacher.id, linked_existing_admin: true });
+    return;
+  }
+
+  const tempPassword = generateTempPassword();
   const { user } = await provisionSupabaseAuthUser(cleanEmail, tempPassword, cleanName, 'teacher');
   const { error: pErr } = await sb.from('profiles').upsert(
     {
@@ -6136,7 +8059,9 @@ app.post('/api/admin/teachers', authenticate, requireRole('admin'), asyncHandler
   });
 
   invalidateOverviewCache();
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_TEACHER', 'teacher', teacher.id, { email: cleanEmail, name_ar: cleanName });
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_TEACHER', 'teacher', teacher.id, {
+    teacher_id: teacher.id,
+  });
   res.status(201).json({ id: teacher.id, temporary_password: tempPassword });
 }));
 
@@ -6166,22 +8091,23 @@ app.patch('/api/admin/teachers/:id', authenticate, requireRole('admin'), asyncHa
     return;
   }
   invalidateOverviewCache();
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_TEACHER', 'teacher', id, parsed.data);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_TEACHER', 'teacher', id, {
+    updated_fields: Object.keys(parsed.data),
+  });
   res.json({ ok: true });
 }));
 
-async function purgeEmailTraces(sb: ReturnType<typeof requireSupabaseAdmin>, rawEmails: Array<string | null | undefined>, matchedProfileIds: Array<string | null | undefined> = []) {
-  const emailSet = new Set(rawEmails.map((e) => String(e || '').trim().toLowerCase()).filter(Boolean));
+async function purgeEmailTraces(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  rawEmails: Array<string | null | undefined>,
+  matchedProfileIds: Array<string | null | undefined> = []
+): Promise<number> {
+  const emailList = Array.from(
+    new Set(rawEmails.map((e) => String(e || '').trim().toLowerCase()).filter(Boolean))
+  );
+  const emailSet = new Set(emailList);
   const profileSet = new Set(matchedProfileIds.map((p) => String(p || '').trim()).filter(Boolean));
-  if (!emailSet.size && !profileSet.size) return;
-
-  for (const email of emailSet) {
-    try {
-      await sb.from('consents').delete().eq('email', email);
-    } catch {
-      // ignore
-    }
-  }
+  if (!emailSet.size && !profileSet.size) return 0;
 
   const [admMetas, teacherApps, guardianReqs, admRowsRes] = await Promise.all([
     listAdmissionMetas(sb),
@@ -6192,7 +8118,10 @@ async function purgeEmailTraces(sb: ReturnType<typeof requireSupabaseAdmin>, raw
 
   const admIdsToDelete = new Set<number>();
   for (const [admId, meta] of admMetas.entries()) {
-    if (emailSet.has((meta.student_email || '').toLowerCase()) || (meta.pending_profile_id && profileSet.has(meta.pending_profile_id))) {
+    if (
+      emailSet.has((meta.student_email || '').toLowerCase()) ||
+      (meta.pending_profile_id && profileSet.has(meta.pending_profile_id))
+    ) {
       admIdsToDelete.add(admId);
     }
   }
@@ -6201,119 +8130,238 @@ async function purgeEmailTraces(sb: ReturnType<typeof requireSupabaseAdmin>, raw
       admIdsToDelete.add(Number(row.id));
     }
   }
-  for (const admId of admIdsToDelete) {
-    await deleteAdmissionMeta(sb, admId);
-    try {
-      await sb.from('admission_requests').delete().eq('id', admId);
-    } catch {
-      // ignore
-    }
+
+  const admIdList = Array.from(admIdsToDelete);
+  const teacherAppIds = teacherApps
+    .filter((appRec) => emailSet.has((appRec.email || '').toLowerCase()) || (appRec.profile_id && profileSet.has(appRec.profile_id)))
+    .map((appRec) => appRec.id);
+  const guardianReqIds = guardianReqs
+    .filter((gReq) => emailSet.has((gReq.email || '').toLowerCase()) || (gReq.profile_id && profileSet.has(gReq.profile_id)))
+    .map((gReq) => gReq.id);
+
+  const tasks: Array<{ label: string; promise: Promise<{ failed: number } | void> }> = [];
+  if (emailList.length) {
+    tasks.push({
+      label: 'consents',
+      promise: Promise.resolve(sb.from('consents').delete().in('email', emailList)).then((r) => {
+        if (r.error) throw new Error(r.error.message);
+      }),
+    });
+  }
+  if (admIdList.length) {
+    tasks.push({
+      label: 'admissionMetas',
+      promise: deleteAdmissionMetasBatch(sb, admIdList),
+    });
+    tasks.push({
+      label: 'admissionRequests',
+      promise: Promise.resolve(sb.from('admission_requests').delete().in('id', admIdList)).then((r) => {
+        if (r.error) throw new Error(r.error.message);
+      }),
+    });
+  }
+  if (teacherAppIds.length) {
+    tasks.push({
+      label: 'teacherApplications',
+      promise: deleteTeacherApplicationsBatch(sb, teacherAppIds),
+    });
+  }
+  if (guardianReqIds.length) {
+    tasks.push({
+      label: 'guardianRequests',
+      promise: deleteGuardianRequestsBatch(sb, guardianReqIds),
+    });
   }
 
-  for (const appRec of teacherApps) {
-    if (emailSet.has((appRec.email || '').toLowerCase()) || (appRec.profile_id && profileSet.has(appRec.profile_id))) {
-      await deleteTeacherApplication(sb, appRec.id);
+  let failedCount = 0;
+  const results = await Promise.allSettled(tasks.map((t) => t.promise));
+  results.forEach((result, idx) => {
+    if (result.status === 'fulfilled') {
+      const val = result.value as { failed?: number } | void;
+      if (val && typeof val.failed === 'number') {
+        failedCount += val.failed;
+      }
+    } else {
+      failedCount += 1;
+      console.warn(`[purgeEmailTraces] Partial cleanup warning (${tasks[idx]?.label}):`, result.reason);
     }
-  }
-
-  for (const gReq of guardianReqs) {
-    if (emailSet.has((gReq.email || '').toLowerCase()) || (gReq.profile_id && profileSet.has(gReq.profile_id))) {
-      await deleteGuardianRequest(sb, gReq.id);
-    }
-  }
+  });
+  return failedCount;
 }
 
-async function purgeNonAdminProfileAndAuth(sb: ReturnType<typeof requireSupabaseAdmin>, profileId: string | null | undefined): Promise<string | null> {
+async function purgeNonAdminProfileAndAuth(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  profileId: string | null | undefined
+): Promise<string | null> {
   if (!profileId) return null;
+  invalidateAuthSessionCacheForUser(profileId);
   const { data: prof } = await sb.from('profiles').select('id, email, role').eq('id', profileId).maybeSingle();
   if (prof?.role === 'admin') {
     return prof.email || null;
   }
   const email = prof?.email ? String(prof.email).trim().toLowerCase() : null;
-  try {
-    await sb.from('notifications').delete().eq('profile_id', profileId);
-  } catch {
-    // ignore
+
+  // Preserve strict FK order: dependent child notifications -> profile -> Supabase Auth user
+  const { error: notifErr } = await sb.from('notifications').delete().eq('profile_id', profileId);
+  if (notifErr) {
+    console.warn(`[purgeProfile] Failed deleting notifications for ${profileId}:`, notifErr.message);
   }
-  try {
-    await sb.from('profiles').delete().eq('id', profileId);
-  } catch {
-    // ignore
+  const { error: profErr } = await sb.from('profiles').delete().eq('id', profileId);
+  if (profErr) {
+    console.warn(`[purgeProfile] Failed deleting profile ${profileId}:`, profErr.message);
   }
-  await sb.auth.admin.deleteUser(profileId).catch(() => {});
-  if (email) {
-    const leftover = await findSupabaseAuthUserByEmail(email).catch(() => null);
-    if (leftover && leftover.id !== profileId) {
-      await sb.auth.admin.deleteUser(leftover.id).catch(() => {});
+
+  const [authDelRes, leftover] = await Promise.all([
+    sb.auth.admin.deleteUser(profileId),
+    email ? findSupabaseAuthUserByEmail(email).catch(() => null) : Promise.resolve(null),
+  ]);
+  if (authDelRes.error) {
+    console.warn(`[purgeProfile] Failed deleting auth user ${profileId}:`, authDelRes.error.message);
+  }
+  if (leftover && leftover.id !== profileId) {
+    const { error: leftoverErr } = await sb.auth.admin.deleteUser(leftover.id);
+    if (leftoverErr) {
+      console.warn(`[purgeProfile] Failed deleting duplicate auth user ${leftover.id}:`, leftoverErr.message);
     }
   }
   return email;
 }
 
-async function hardDeleteTeacherCascade(sb: ReturnType<typeof requireSupabaseAdmin>, teacherId: number): Promise<{ deleted: boolean; name_ar?: string; email?: string | null }> {
+async function hardDeleteTeacherCascade(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  teacherId: number
+): Promise<{ deleted: boolean; email?: string | null; cleanupFailed?: number }> {
   const { data: teacher } = await sb
     .from('teachers')
-    .select('id, profile_id, name_ar')
+    .select('id, profile_id')
     .eq('id', teacherId)
     .maybeSingle();
   if (!teacher) return { deleted: false };
 
-  let profileEmail: string | null = null;
-  if (teacher.profile_id) {
-    const { data: p } = await sb.from('profiles').select('email').eq('id', teacher.profile_id).maybeSingle();
-    profileEmail = p?.email ?? null;
-  }
+  const [profileRes, metas] = await Promise.all([
+    teacher.profile_id
+      ? sb.from('profiles').select('email, role').eq('id', teacher.profile_id).maybeSingle()
+      : Promise.resolve({ data: null }),
+    listCourseMetas(sb),
+  ]);
+  const profMeta = profileRes.data as { email?: string; role?: string } | null;
+  const profileEmail: string | null = profMeta?.email ?? null;
+  const isAdminProfile = profMeta?.role === 'admin';
 
-  await sb.from('courses').update({ teacher_id: null }).eq('teacher_id', teacherId);
-  const metas = await listCourseMetas(sb);
+  // Step 1: Remove/detach child references & Storage metadata BEFORE deleting teachers row
+  const coTeacherTasks: Promise<unknown>[] = [];
   for (const [cid, meta] of metas.entries()) {
     if (meta.co_teacher_ids?.includes(teacherId)) {
-      await saveCourseMeta(sb, {
-        ...meta,
-        course_id: cid,
-        co_teacher_ids: meta.co_teacher_ids.filter((tid) => tid !== teacherId),
-        updated_at: new Date().toISOString(),
-      });
+      coTeacherTasks.push(
+        saveCourseMeta(sb, {
+          ...meta,
+          course_id: cid,
+          co_teacher_ids: meta.co_teacher_ids.filter((tid) => tid !== teacherId),
+          updated_at: new Date().toISOString(),
+        })
+      );
     }
   }
 
-  await sb.from('payroll').delete().eq('teacher_id', teacherId);
-  await sb.from('teacher_payout_details').delete().eq('teacher_id', teacherId);
-  await sb.from('teachers').delete().eq('id', teacherId);
+  let cleanupFailed = 0;
+  const step1Results = await Promise.allSettled([
+    sb.from('courses').update({ teacher_id: null }).eq('teacher_id', teacherId),
+    sb.from('payroll').delete().eq('teacher_id', teacherId),
+    sb.from('teacher_payout_details').delete().eq('teacher_id', teacherId),
+    ...coTeacherTasks,
+  ]);
+  step1Results.forEach((res, idx) => {
+    if (res.status === 'rejected') {
+      cleanupFailed += 1;
+      console.warn(`[hardDeleteTeacher:${teacherId}] Step 1 cleanup warning (#${idx}):`, res.reason);
+    }
+  });
 
+  // Step 2: Delete teachers parent record BEFORE purging profile/auth
+  const { error: teacherDelErr } = await sb.from('teachers').delete().eq('id', teacherId);
+  if (teacherDelErr) {
+    throw new Error(`Failed deleting teacher ${teacherId}: ${teacherDelErr.message}`);
+  }
+
+  // Step 3: Scrub existing audit rows BEFORE deleting non-admin profile
+  await Promise.allSettled([
+    anonymizeAuditSubject({
+      profileId: isAdminProfile ? null : teacher.profile_id,
+      entityType: 'teacher',
+      entityId: teacherId,
+    }),
+    ...(!isAdminProfile && teacher.profile_id
+      ? [anonymizeAuditSubject({ entityType: 'profile', entityId: teacher.profile_id })]
+      : []),
+  ]);
+
+  // Step 4: Purge non-admin profile + Auth user + email traces (preserve active admin account & consents)
+  if (isAdminProfile) {
+    return { deleted: true, email: profileEmail, cleanupFailed };
+  }
   const purgedEmail = await purgeNonAdminProfileAndAuth(sb, teacher.profile_id);
   const finalEmail = purgedEmail || profileEmail;
-  await purgeEmailTraces(sb, [finalEmail], [teacher.profile_id]);
-  return { deleted: true, name_ar: teacher.name_ar, email: finalEmail };
+  cleanupFailed += await purgeEmailTraces(sb, [finalEmail], [teacher.profile_id]);
+  return { deleted: true, email: finalEmail, cleanupFailed };
 }
 
-async function hardDeleteStudentCascade(sb: ReturnType<typeof requireSupabaseAdmin>, studentId: number): Promise<{ deleted: boolean; name_ar?: string; email?: string | null }> {
+async function hardDeleteStudentCascade(
+  sb: ReturnType<typeof requireSupabaseAdmin>,
+  studentId: number
+): Promise<{ deleted: boolean; email?: string | null; guardianId?: number | null; cleanupFailed?: number }> {
   const { data: student } = await sb
     .from('students')
-    .select('id, profile_id, guardian_id, student_code, full_name_ar')
+    .select('id, profile_id, guardian_id, student_code')
     .eq('id', studentId)
     .maybeSingle();
   if (!student) return { deleted: false };
 
-  let studentEmail: string | null = null;
-  if (student.profile_id) {
-    const { data: p } = await sb.from('profiles').select('email').eq('id', student.profile_id).maybeSingle();
-    studentEmail = p?.email ?? null;
+  const [profileRes, guardianReqs] = await Promise.all([
+    student.profile_id
+      ? sb.from('profiles').select('email').eq('id', student.profile_id).maybeSingle()
+      : Promise.resolve({ data: null }),
+    listGuardianRequests(sb),
+  ]);
+  const studentEmail: string | null = (profileRes.data as { email?: string } | null)?.email ?? null;
+  const matchingGuardianReqIds = guardianReqs
+    .filter(
+      (gr) =>
+        gr.student_id === studentId ||
+        gr.student_code.toUpperCase() === String(student.student_code || '').toUpperCase()
+    )
+    .map((gr) => gr.id);
+
+  // Step 1: Delete exam vault data & guardian link requests in parallel BEFORE deleting student row
+  let cleanupFailed = 0;
+  const [examVaultRes, guardianReqRes] = await Promise.allSettled([
+    deleteExamDataForStudent(sb, studentId),
+    deleteGuardianRequestsBatch(sb, matchingGuardianReqIds),
+  ]);
+  if (examVaultRes.status === 'fulfilled') {
+    cleanupFailed += examVaultRes.value.failed;
+  } else {
+    cleanupFailed += 1;
+    console.warn(`[hardDeleteStudent:${studentId}] Step 1 cleanup warning (#0):`, examVaultRes.reason);
+  }
+  if (guardianReqRes.status === 'fulfilled') {
+    cleanupFailed += guardianReqRes.value.failed;
+  } else {
+    cleanupFailed += 1;
+    console.warn(`[hardDeleteStudent:${studentId}] Step 1 cleanup warning (#1):`, guardianReqRes.reason);
   }
 
-  await deleteExamDataForStudent(sb, studentId);
-  await sb.from('students').delete().eq('id', studentId);
-
-  const guardianReqs = await listGuardianRequests(sb);
-  for (const gr of guardianReqs) {
-    if (gr.student_id === studentId || gr.student_code.toUpperCase() === String(student.student_code || '').toUpperCase()) {
-      await deleteGuardianRequest(sb, gr.id);
-    }
+  // Step 2: Delete student row (cascades enrollments, attendance, exam_results, certificates, etc.)
+  const { error: stuDelErr } = await sb.from('students').delete().eq('id', studentId);
+  if (stuDelErr) {
+    throw new Error(`Failed deleting student ${studentId}: ${stuDelErr.message}`);
   }
 
   const emailsToPurge: Array<string | null> = [studentEmail];
   const profileIdsToPurge: Array<string | null> = [student.profile_id];
 
+  // Step 3: Check remaining siblings and delete orphaned guardian AFTER student row is deleted
+  let guardianProfileToPurge: string | null = null;
+  let deletedGuardianId: number | null = null;
   if (student.guardian_id) {
     const { count: remainingSiblings } = await sb
       .from('students')
@@ -6321,14 +8369,17 @@ async function hardDeleteStudentCascade(sb: ReturnType<typeof requireSupabaseAdm
       .eq('guardian_id', student.guardian_id);
 
     if ((remainingSiblings || 0) === 0) {
+      deletedGuardianId = Number(student.guardian_id);
       const { data: guardian } = await sb
         .from('guardians')
         .select('id, profile_id, email')
         .eq('id', student.guardian_id)
         .maybeSingle();
 
-      await deleteGuardianAuth(sb, student.guardian_id);
-      await sb.from('guardians').delete().eq('id', student.guardian_id);
+      await Promise.allSettled([
+        deleteGuardianAuth(sb, student.guardian_id),
+        sb.from('guardians').delete().eq('id', student.guardian_id),
+      ]);
 
       if (guardian?.email) emailsToPurge.push(guardian.email);
       if (guardian?.profile_id && guardian.profile_id !== student.profile_id) {
@@ -6338,19 +8389,46 @@ async function hardDeleteStudentCascade(sb: ReturnType<typeof requireSupabaseAdm
           sb.from('teachers').select('id', { count: 'exact', head: true }).eq('profile_id', guardian.profile_id),
         ]);
         if ((otherG || 0) === 0 && (otherS || 0) === 0 && (otherT || 0) === 0) {
+          guardianProfileToPurge = guardian.profile_id;
           profileIdsToPurge.push(guardian.profile_id);
-          const gEmail = await purgeNonAdminProfileAndAuth(sb, guardian.profile_id);
-          if (gEmail) emailsToPurge.push(gEmail);
         }
       }
     }
   }
 
-  const purgedStuEmail = await purgeNonAdminProfileAndAuth(sb, student.profile_id);
-  if (purgedStuEmail) emailsToPurge.push(purgedStuEmail);
-  await purgeEmailTraces(sb, emailsToPurge, profileIdsToPurge);
+  // Step 4: Scrub existing audit rows BEFORE deleting student & orphaned guardian profiles
+  await Promise.allSettled([
+    anonymizeAuditSubject({ profileId: student.profile_id, entityType: 'student', entityId: studentId }),
+    ...(student.profile_id ? [anonymizeAuditSubject({ entityType: 'profile', entityId: student.profile_id })] : []),
+    ...(deletedGuardianId
+      ? [anonymizeAuditSubject({ profileId: guardianProfileToPurge, entityType: 'guardian', entityId: deletedGuardianId })]
+      : []),
+    ...(guardianProfileToPurge ? [anonymizeAuditSubject({ entityType: 'profile', entityId: guardianProfileToPurge })] : []),
+  ]);
 
-  return { deleted: true, name_ar: student.full_name_ar, email: purgedStuEmail || studentEmail };
+  // Step 5: Purge student & orphaned guardian profiles/Auth users in parallel, then purge email traces
+  const profilePurgeResults = await Promise.allSettled([
+    purgeNonAdminProfileAndAuth(sb, student.profile_id),
+    guardianProfileToPurge ? purgeNonAdminProfileAndAuth(sb, guardianProfileToPurge) : Promise.resolve(null),
+  ]);
+  let purgedStuEmail: string | null = null;
+  profilePurgeResults.forEach((res, idx) => {
+    if (res.status === 'fulfilled') {
+      if (res.value) emailsToPurge.push(res.value);
+      if (idx === 0) purgedStuEmail = res.value;
+    } else {
+      console.warn(`[hardDeleteStudent:${studentId}] Profile purge warning (#${idx}):`, res.reason);
+    }
+  });
+
+  cleanupFailed += await purgeEmailTraces(sb, emailsToPurge, profileIdsToPurge);
+
+  return {
+    deleted: true,
+    email: purgedStuEmail || studentEmail,
+    guardianId: student.guardian_id ?? null,
+    cleanupFailed,
+  };
 }
 
 app.delete('/api/admin/teachers/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
@@ -6361,12 +8439,14 @@ app.delete('/api/admin/teachers/:id', authenticate, requireRole('admin'), asyncH
     res.status(404).json({ error: 'Teacher not found' });
     return;
   }
+  const cleanupFailed = result.cleanupFailed || 0;
   invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'HARD_DELETE_TEACHER', 'teacher', id, {
-    name_ar: result.name_ar,
-    email: result.email,
+    teacher_id: id,
+    masked_email: maskEmail(result.email),
+    ...(cleanupFailed > 0 ? { cleanup_failed: cleanupFailed } : {}),
   });
-  res.json({ ok: true });
+  res.json(cleanupFailed > 0 ? { ok: true, warnings: { cleanup_failed: cleanupFailed } } : { ok: true });
 }));
 
 app.post('/api/admin/students', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
@@ -6438,7 +8518,9 @@ app.post('/api/admin/students', authenticate, requireRole('admin'), asyncHandler
   }
 
   invalidateOverviewCache();
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_STUDENT', 'student', student.id, { email: cleanEmail, full_name_ar: cleanName });
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_STUDENT', 'student', student.id, {
+    student_id: student.id,
+  });
   res.status(201).json({ id: student.id, student_code: code, temporary_password: tempPassword });
 }));
 
@@ -6512,7 +8594,9 @@ app.patch('/api/admin/students/:id', authenticate, requireRole('admin'), asyncHa
     }
   }
 
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_STUDENT', 'student', id, parsed.data);
+  await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_STUDENT', 'student', id, {
+    updated_fields: Object.keys(parsed.data),
+  });
   res.json({ ok: true });
 }));
 
@@ -6546,12 +8630,15 @@ app.delete('/api/admin/students/:id', authenticate, requireRole('admin'), asyncH
     res.status(404).json({ error: 'Student not found' });
     return;
   }
+  const cleanupFailed = result.cleanupFailed || 0;
   invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'HARD_DELETE_STUDENT', 'student', id, {
-    name_ar: result.name_ar,
-    email: result.email,
+    student_id: id,
+    guardian_id: result.guardianId ?? null,
+    masked_email: maskEmail(result.email),
+    cleanup_failed: cleanupFailed,
   });
-  res.json({ ok: true });
+  res.json(cleanupFailed > 0 ? { ok: true, warnings: { cleanup_failed: cleanupFailed } } : { ok: true });
 }));
 
 app.post('/api/admin/enrollments', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
@@ -6632,23 +8719,32 @@ app.post('/api/admin/admissions/:id/decision', authenticate, requireRole('admin'
   await sb.from('admission_requests').update({ status: decision, reviewed_by: req.user!.id }).eq('id', id);
 
   let tempPassword: string | undefined;
-  let resolvedEmail = (student_email || meta?.student_email || `student.${id}@noorbayan.academy`).trim().toLowerCase();
+  let resolvedEmail = (student_email || meta?.student_email || `student.${id}@noorwbayan-academy.com`).trim().toLowerCase();
   let studentCode: string | undefined;
 
   if (decision === 'approved') {
     let profileId: string;
+    const confirmationRedirectUrl = `${resolvePublicBaseUrl(req)}/login?confirmed=1`;
     if (meta?.pending_profile_id) {
       profileId = meta.pending_profile_id;
       await sb.from('profiles').update({ is_active: true }).eq('id', profileId);
-      await sb.auth.admin.updateUserById(profileId, { email_confirm: true }).catch(() => {});
       resolvedEmail = meta.student_email;
+      if (REQUIRE_EMAIL_VERIFICATION) {
+        await sendSignupConfirmationIfNeeded(sb, profileId, resolvedEmail, confirmationRedirectUrl);
+      } else {
+        await sb.auth.admin.updateUserById(profileId, { email_confirm: true }).catch(() => {});
+      }
     } else {
       const { data: existingProfile } = await sb.from('profiles').select('id, is_active').eq('email', resolvedEmail).maybeSingle();
       if (existingProfile) {
         profileId = existingProfile.id;
         if (!existingProfile.is_active) {
           await sb.from('profiles').update({ is_active: true }).eq('id', profileId);
-          await sb.auth.admin.updateUserById(profileId, { email_confirm: true }).catch(() => {});
+          if (REQUIRE_EMAIL_VERIFICATION) {
+            await sendSignupConfirmationIfNeeded(sb, profileId, resolvedEmail, confirmationRedirectUrl);
+          } else {
+            await sb.auth.admin.updateUserById(profileId, { email_confirm: true }).catch(() => {});
+          }
         }
       } else {
         tempPassword = generateTempPassword();
@@ -6715,8 +8811,8 @@ app.post('/api/admin/admissions/:id/decision', authenticate, requireRole('admin'
   }
 
   await writeAuditLog(req.user!.id, req.user!.full_name, `ADMISSION_${decision.toUpperCase()}`, 'admission_request', id, {
-    student_name: reqRow.student_name,
-    student_email: resolvedEmail,
+    admission_id: id,
+    masked_email: maskEmail(resolvedEmail),
   });
   void broadcastRealtimeEvent('academic:updated', { kind: 'admission' });
   res.json({
@@ -6757,7 +8853,16 @@ app.post('/api/admin/teacher-applications/:id/decision', authenticate, requireRo
       return;
     }
     await sb.from('profiles').update({ is_active: true, role: 'teacher' }).eq('id', appRecord.profile_id);
-    await sb.auth.admin.updateUserById(appRecord.profile_id, { email_confirm: true }).catch(() => {});
+    if (REQUIRE_EMAIL_VERIFICATION) {
+      await sendSignupConfirmationIfNeeded(
+        sb,
+        appRecord.profile_id,
+        appRecord.email,
+        `${resolvePublicBaseUrl(req)}/login?confirmed=1`
+      );
+    } else {
+      await sb.auth.admin.updateUserById(appRecord.profile_id, { email_confirm: true }).catch(() => {});
+    }
     const teacher = await insertRowSafe<{ id: number }>('teachers', {
       profile_id: appRecord.profile_id,
       name_ar: appRecord.name_ar,
@@ -6787,8 +8892,9 @@ app.post('/api/admin/teacher-applications/:id/decision', authenticate, requireRo
     });
     invalidateOverviewCache();
     await writeAuditLog(req.user!.id, req.user!.full_name, 'TEACHER_APP_APPROVED', 'teacher', teacher.id, {
-      email: appRecord.email,
-      name_ar: appRecord.name_ar,
+      teacher_id: teacher.id,
+      application_id: id,
+      masked_email: maskEmail(appRecord.email),
     });
     void broadcastRealtimeEvent('academic:updated', { kind: 'teacher' });
     res.json({ ok: true, teacher_id: teacher.id, email: appRecord.email });
@@ -6803,8 +8909,8 @@ app.post('/api/admin/teacher-applications/:id/decision', authenticate, requireRo
   });
   await deletePendingAuthProfileIfSafe(sb, appRecord.profile_id);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'TEACHER_APP_REJECTED', 'teacher_application', id, {
-    email: appRecord.email,
-    name_ar: appRecord.name_ar,
+    application_id: id,
+    masked_email: maskEmail(appRecord.email),
   });
   res.json({ ok: true });
 }));
@@ -6848,6 +8954,14 @@ app.post('/api/admin/guardian-requests/:id/decision', authenticate, requireRole(
     if (!isSharedStudentProfile) {
       await sb.from('profiles').update({ is_active: true, role: 'guardian' }).eq('id', reqRecord.profile_id);
     }
+    if (REQUIRE_EMAIL_VERIFICATION) {
+      await sendSignupConfirmationIfNeeded(
+        sb,
+        reqRecord.profile_id,
+        reqRecord.email,
+        `${resolvePublicBaseUrl(req)}/login?confirmed=1`
+      );
+    }
 
     await sb
       .from('guardians')
@@ -6885,9 +8999,11 @@ app.post('/api/admin/guardian-requests/:id/decision', authenticate, requireRole(
       reviewed_at: new Date().toISOString(),
     });
     await writeAuditLog(req.user!.id, req.user!.full_name, 'GUARDIAN_APP_APPROVED', 'guardian', reqRecord.guardian_id, {
-      email: reqRecord.email,
+      guardian_id: reqRecord.guardian_id,
+      student_id: reqRecord.student_id,
       student_code: reqRecord.student_code,
       shared_student_email: isSharedStudentProfile,
+      masked_email: maskEmail(reqRecord.email),
     });
     void broadcastRealtimeEvent('academic:updated', { kind: 'guardian' });
     res.json({ ok: true, email: reqRecord.email, student_code: reqRecord.student_code });
@@ -6905,8 +9021,11 @@ app.post('/api/admin/guardian-requests/:id/decision', authenticate, requireRole(
     await deletePendingAuthProfileIfSafe(sb, reqRecord.profile_id);
   }
   await writeAuditLog(req.user!.id, req.user!.full_name, 'GUARDIAN_APP_REJECTED', 'guardian_request', id, {
-    email: reqRecord.email,
+    guardian_request_id: id,
+    guardian_id: reqRecord.guardian_id,
+    student_id: reqRecord.student_id,
     student_code: reqRecord.student_code,
+    masked_email: maskEmail(reqRecord.email),
   });
   res.json({ ok: true });
 }));
@@ -7206,38 +9325,44 @@ app.delete('/api/admin/payroll/:id', authenticate, requireRole('admin'), asyncHa
 }));
 
 app.get('/api/admin/audit-logs', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const sb = requireSupabaseAdmin();
-  const page = Math.max(1, Number(req.query.page || 1) || 1);
-  const limit = Math.min(50, Math.max(1, Number(req.query.limit || 20) || 20));
-  const from = (page - 1) * limit;
-  const to = from + limit - 1;
-  const { data, count } = await sb
-    .from('audit_logs')
-    .select('*', { count: 'exact' })
-    .order('id', { ascending: false })
-    .range(from, to);
-  const total = count || 0;
-  res.json({
-    items: data || [],
-    page,
-    limit,
-    total,
-    totalPages: Math.max(1, Math.ceil(total / limit)),
-  });
-}));
+  const stopTimer = startDevEndpointTimer('GET /api/admin/audit-logs');
+  try {
+    const sb = requireSupabaseAdmin();
+    const { page, limit, q, from, to } = parseAdminListQuery(req);
+    const safeQ = sanitizePostgrestOrSearch(q);
+    const actionFilter = String(req.query.action || '').trim().slice(0, 80);
 
-app.delete('/api/admin/audit-logs/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const id = parsePositiveIntParam(req.params.id, 'audit log id');
-  const sb = requireSupabaseAdmin();
-  await sb.from('audit_logs').delete().eq('id', id);
-  res.json({ ok: true });
-}));
+    let query = sb
+      .from('audit_logs')
+      .select('id, actor_name, action, entity_type, entity_id, details_json, created_at', { count: 'exact' });
 
-app.delete('/api/admin/audit-logs', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
-  const sb = requireSupabaseAdmin();
-  await sb.from('audit_logs').delete().gte('id', 0);
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'CLEAR_AUDIT_LOGS', 'audit_logs', 'all', {});
-  res.json({ ok: true });
+    if (actionFilter && actionFilter !== 'all') {
+      query = query.eq('action', actionFilter);
+    }
+    if (safeQ) {
+      query = query.or(
+        `actor_name.ilike.%${safeQ}%,action.ilike.%${safeQ}%,entity_type.ilike.%${safeQ}%,entity_id.ilike.%${safeQ}%`
+      );
+    }
+
+    const { data, count, error } = await query
+      .order('id', { ascending: false })
+      .range(from, to);
+    if (error) {
+      throw new AppError(500, process.env.NODE_ENV === 'production' ? 'Failed to fetch audit logs' : error.message);
+    }
+
+    const total = count || 0;
+    res.json({
+      items: data || [],
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    });
+  } finally {
+    stopTimer?.();
+  }
 }));
 
 app.put('/api/admin/legal/:docType', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
@@ -7282,7 +9407,7 @@ app.post('/api/admin/admins', authenticate, requireRole('admin'), asyncHandler<A
     email: z.string().trim().email().max(160),
     password: z.string().min(8).max(128),
     confirmPassword: z.string().max(128).optional(),
-    confirmAction: z.boolean().optional(),
+    confirmGoogleToken: z.string().min(20).max(8192).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -7291,7 +9416,7 @@ app.post('/api/admin/admins', authenticate, requireRole('admin'), asyncHandler<A
   }
 
   const sb = requireSupabaseAdmin();
-  const reauth = await verifyAdminReauth(sb, req.user!, parsed.data.confirmPassword, parsed.data.confirmAction);
+  const reauth = await verifyAdminReauth(sb, req.user!, parsed.data.confirmPassword, parsed.data.confirmGoogleToken);
   if (!reauth.ok) {
     res.status(reauth.status || 401).json({ error: reauth.error, code: reauth.code });
     return;
@@ -7335,8 +9460,8 @@ app.post('/api/admin/admins', authenticate, requireRole('admin'), asyncHandler<A
   }
 
   await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_ADMIN', 'profile', user.id, {
-    email: cleanEmail,
-    full_name: cleanName,
+    profile_id: user.id,
+    masked_email: maskEmail(cleanEmail),
   });
 
   res.status(201).json({
@@ -7353,7 +9478,7 @@ app.patch('/api/admin/users/:id/role', authenticate, requireRole('admin'), async
     role: z.enum(['student', 'teacher', 'admin', 'guardian']).optional(),
     is_active: z.union([z.boolean(), z.number()]).optional(),
     confirmPassword: z.string().max(128).optional(),
-    confirmAction: z.boolean().optional(),
+    confirmGoogleToken: z.string().min(20).max(8192).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -7362,7 +9487,7 @@ app.patch('/api/admin/users/:id/role', authenticate, requireRole('admin'), async
   }
 
   const sb = requireSupabaseAdmin();
-  const reauth = await verifyAdminReauth(sb, req.user!, parsed.data.confirmPassword, parsed.data.confirmAction);
+  const reauth = await verifyAdminReauth(sb, req.user!, parsed.data.confirmPassword, parsed.data.confirmGoogleToken);
   if (!reauth.ok) {
     res.status(reauth.status || 401).json({ error: reauth.error, code: reauth.code });
     return;
@@ -7411,7 +9536,7 @@ app.post('/api/admin/users/:id/reset-password', authenticate, requireRole('admin
   const parsed = z.object({
     newPassword: z.string().min(8, 'Password must be at least 8 characters').max(128),
     confirmPassword: z.string().max(128).optional(),
-    confirmAction: z.boolean().optional(),
+    confirmGoogleToken: z.string().min(20).max(8192).optional(),
   }).safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: 'A new password of at least 8 characters is required.' });
@@ -7419,7 +9544,7 @@ app.post('/api/admin/users/:id/reset-password', authenticate, requireRole('admin
   }
 
   const sb = requireSupabaseAdmin();
-  const reauth = await verifyAdminReauth(sb, req.user!, parsed.data.confirmPassword, parsed.data.confirmAction);
+  const reauth = await verifyAdminReauth(sb, req.user!, parsed.data.confirmPassword, parsed.data.confirmGoogleToken);
   if (!reauth.ok) {
     res.status(reauth.status || 401).json({ error: reauth.error, code: reauth.code });
     return;
@@ -7448,7 +9573,7 @@ app.post('/api/admin/users/:id/reset-password', authenticate, requireRole('admin
 
   await bumpProfileTokenVersion(sb, id);
   await writeAuditLog(req.user!.id, req.user!.full_name, 'ADMIN_RESET_USER_PASSWORD', 'profile', id, {
-    email: target.email,
+    masked_email: maskEmail(target.email),
     role: target.role,
   });
   res.json({ ok: true });
@@ -7460,6 +9585,7 @@ app.delete('/api/admin/users/:id', authenticate, requireRole('admin'), asyncHand
     res.status(400).json({ error: 'You cannot delete your own administrator account.' });
     return;
   }
+  invalidateAuthSessionCacheForUser(id);
 
   const sb = requireSupabaseAdmin();
   const { data: target } = await sb
@@ -7492,38 +9618,80 @@ app.delete('/api/admin/users/:id', authenticate, requireRole('admin'), asyncHand
     sb.from('guardians').select('id, email').eq('profile_id', id),
   ]);
 
-  for (const t of linkedTeachers || []) {
-    await hardDeleteTeacherCascade(sb, Number((t as { id: number }).id));
-  }
-  for (const s of linkedStudents || []) {
-    await hardDeleteStudentCascade(sb, Number((s as { id: number }).id));
-  }
-  for (const g of linkedGuardians || []) {
+  // Step 1: Delete linked student/teacher entities first (FK order before guardian/profile)
+  let cleanupFailed = 0;
+  const cascadeResults = await Promise.allSettled([
+    ...(linkedTeachers || []).map((t) => hardDeleteTeacherCascade(sb, Number((t as { id: number }).id))),
+    ...(linkedStudents || []).map((s) => hardDeleteStudentCascade(sb, Number((s as { id: number }).id))),
+  ]);
+  cascadeResults.forEach((r, idx) => {
+    if (r.status === 'fulfilled') {
+      cleanupFailed += r.value.cleanupFailed || 0;
+    } else {
+      cleanupFailed += 1;
+      console.warn(`[deleteUser:${id}] Linked entity cascade warning (#${idx}):`, r.reason);
+    }
+  });
+
+  // Step 2: Detach or delete linked guardians AFTER linked students are removed
+  const deletedGuardianIds: number[] = [];
+  const guardianTasks = (linkedGuardians || []).map(async (g) => {
     const gid = Number((g as { id: number }).id);
-    await deleteGuardianAuth(sb, gid);
     const { count: remStu } = await sb.from('students').select('id', { count: 'exact', head: true }).eq('guardian_id', gid);
     if ((remStu || 0) === 0) {
-      await sb.from('guardians').delete().eq('id', gid);
+      deletedGuardianIds.push(gid);
+      await Promise.allSettled([
+        deleteGuardianAuth(sb, gid),
+        sb.from('guardians').delete().eq('id', gid),
+      ]);
     } else {
       await sb.from('guardians').update({ profile_id: null }).eq('id', gid);
     }
+  });
+  const guardianResults = await Promise.allSettled(guardianTasks);
+  guardianResults.forEach((r, idx) => {
+    if (r.status === 'rejected') {
+      console.warn(`[deleteUser:${id}] Guardian detach warning (#${idx}):`, r.reason);
+    }
+  });
+
+  // Step 3: Scrub existing audit rows BEFORE deleting profile (actor_id ON DELETE SET NULL)
+  await Promise.allSettled([
+    anonymizeAuditSubject({ profileId: id, entityType: 'profile', entityId: id }),
+    ...deletedGuardianIds.map((gid) => anonymizeAuditSubject({ entityType: 'guardian', entityId: gid })),
+  ]);
+
+  // Step 4: Delete notifications -> profiles -> Auth user -> email traces
+  const { error: notifErr } = await sb.from('notifications').delete().eq('profile_id', id);
+  if (notifErr) {
+    console.warn(`[deleteUser:${id}] Notification cleanup warning:`, notifErr.message);
+  }
+  const { error: profDelErr } = await sb.from('profiles').delete().eq('id', id);
+  if (profDelErr) {
+    console.warn(`[deleteUser:${id}] Profile cleanup warning:`, profDelErr.message);
   }
 
-  try {
-    await sb.from('notifications').delete().eq('profile_id', id);
-  } catch {
-    // ignore
+  const [, traceRes] = await Promise.allSettled([
+    sb.auth.admin.deleteUser(id).then(({ error }) => {
+      if (error) console.warn(`[deleteUser:${id}] Auth delete warning:`, error.message);
+    }),
+    purgeEmailTraces(sb, [target.email, ...(linkedGuardians || []).map((g: { email?: string }) => g.email)], [id]),
+  ]);
+  if (traceRes.status === 'fulfilled') {
+    cleanupFailed += traceRes.value || 0;
+  } else {
+    cleanupFailed += 1;
+    console.warn(`[deleteUser:${id}] Trace purge warning:`, traceRes.reason);
   }
-  await sb.from('profiles').delete().eq('id', id);
-  await sb.auth.admin.deleteUser(id).catch(() => {});
-  await purgeEmailTraces(sb, [target.email, ...(linkedGuardians || []).map((g: { email?: string }) => g.email)], [id]);
 
   invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'HARD_DELETE_USER', 'profile', id, {
-    email: target.email,
+    profile_id: id,
+    masked_email: maskEmail(target.email),
     role: target.role,
+    ...(cleanupFailed > 0 ? { cleanup_failed: cleanupFailed } : {}),
   });
-  res.json({ ok: true });
+  res.json(cleanupFailed > 0 ? { ok: true, warnings: { cleanup_failed: cleanupFailed } } : { ok: true });
 }));
 
 // ============================================================================
@@ -7565,7 +9733,7 @@ app.post('/api/comments', authenticate, communityWriteLimiter, asyncHandler<Auth
     updated_at: nowIso,
   };
   await saveComment(sb, record);
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_COMMENT', 'comment', id, {
+  await writeAuditLog(req.user!.id, auditActorName(req.user!), 'CREATE_COMMENT', 'comment', id, {
     rating: record.rating,
     role: req.user!.role,
   });
@@ -7616,7 +9784,7 @@ app.post('/api/comments/:id/replies', authenticate, communityWriteLimiter, async
     }).catch(() => {});
   }
 
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'REPLY_COMMENT', 'comment', existing.id, {
+  await writeAuditLog(req.user!.id, auditActorName(req.user!), 'REPLY_COMMENT', 'comment', existing.id, {
     reply_id: reply.id,
   });
 
@@ -7635,7 +9803,7 @@ app.delete('/api/comments/:id', authenticate, asyncHandler<AuthRequest>(async (r
     return;
   }
   await deleteCommentRecord(sb, existing.id);
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'DELETE_COMMENT', 'comment', existing.id, {});
+  await writeAuditLog(req.user!.id, auditActorName(req.user!), 'DELETE_COMMENT', 'comment', existing.id, {});
   res.json({ ok: true });
 }));
 
@@ -7701,7 +9869,7 @@ app.post('/api/suggestions', authenticate, communityWriteLimiter, asyncHandler<A
     updated_at: nowIso,
   };
   await saveSuggestion(sb, record);
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_SUGGESTION', 'suggestion', id, {
+  await writeAuditLog(req.user!.id, auditActorName(req.user!), 'CREATE_SUGGESTION', 'suggestion', id, {
     category: record.category,
     title: record.title,
   });
@@ -7742,7 +9910,7 @@ app.delete('/api/suggestions/:id', authenticate, asyncHandler<AuthRequest>(async
     return;
   }
   await deleteSuggestionRecord(sb, existing.id);
-  await writeAuditLog(req.user!.id, req.user!.full_name, 'DELETE_SUGGESTION', 'suggestion', existing.id, {});
+  await writeAuditLog(req.user!.id, auditActorName(req.user!), 'DELETE_SUGGESTION', 'suggestion', existing.id, {});
   res.json({ ok: true });
 }));
 
@@ -7932,20 +10100,55 @@ app.post('/api/admin/supabase/sync-users', authenticate, requireRole('admin'), a
   res.json(result);
 }));
 
+function isLegacyHost(hostname: string): boolean {
+  const host = hostname.trim().toLowerCase();
+  return (
+    host.endsWith('.up.railway.app') ||
+    host === 'noorbayan.academy' ||
+    host === 'www.noorbayan.academy'
+  );
+}
+
+function resolveCanonicalSiteUrl(): string {
+  const configured = process.env.APP_URL?.trim();
+  if (configured && configured !== 'MY_APP_URL' && /^https?:\/\//i.test(configured)) {
+    try {
+      const parsed = new URL(configured);
+      const host = parsed.hostname.toLowerCase();
+      if (host !== 'localhost' && host !== '127.0.0.1' && !isLegacyHost(host)) {
+        return parsed.origin;
+      }
+    } catch {
+      // fall back to official site URL
+    }
+  }
+  return OFFICIAL_SITE_URL;
+}
+
 function resolvePublicBaseUrl(req: Request): string {
   const configured = process.env.APP_URL?.trim();
   if (configured && configured !== 'MY_APP_URL' && /^https?:\/\//i.test(configured)) {
     try {
-      return new URL(configured).origin;
+      const parsed = new URL(configured);
+      if (!isLegacyHost(parsed.hostname)) {
+        return parsed.origin;
+      }
     } catch {
       // fall back to request host
     }
   }
   const protoRaw = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim().toLowerCase();
   const proto = protoRaw === 'http' || protoRaw === 'https' ? protoRaw : 'https';
-  const hostRaw = String(req.headers['x-forwarded-host'] || req.get('host') || 'localhost:3000').split(',')[0].trim();
-  const safeHost = /^[a-zA-Z0-9.-]+(:\d{1,5})?$/.test(hostRaw) ? hostRaw : 'localhost:3000';
-  return `${proto}://${safeHost}`;
+  const hostRaw = String(req.headers['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim();
+  const hostNoPort = hostRaw.split(':')[0].toLowerCase();
+  if (!hostRaw || isLegacyHost(hostNoPort)) {
+    return OFFICIAL_SITE_URL;
+  }
+  if (IS_PRODUCTION && (hostNoPort === 'localhost' || hostNoPort === '127.0.0.1')) {
+    return OFFICIAL_SITE_URL;
+  }
+  const safeHost = /^[a-zA-Z0-9.-]+(:\d{1,5})?$/.test(hostRaw) ? hostRaw : '';
+  return safeHost ? `${proto}://${safeHost}` : OFFICIAL_SITE_URL;
 }
 
 function escapeXmlText(val: string): string {
@@ -7957,8 +10160,8 @@ function escapeXmlText(val: string): string {
     .replace(/'/g, '&apos;');
 }
 
-app.get('/robots.txt', (req, res) => {
-  const baseUrl = resolvePublicBaseUrl(req);
+app.get('/robots.txt', (_req, res) => {
+  const baseUrl = resolveCanonicalSiteUrl();
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.setHeader('Cache-Control', 'public, max-age=3600');
   res.send(
@@ -7966,8 +10169,8 @@ app.get('/robots.txt', (req, res) => {
   );
 });
 
-app.get('/sitemap.xml', asyncHandler(async (req, res) => {
-  const baseUrl = escapeXmlText(resolvePublicBaseUrl(req));
+app.get('/sitemap.xml', asyncHandler(async (_req, res) => {
+  const baseUrl = escapeXmlText(resolveCanonicalSiteUrl());
   const staticPaths: Array<{ path: string; priority: string }> = [
     { path: '/', priority: '1.0' },
     { path: '/courses', priority: '0.9' },
@@ -8025,7 +10228,49 @@ app.use('/api', apiNotFoundHandler);
 // ============================================================================
 // VITE DEV / PRODUCTION STATIC MOUNT + GLOBAL ERROR MIDDLEWARE + GRACEFUL SHUTDOWN
 // ============================================================================
+function validateProductionConfig(): void {
+  try {
+    if (!IS_PRODUCTION) return;
+
+    const issues: string[] = [];
+    const appUrl = String(process.env.APP_URL || '').trim();
+    if (!appUrl || appUrl === 'MY_APP_URL' || !/^https?:\/\//i.test(appUrl)) {
+      issues.push('APP_URL is missing or invalid');
+    }
+
+    const sessionSecret = String(process.env.SESSION_SECRET || '').trim();
+    if (!sessionSecret || sessionSecret.length < 32 || sessionSecret === 'REPLACE_WITH_LONG_RANDOM_SECRET') {
+      issues.push('SESSION_SECRET is missing or shorter than 32 characters');
+    }
+
+    const ibanKey = String(process.env.IBAN_ENCRYPTION_KEY || '').trim();
+    if (!ibanKey || ibanKey.length < 16) {
+      issues.push('IBAN_ENCRYPTION_KEY is missing or weak (< 16 chars)');
+    }
+
+    const turnstileSecret = String(process.env.TURNSTILE_SECRET_KEY || '').trim();
+    if (!turnstileSecret) {
+      issues.push('TURNSTILE_SECRET_KEY is missing');
+    }
+
+    const serviceRoleKey = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+    if (!serviceRoleKey) {
+      issues.push('SUPABASE_SERVICE_ROLE_KEY is missing');
+    }
+
+    if (issues.length > 0) {
+      console.error(`[production-config] Configuration warnings (${issues.length}): ${issues.join('; ')}`);
+    }
+    console.warn(
+      '[production-config] Rate limits, lockouts, revoked sessions, and caches are stored in-memory — run a single server instance.'
+    );
+  } catch (err) {
+    console.warn('[production-config] Startup validation check warning:', err instanceof Error ? err.message : err);
+  }
+}
+
 async function startServer() {
+  validateProductionConfig();
   const PORT = Number(process.env.PORT || 3000);
   const httpServer = http.createServer(app);
   let viteServer: ViteDevServer | null = null;
@@ -8082,16 +10327,31 @@ async function startServer() {
         return;
       }
       const rawHtml = indexHtmlTemplate || fs.readFileSync(indexHtmlPath, 'utf8');
-      const baseUrl = resolvePublicBaseUrl(req);
+      const baseUrl = resolveCanonicalSiteUrl();
       const safePath = /^\/[a-zA-Z0-9/_-]*$/.test(req.path) ? req.path : '/';
       const canonicalUrl = `${baseUrl}${safePath === '/' ? '/' : safePath}`;
       const ogImageAbs = `${baseUrl}/assets/images/academy_banner.webp`;
-      const hydratedHtml = rawHtml
-        .replace(/content="\/assets\/images\/academy_banner\.webp"/g, `content="${escapeXmlText(ogImageAbs)}"`)
+      const hasCanonical = /<link\s+rel="canonical"/i.test(rawHtml);
+      let hydratedHtml = rawHtml
         .replace(
+          /content="(?:https?:\/\/[^"]*)?\/assets\/images\/academy_banner\.webp"/g,
+          `content="${escapeXmlText(ogImageAbs)}"`
+        )
+        .replace(
+          /<meta\s+property="og:url"\s+content="[^"]*"\s*\/?>/i,
+          `<meta property="og:url" content="${escapeXmlText(canonicalUrl)}" />`
+        );
+      if (hasCanonical) {
+        hydratedHtml = hydratedHtml.replace(
+          /<link\s+rel="canonical"\s+href="[^"]*"\s*\/?>/i,
+          `<link rel="canonical" href="${escapeXmlText(canonicalUrl)}" />`
+        );
+      } else {
+        hydratedHtml = hydratedHtml.replace(
           '</head>',
           `  <link rel="canonical" href="${escapeXmlText(canonicalUrl)}" />\n  </head>`
         );
+      }
 
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -8107,6 +10367,11 @@ async function startServer() {
       `Noor & Bayan Academy (Supabase PostgreSQL, ${IS_PRODUCTION ? 'production' : 'development'}) running on http://0.0.0.0:${PORT}`
     );
     void ensureUpdatedLevelsCatalog();
+    void cleanupExpiredAuditLogs();
+    const auditCleanupTimer = setInterval(() => {
+      void cleanupExpiredAuditLogs();
+    }, 12 * 60 * 60 * 1000);
+    auditCleanupTimer.unref();
   });
 
   const gracefulShutdown = async (signal: string, exitCode = 0) => {
