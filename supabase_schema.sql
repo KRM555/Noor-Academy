@@ -901,3 +901,252 @@ WHERE
   OR content_en LIKE '%noorbayan.academy%'
   OR content_en LIKE '%noorwbayan-academy.up.railway.app%'
   OR content_en LIKE '%noorwbayan558@gmail.com%';
+
+-- ============================================================================
+-- Admin Dashboard Summary RPC & Performance Indexes (Idempotent)
+-- ============================================================================
+CREATE INDEX IF NOT EXISTS idx_profiles_role ON public.profiles(role);
+CREATE INDEX IF NOT EXISTS idx_profiles_role_active ON public.profiles(role, is_active) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_admission_requests_status ON public.admission_requests(status);
+CREATE INDEX IF NOT EXISTS idx_students_status ON public.students(status) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_enrollments_status ON public.enrollments(status) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_enrollments_course_active ON public.enrollments(course_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_lessons_course_active ON public.lessons(course_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_exams_course_active ON public.exams(course_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_payroll_status ON public.payroll(status);
+CREATE INDEX IF NOT EXISTS idx_exam_attempts_submitted ON public.exam_attempts(exam_id, student_id) WHERE submitted_at IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION public.get_admin_dashboard_summary()
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_students_count INT := 0;
+  v_teachers_count INT := 0;
+  v_courses_count INT := 0;
+  v_lessons_count INT := 0;
+  v_pending_admissions INT := 0;
+  v_pending_grading INT := 0;
+  v_pending_suggestions INT := 0;
+  v_levels JSONB := '[]'::jsonb;
+  v_games JSONB := '[]'::jsonb;
+  v_legal JSONB := '[]'::jsonb;
+  v_course_chart JSONB := '[]'::jsonb;
+  v_student_opts JSONB := '[]'::jsonb;
+  v_teacher_opts JSONB := '[]'::jsonb;
+  v_unlinked_admins JSONB := '[]'::jsonb;
+  v_course_opts JSONB := '[]'::jsonb;
+BEGIN
+  SELECT COUNT(*)::INT INTO v_students_count
+  FROM public.students
+  WHERE deleted_at IS NULL;
+
+  SELECT COUNT(*)::INT INTO v_teachers_count
+  FROM public.teachers
+  WHERE deleted_at IS NULL;
+
+  SELECT COUNT(*)::INT INTO v_courses_count
+  FROM public.courses
+  WHERE deleted_at IS NULL;
+
+  SELECT COUNT(*)::INT INTO v_lessons_count
+  FROM public.lessons l
+  JOIN public.courses c ON c.id = l.course_id
+  WHERE l.deleted_at IS NULL
+    AND c.deleted_at IS NULL;
+
+  SELECT COUNT(*)::INT INTO v_pending_admissions
+  FROM public.admission_requests
+  WHERE status = 'pending';
+
+  SELECT COUNT(*)::INT INTO v_pending_grading
+  FROM public.exam_attempts ea
+  JOIN public.exams ex ON ex.id = ea.exam_id
+  JOIN public.courses c ON c.id = ex.course_id
+  WHERE ex.deleted_at IS NULL
+    AND c.deleted_at IS NULL
+    AND ea.submitted_at IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public.exam_results er
+      WHERE er.exam_id = ea.exam_id
+        AND er.student_id = ea.student_id
+    );
+
+  SELECT COALESCE(jsonb_agg(
+    jsonb_build_object(
+      'id', l.id,
+      'code', l.code,
+      'name_ar', l.name_ar,
+      'name_en', l.name_en,
+      'age_range', l.age_range
+    ) ORDER BY l.order_index ASC
+  ), '[]'::jsonb) INTO v_levels
+  FROM (
+    SELECT id, code, name_ar, name_en, age_range, order_index
+    FROM public.levels
+    ORDER BY order_index ASC
+    LIMIT 100
+  ) l;
+
+  SELECT COALESCE(jsonb_agg(
+    jsonb_build_object(
+      'id', g.id,
+      'slug', g.slug,
+      'title_ar', g.title_ar,
+      'title_en', g.title_en,
+      'category', g.category,
+      'is_active', g.is_active
+    ) ORDER BY g.id ASC
+  ), '[]'::jsonb) INTO v_games
+  FROM (
+    SELECT id, slug, title_ar, title_en, category, is_active
+    FROM public.games
+    ORDER BY id ASC
+    LIMIT 100
+  ) g;
+
+  SELECT COALESCE(jsonb_agg(
+    jsonb_build_object(
+      'doc_type', ld.doc_type,
+      'version', ld.version,
+      'title_ar', ld.title_ar,
+      'title_en', ld.title_en,
+      'content_ar', ld.content_ar,
+      'content_en', ld.content_en
+    ) ORDER BY ld.id ASC
+  ), '[]'::jsonb) INTO v_legal
+  FROM (
+    SELECT id, doc_type, version, title_ar, title_en, content_ar, content_en
+    FROM public.legal_documents
+    ORDER BY id ASC
+    LIMIT 50
+  ) ld;
+
+  WITH recent_courses AS (
+    SELECT id, title_ar, capacity
+    FROM public.courses
+    WHERE deleted_at IS NULL
+    ORDER BY id DESC
+    LIMIT 500
+  ),
+  enrollment_counts AS (
+    SELECT course_id, COUNT(*)::INT AS enrolled_count
+    FROM public.enrollments
+    WHERE deleted_at IS NULL
+    GROUP BY course_id
+  )
+  SELECT
+    COALESCE(jsonb_agg(
+      jsonb_build_object(
+        'id', rc.id,
+        'title_ar', COALESCE(rc.title_ar, ''),
+        'capacity', COALESCE(rc.capacity, 0),
+        'enrolled_count', COALESCE(ec.enrolled_count, 0)
+      ) ORDER BY rc.id DESC
+    ), '[]'::jsonb),
+    COALESCE(jsonb_agg(
+      jsonb_build_object(
+        'id', rc.id,
+        'label', COALESCE(rc.title_ar, '')
+      ) ORDER BY rc.id DESC
+    ), '[]'::jsonb)
+  INTO v_course_chart, v_course_opts
+  FROM recent_courses rc
+  LEFT JOIN enrollment_counts ec ON ec.course_id = rc.id;
+
+  SELECT COALESCE(jsonb_agg(
+    jsonb_build_object(
+      'id', s.id,
+      'label', s.full_name_ar || ' (' || s.student_code || ')',
+      'full_name_ar', s.full_name_ar,
+      'student_code', s.student_code
+    ) ORDER BY s.id DESC
+  ), '[]'::jsonb) INTO v_student_opts
+  FROM (
+    SELECT id, full_name_ar, student_code
+    FROM public.students
+    WHERE deleted_at IS NULL
+    ORDER BY id DESC
+    LIMIT 500
+  ) s;
+
+  SELECT COALESCE(jsonb_agg(
+    jsonb_build_object(
+      'id', t.id,
+      'label', CASE WHEN p.id IS NOT NULL THEN COALESCE(t.name_ar, '') || ' (المدير)' ELSE COALESCE(t.name_ar, '') END,
+      'is_admin', (p.id IS NOT NULL)
+    ) ORDER BY t.id ASC
+  ), '[]'::jsonb) INTO v_teacher_opts
+  FROM (
+    SELECT id, profile_id, name_ar
+    FROM public.teachers
+    WHERE deleted_at IS NULL
+    ORDER BY id ASC
+    LIMIT 500
+  ) t
+  LEFT JOIN public.profiles p
+    ON p.id = t.profile_id
+   AND p.role = 'admin'
+   AND p.is_active = TRUE
+   AND p.deleted_at IS NULL;
+
+  SELECT COALESCE(jsonb_agg(
+    jsonb_build_object(
+      'profile_id', p.id::text,
+      'full_name', COALESCE(NULLIF(TRIM(p.full_name), ''), p.email, 'المدير'),
+      'label', COALESCE(NULLIF(TRIM(p.full_name), ''), p.email, 'المدير') || ' (المدير)'
+    ) ORDER BY p.created_at ASC
+  ), '[]'::jsonb) INTO v_unlinked_admins
+  FROM (
+    SELECT id, full_name, email, created_at
+    FROM public.profiles
+    WHERE role = 'admin'
+      AND is_active = TRUE
+      AND deleted_at IS NULL
+    ORDER BY created_at ASC
+    LIMIT 50
+  ) p
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM public.teachers t
+    WHERE t.profile_id = p.id
+      AND t.deleted_at IS NULL
+  );
+
+  RETURN jsonb_build_object(
+    'counts', jsonb_build_object(
+      'students', v_students_count,
+      'teachers', v_teachers_count,
+      'courses', v_courses_count,
+      'lessons', v_lessons_count,
+      'pendingAdmissions', v_pending_admissions,
+      'pendingGrading', v_pending_grading,
+      'pendingSuggestions', v_pending_suggestions
+    ),
+    'overview', jsonb_build_object(
+      'stats', jsonb_build_object(
+        'students', v_students_count,
+        'teachers', v_teachers_count,
+        'courses', v_courses_count,
+        'lessons', v_lessons_count
+      )
+    ),
+    'levels', v_levels,
+    'games', v_games,
+    'legal', v_legal,
+    'courseChart', v_course_chart,
+    'options', jsonb_build_object(
+      'students', v_student_opts,
+      'teachers', v_teacher_opts,
+      'unlinkedAdmins', v_unlinked_admins,
+      'courses', v_course_opts
+    )
+  );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.get_admin_dashboard_summary() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_admin_dashboard_summary() TO service_role;

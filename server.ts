@@ -1575,6 +1575,7 @@ const courseDetailCache = new Map<number, { payload: unknown; expiresAt: number 
 const teacherDetailCache = new Map<number, { payload: unknown; expiresAt: number }>();
 let adminDashboardSummaryCache: { payload: unknown; expiresAt: number } | null = null;
 let adminDashboardSummaryInFlight: Promise<unknown> | null = null;
+let adminDashboardSummaryEpoch = 0;
 const roleDashboardCache = new Map<string, { payload: unknown; expiresAt: number }>();
 
 function getCachedRoleDashboard<T>(key: string): T | null {
@@ -1603,6 +1604,7 @@ function setCachedRoleDashboard(key: string, payload: unknown): void {
 }
 
 function invalidateDashboardCaches(): void {
+  adminDashboardSummaryEpoch += 1;
   adminDashboardSummaryCache = null;
   adminDashboardSummaryInFlight = null;
   roleDashboardCache.clear();
@@ -6245,7 +6247,45 @@ function sanitizePostgrestOrSearch(q: string): string {
     .trim();
 }
 
+let warnedMissingAdminSummaryRpc = false;
+
 async function buildAdminDashboardSummaryPayload(sb: ReturnType<typeof requireSupabaseAdmin>) {
+  const { data: rpcPayload, error: rpcError } = await sb.rpc('get_admin_dashboard_summary');
+  if (!rpcError && rpcPayload && typeof rpcPayload === 'object') {
+    const record = rpcPayload as Record<string, unknown>;
+    const legalList = Array.isArray(record.legal) ? record.legal : [];
+    return {
+      ...record,
+      legal: legalList.map((doc) => {
+        const d = (doc && typeof doc === 'object' ? doc : {}) as Record<string, unknown>;
+        return {
+          ...d,
+          content_ar: normalizeLegacyDomainText(String(d.content_ar || '')),
+          content_en: normalizeLegacyDomainText(String(d.content_en || '')),
+        };
+      }),
+    };
+  }
+
+  const errCode = String((rpcError as { code?: string } | null)?.code || '');
+  const errMsg = String((rpcError as { message?: string } | null)?.message || '');
+  const isMissingRpc =
+    errCode === 'PGRST202' ||
+    errCode === '42883' ||
+    errMsg.includes('get_admin_dashboard_summary');
+
+  if (!isMissingRpc) {
+    throw new Error(errMsg || 'Failed to load admin dashboard summary');
+  }
+
+  if (!warnedMissingAdminSummaryRpc) {
+    warnedMissingAdminSummaryRpc = true;
+    console.warn('[admin-summary] get_admin_dashboard_summary() RPC is not installed yet; falling back to multi-query mode until supabase_schema.sql is applied.');
+  }
+  return buildAdminDashboardSummaryFallback(sb);
+}
+
+async function buildAdminDashboardSummaryFallback(sb: ReturnType<typeof requireSupabaseAdmin>) {
   const [
     studentsCountRes,
     teachersCountRes,
@@ -6401,7 +6441,7 @@ async function buildAdminDashboardSummaryPayload(sb: ReturnType<typeof requireSu
   };
 }
 
-app.get('/api/admin/dashboard/summary', authenticate, requireRole('admin'), asyncHandler(async (_req, res) => {
+app.get(['/api/admin/dashboard/summary', '/api/admin/summary'], authenticate, requireRole('admin'), asyncHandler(async (_req, res) => {
   const stopTimer = startDevEndpointTimer('GET /api/admin/dashboard/summary');
   try {
     if (adminDashboardSummaryCache && Date.now() < adminDashboardSummaryCache.expiresAt) {
@@ -6411,12 +6451,15 @@ app.get('/api/admin/dashboard/summary', authenticate, requireRole('admin'), asyn
 
     const sb = requireSupabaseAdmin();
     if (!adminDashboardSummaryInFlight) {
+      const requestEpoch = adminDashboardSummaryEpoch;
       adminDashboardSummaryInFlight = buildAdminDashboardSummaryPayload(sb)
         .then((payload) => {
-          adminDashboardSummaryCache = {
-            payload,
-            expiresAt: Date.now() + DASHBOARD_CACHE_TTL_MS,
-          };
+          if (requestEpoch === adminDashboardSummaryEpoch) {
+            adminDashboardSummaryCache = {
+              payload,
+              expiresAt: Date.now() + DASHBOARD_CACHE_TTL_MS,
+            };
+          }
           return payload;
         })
         .finally(() => {
