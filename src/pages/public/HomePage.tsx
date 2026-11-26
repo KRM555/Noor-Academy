@@ -499,7 +499,7 @@ export function HomePage({
                         <h3 className="text-base font-bold leading-snug">
                           {tField(course as unknown as Record<string, unknown>, 'title', lang)}
                         </h3>
-                        <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 line-clamp-3 leading-relaxed">
+                        <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 line-clamp-3 leading-relaxed whitespace-pre-line">
                           {tField(course as unknown as Record<string, unknown>, 'description', lang)}
                         </p>
                       </div>

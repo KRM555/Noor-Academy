@@ -84,7 +84,7 @@ export function CoursesPage({
                     {c.co_teacher_names_ar && c.co_teacher_names_ar.length > 0 && ` (+${c.co_teacher_names_ar.length})`}
                   </div>
                   <h2 className="text-lg font-bold">{tField(c as unknown as Record<string, unknown>, 'title', lang)}</h2>
-                  <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                  <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed whitespace-pre-line">
                     {tField(c as unknown as Record<string, unknown>, 'description', lang)}
                   </p>
                 </div>
@@ -181,7 +181,7 @@ export function CourseDetailPage({
             <h1 className="text-2xl sm:text-3xl font-extrabold">
               {tField(course as unknown as Record<string, unknown>, 'title', lang)}
             </h1>
-            <p className="text-slate-600 dark:text-slate-300 leading-relaxed">
+            <p className="text-slate-600 dark:text-slate-300 leading-relaxed whitespace-pre-line">
               {tField(course as unknown as Record<string, unknown>, 'description', lang)}
             </p>
 

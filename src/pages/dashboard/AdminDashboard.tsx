@@ -646,7 +646,7 @@ export function AdminDashboard({
   });
 
   // Create Form states
-  const [newCourse, setNewCourse] = useState({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '', schedule_ar: '', capacity: '12' });
+  const [newCourse, setNewCourse] = useState({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '', schedule_ar: '', capacity: '' });
   const [newStudent, setNewStudent] = useState({ email: '', full_name_ar: '', age: '8', level_id: '1', guardian_name: '', guardian_phone: '', guardian_email: '', course_id: '1' });
   const [newTeacher, setNewTeacher] = useState({ name_ar: '', phone: '', specialty_ar: '' });
   const [enrollPair, setEnrollPair] = useState({ student_id: '1', course_id: '1' });
@@ -2294,7 +2294,7 @@ export function AdminDashboard({
         level_id: String(c.level_id || 1),
         teacher_id: c.teacher_id ? String(c.teacher_id) : '',
         schedule_ar: c.schedule_ar || '',
-        capacity: String(c.capacity ?? 12),
+        capacity: c.capacity && c.capacity > 0 ? String(c.capacity) : '',
         is_featured: Boolean(c.is_featured),
         co_teacher_ids: c.co_teacher_ids || [],
         co_teacher_admin_ids: [],
@@ -2370,7 +2370,7 @@ export function AdminDashboard({
               level_id: Number(courseEdit.level_id),
               teacher_id: courseEdit.teacher_id || null,
               schedule_ar: courseEdit.schedule_ar,
-              capacity: Number(courseEdit.capacity),
+              capacity: courseEdit.capacity.trim() ? Number(courseEdit.capacity) : 0,
               is_featured: courseEdit.is_featured,
               co_teacher_ids: courseEdit.co_teacher_ids.filter(
                 (tid) => !courseEdit.teacher_id || tid !== Number(courseEdit.teacher_id)
@@ -2766,7 +2766,7 @@ export function AdminDashboard({
                     <span>{selectedCourse.level_name_ar}</span>
                     <span aria-hidden="true">·</span>
                     <span className="font-mono-tabular font-bold text-[#C98A1E]">
-                      {courseEnrollments.length}/{selectedCourse.capacity} {lang === 'ar' ? 'طالب' : 'enrolled'}
+                      {selectedCourse.capacity > 0 ? `${courseEnrollments.length}/${selectedCourse.capacity}` : courseEnrollments.length} {lang === 'ar' ? 'طالب' : 'enrolled'}
                     </span>
                   </div>
                 </div>
@@ -3541,8 +3541,8 @@ export function AdminDashboard({
                       <input value={courseEdit.schedule_ar} onChange={(e) => setCourseEdit({ ...courseEdit, schedule_ar: e.target.value })} placeholder={lang === 'ar' ? 'اختياري' : 'Optional'} className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
                     </div>
                     <div className="space-y-1">
-                      <label className="text-xs font-bold">{lang === 'ar' ? 'السعة القصوى' : 'Capacity'}</label>
-                      <input type="number" min={1} value={courseEdit.capacity} onChange={(e) => setCourseEdit({ ...courseEdit, capacity: e.target.value })} required className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
+                      <label className="text-xs font-bold">{lang === 'ar' ? 'السعة القصوى (اختياري)' : 'Capacity (optional)'}</label>
+                      <input type="number" min={1} placeholder={lang === 'ar' ? 'اختياري' : 'Optional'} value={courseEdit.capacity} onChange={(e) => setCourseEdit({ ...courseEdit, capacity: e.target.value })} className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
                     </div>
                   </div>
 
@@ -3608,15 +3608,28 @@ export function AdminDashboard({
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
-                    <div className="sm:col-span-2 space-y-1">
-                      <label className="text-xs font-bold">{lang === 'ar' ? 'وصف الكورس في الصفحة الرئيسية' : 'Public Description'}</label>
-                      <input value={courseEdit.description_ar} onChange={(e) => setCourseEdit({ ...courseEdit, description_ar: e.target.value })} className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+                  <div className="space-y-3">
+                    <div className="space-y-1.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <label className="text-xs font-bold">{lang === 'ar' ? 'وصف الكورس في الصفحة الرئيسية' : 'Public Description'}</label>
+                        <label className="inline-flex items-center gap-2 text-xs font-bold cursor-pointer">
+                          <input type="checkbox" checked={courseEdit.is_featured} onChange={(e) => setCourseEdit({ ...courseEdit, is_featured: e.target.checked })} />
+                          <span>{lang === 'ar' ? 'ظاهر في الصفحة الرئيسية' : 'Featured on Home'}</span>
+                        </label>
+                      </div>
+                      <textarea
+                        rows={6}
+                        value={courseEdit.description_ar}
+                        onChange={(e) => setCourseEdit({ ...courseEdit, description_ar: e.target.value })}
+                        placeholder={lang === 'ar' ? 'اكتب وصف الكورس هنا... اضغط Enter لبدء سطر جديد وترتيب النقاط' : 'Write course description... Press Enter for new lines'}
+                        className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3.5 py-2.5 text-sm leading-relaxed resize-y"
+                      />
+                      <p className="text-[11px] text-slate-500">
+                        {lang === 'ar'
+                          ? 'اضغط Enter للنزول إلى سطر جديد؛ سيظهر نفس تنسيق الأسطر للزوار في صفحة تفاصيل الكورس.'
+                          : 'Press Enter for line breaks; visitors will see the same line layout on the course details page.'}
+                      </p>
                     </div>
-                    <label className="inline-flex items-center gap-2 text-xs font-bold cursor-pointer pb-2">
-                      <input type="checkbox" checked={courseEdit.is_featured} onChange={(e) => setCourseEdit({ ...courseEdit, is_featured: e.target.checked })} />
-                      <span>{lang === 'ar' ? 'ظاهر في الصفحة الرئيسية' : 'Featured on Home'}</span>
-                    </label>
                   </div>
 
                   <div>
@@ -3690,6 +3703,7 @@ export function AdminDashboard({
           body: JSON.stringify({
             ...newCourse,
             teacher_id: newCourse.teacher_id || null,
+            capacity: newCourse.capacity.trim() ? Number(newCourse.capacity) : 0,
             price_monthly: 0,
             price_monthly_sar: null,
             cover_url: newCourseCoverFile ? undefined : newCourseCoverUrl || undefined,
@@ -3711,7 +3725,7 @@ export function AdminDashboard({
           });
         }
         toast(lang === 'ar' ? 'تم إنشاء الكورس وإضافته للصفحة الرئيسية بنجاح' : 'Course created & added to showcase', 'success');
-        setNewCourse({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '', schedule_ar: '', capacity: '12' });
+        setNewCourse({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '', schedule_ar: '', capacity: '' });
         setNewCourseCoverUrl('');
         setNewCourseCoverFile(null);
         setNewCourseCoTeacherIds([]);
@@ -3778,8 +3792,8 @@ export function AdminDashboard({
                   {unlinkedAdminOptions.map((a) => <option key={a.profile_id} value={`admin:${a.profile_id}`}>{a.label}</option>)}
                 </select>
                 <input placeholder={lang === 'ar' ? 'المواعيد (اختياري)' : 'Schedule (optional)'} value={newCourse.schedule_ar} onChange={(e) => setNewCourse({ ...newCourse, schedule_ar: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
-                <input type="number" min={1} placeholder={lang === 'ar' ? 'السعة' : 'Capacity'} value={newCourse.capacity} onChange={(e) => setNewCourse({ ...newCourse, capacity: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
-                <input placeholder={lang === 'ar' ? 'وصف مختصر للكورس (اختياري)' : 'Course description (optional)'} value={newCourse.description_ar} onChange={(e) => setNewCourse({ ...newCourse, description_ar: e.target.value })} className="sm:col-span-3 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+                <input type="number" min={1} placeholder={lang === 'ar' ? 'السعة (اختياري)' : 'Capacity (optional)'} value={newCourse.capacity} onChange={(e) => setNewCourse({ ...newCourse, capacity: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
+                <textarea rows={5} placeholder={lang === 'ar' ? 'وصف الكورس (اختياري — اضغط Enter لبدء سطر جديد وترتيب النقاط)' : 'Course description (optional — press Enter for new lines)'} value={newCourse.description_ar} onChange={(e) => setNewCourse({ ...newCourse, description_ar: e.target.value })} className="sm:col-span-3 w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3.5 py-2.5 text-sm leading-relaxed resize-y" />
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start pt-2 border-t border-[#E5DEC9] dark:border-[#233C63]">
@@ -3919,7 +3933,7 @@ export function AdminDashboard({
                         <span>{cExams} {lang === 'ar' ? 'امتحان' : 'exams'}</span>
                         <span aria-hidden="true">·</span>
                         <span className="text-[#0F766E] dark:text-[#2DD4BF] font-bold">
-                          {cEnrolled}/{c.capacity} {lang === 'ar' ? 'طالب' : 'students'}
+                          {c.capacity > 0 ? `${cEnrolled}/${c.capacity}` : cEnrolled} {lang === 'ar' ? 'طالب' : 'students'}
                         </span>
                       </div>
                     </div>
