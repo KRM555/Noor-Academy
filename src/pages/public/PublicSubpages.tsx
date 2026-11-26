@@ -9,7 +9,6 @@ import { dict, tField } from '../../i18n/translations';
 import type { Course, LegalDocument, PublicOverview, Teacher } from '../../types';
 import { Card, PrimaryButton, SecondaryButton, ResilientImage, LoadingState, PaginationBar } from '../../components/ui/CommonUI';
 import { getCourseImageUrl } from '../../lib/courseImages';
-import { formatCoursePriceSummary, resolveCoursePrices, type DisplayCurrency } from '../../lib/currency';
 import {
   ACADEMY_CONTACTS,
   WhatsAppBrandIcon,
@@ -27,7 +26,7 @@ export function CoursesPage({
   onSelectCourse: (id: number) => void;
   onApplyCourse: (id: number) => void;
 }) {
-  const { lang, currency, setCurrency } = useApp();
+  const { lang } = useApp();
   const t = dict[lang];
   const [page, setPage] = useState(1);
   const pageSize = 20;
@@ -39,31 +38,6 @@ export function CoursesPage({
         <div className="lg:col-span-7 space-y-3">
           <h1 className="text-3xl font-extrabold">{t.coursesTitle}</h1>
           <p className="text-slate-600 dark:text-slate-300">{t.coursesSubtitle}</p>
-          <div className="inline-flex items-center gap-2 pt-1">
-            <span className="text-xs font-bold text-slate-500">{lang === 'ar' ? 'عملة العرض:' : 'Currency:'}</span>
-            <div className="inline-flex rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] p-1 text-xs font-bold">
-              {(
-                [
-                  { id: 'BOTH', ar: 'ج.م + ر.س', en: 'EGP + SAR' },
-                  { id: 'EGP', ar: 'الجنيه المصري', en: 'EGP' },
-                  { id: 'SAR', ar: 'الريال السعودي', en: 'SAR' },
-                ] as Array<{ id: DisplayCurrency; ar: string; en: string }>
-              ).map((opt) => (
-                <button
-                  key={opt.id}
-                  type="button"
-                  onClick={() => setCurrency(opt.id)}
-                  className={`px-3 py-1 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                    currency === opt.id
-                      ? 'bg-[#0F213E] text-white dark:bg-[#C98A1E]'
-                      : 'text-slate-600 dark:text-slate-300 hover:text-[#0F213E]'
-                  }`}
-                >
-                  {lang === 'ar' ? opt.ar : opt.en}
-                </button>
-              ))}
-            </div>
-          </div>
         </div>
         <div className="lg:col-span-5 rounded-2xl overflow-hidden border border-[#E5DEC9] dark:border-[#233C63] bg-[#FAF8F3] dark:bg-[#091529] shadow-sm">
           <ResilientImage
@@ -116,12 +90,11 @@ export function CoursesPage({
                 </div>
               </div>
               <div className="p-6 pt-4 border-t border-[#EFEAD8] dark:border-[#1D355B] space-y-3 mt-4">
-                <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
-                  <span>{tField(c as unknown as Record<string, unknown>, 'schedule', lang)}</span>
-                  <span className="text-sm sm:text-base font-extrabold text-[#0F213E] dark:text-[#F8F5EC] tabular-nums">
-                    {formatCoursePriceSummary(c, lang, currency)}
-                  </span>
-                </div>
+                {tField(c as unknown as Record<string, unknown>, 'schedule', lang) && (
+                  <div className="text-xs text-slate-500 dark:text-slate-400">
+                    {tField(c as unknown as Record<string, unknown>, 'schedule', lang)}
+                  </div>
+                )}
                 <div className="flex gap-2">
                   <SecondaryButton className="flex-1 text-xs py-2" onClick={() => onSelectCourse(c.id)}>
                     {lang === 'ar' ? 'تفاصيل الدورة' : 'Details'}
@@ -212,7 +185,7 @@ export function CourseDetailPage({
               {tField(course as unknown as Record<string, unknown>, 'description', lang)}
             </p>
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-4 border-t border-[#EFEAD8] dark:border-[#1D355B] text-sm">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-4 border-t border-[#EFEAD8] dark:border-[#1D355B] text-sm">
               <div>
                 <div className="text-xs text-slate-500">{lang === 'ar' ? 'المعلمون المسؤولون' : 'Instructors'}</div>
                 <div className="font-bold">
@@ -231,17 +204,8 @@ export function CourseDetailPage({
               </div>
               <div>
                 <div className="text-xs text-slate-500">{lang === 'ar' ? 'المواعيد' : 'Schedule'}</div>
-                <div className="font-bold">{tField(course as unknown as Record<string, unknown>, 'schedule', lang)}</div>
-              </div>
-              <div>
-                <div className="text-xs text-slate-500">{lang === 'ar' ? 'الرسوم الشهرية' : 'Monthly Fee'}</div>
-                <div className="font-extrabold tabular-nums">
-                  {(() => {
-                    const p = resolveCoursePrices(course.price_monthly, course.price_monthly_sar);
-                    return lang === 'ar'
-                      ? `${p.egp} ج.م · ${p.sar} ر.س / شهرياً`
-                      : `${p.egp} EGP · ${p.sar} SAR / mo`;
-                  })()}
+                <div className="font-bold">
+                  {tField(course as unknown as Record<string, unknown>, 'schedule', lang) || (lang === 'ar' ? 'بالتنسيق مع الإدارة' : 'Flexible schedule')}
                 </div>
               </div>
             </div>
@@ -883,8 +847,8 @@ export function InfoStaticPage({
             </div>
             <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
               {lang === 'ar'
-                ? 'للمراسلات الإدارية، متابعة الشهادات المعتمدة، أو طلبات انضمام المعلمين.'
-                : 'For administrative inquiries, certificate support, or teaching applications.'}
+                ? 'للمراسلات الإدارية، متابعة الشهادات المعتمدة، والاستفسار عن البرامج التعليمية.'
+                : 'For administrative inquiries, certificate support, and program information.'}
             </p>
             <div dir="ltr" className="font-mono-tabular text-sm font-bold text-[#0F213E] dark:text-[#F8F5EC]">
               {ACADEMY_CONTACTS.email}

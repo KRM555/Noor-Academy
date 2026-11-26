@@ -17,7 +17,6 @@ export type AdminListResource =
   | 'profiles'
   | 'enrollments'
   | 'admissions'
-  | 'teacher-applications'
   | 'guardian-requests'
   | 'announcements'
   | 'exams'

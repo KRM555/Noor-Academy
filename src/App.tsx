@@ -9,10 +9,8 @@ import {
   Megaphone,
   User,
   Users,
-  CheckSquare,
   ClipboardList,
   Wallet,
-  CreditCard,
   UserPlus,
   Scale,
   History,
@@ -49,9 +47,6 @@ import { ErrorBoundary } from './components/ui/ErrorBoundary';
 const StudentDashboard = lazy(() =>
   import('./pages/dashboard/StudentDashboard').then((m) => ({ default: m.StudentDashboard }))
 );
-const TeacherDashboard = lazy(() =>
-  import('./pages/dashboard/TeacherDashboard').then((m) => ({ default: m.TeacherDashboard }))
-);
 const GuardianDashboard = lazy(() =>
   import('./pages/dashboard/GuardianDashboard').then((m) => ({ default: m.GuardianDashboard }))
 );
@@ -72,7 +67,7 @@ import { useSupabaseRealtime } from './hooks/useSupabaseRealtime';
 
 const ALL_DASHBOARD_TABS: NavTab[] = [
   // Student & Guardian Tabs
-  { id: 'home', label_ar: 'الرئيسية', label_en: 'Home', icon: Home, allowedRoles: ['student', 'teacher', 'guardian'] },
+  { id: 'home', label_ar: 'الرئيسية', label_en: 'Home', icon: Home, allowedRoles: ['student', 'guardian'] },
   { id: 'lessons', label_ar: 'دروسي واللينكات', label_en: 'My Lessons', icon: BookOpen, allowedRoles: ['student'] },
   { id: 'schedule', label_ar: 'الجدول', label_en: 'Schedule', icon: Calendar, allowedRoles: ['student'] },
   { id: 'exams', label_ar: 'الامتحانات', label_en: 'Exams', icon: FileCheck, allowedRoles: ['student', 'admin'] },
@@ -83,13 +78,10 @@ const ALL_DASHBOARD_TABS: NavTab[] = [
   { id: 'profile', label_ar: 'ملفي', label_en: 'My Profile', icon: User, allowedRoles: ['student'] },
   { id: 'account', label_ar: 'حسابي والأمان', label_en: 'Account & Security', icon: KeyRound, allowedRoles: ['guardian'] },
 
-  // Teacher Tabs
-  { id: 'courses', label_ar: 'كورساتي', label_en: 'My Courses', icon: BookOpen, allowedRoles: ['teacher', 'admin'] },
-  { id: 'students', label_ar: 'طلابي', label_en: 'My Students', icon: Users, allowedRoles: ['teacher', 'admin'] },
-  { id: 'attendance', label_ar: 'الحضور', label_en: 'Attendance', icon: CheckSquare, allowedRoles: ['teacher'] },
-  { id: 'assessments', label_ar: 'الدرجات والتسميع', label_en: 'Assessments', icon: ClipboardList, allowedRoles: ['teacher'] },
-  { id: 'payroll', label_ar: 'مرتباتي', label_en: 'My Payroll', icon: Wallet, allowedRoles: ['teacher', 'admin'] },
-  { id: 'payout', label_ar: 'بيانات الراتب', label_en: 'Payout IBAN', icon: CreditCard, allowedRoles: ['teacher'] },
+  // Academic Management Tabs (Admin)
+  { id: 'courses', label_ar: 'الكورسات', label_en: 'Courses', icon: BookOpen, allowedRoles: ['admin'] },
+  { id: 'students', label_ar: 'الطلاب', label_en: 'Students', icon: Users, allowedRoles: ['admin'] },
+  { id: 'payroll', label_ar: 'المرتبات', label_en: 'Payroll', icon: Wallet, allowedRoles: ['admin'] },
 
   // Admin Tabs (strictly admin)
   { id: 'overview', label_ar: 'نظرة عامة', label_en: 'Overview', icon: Home, allowedRoles: ['admin'] },
@@ -176,12 +168,6 @@ function RouterContent() {
       void queryClient.prefetchQuery({
         queryKey: queryKeys.studentDashboard(user.id),
         queryFn: () => apiFetch('/api/student/dashboard'),
-        staleTime: 60 * 1000,
-      });
-    } else if (user.role === 'teacher') {
-      void queryClient.prefetchQuery({
-        queryKey: queryKeys.teacherDashboard(user.id),
-        queryFn: () => apiFetch('/api/teacher/dashboard'),
         staleTime: 60 * 1000,
       });
     } else if (user.role === 'guardian') {
@@ -291,8 +277,8 @@ function RouterContent() {
       '/login': {
         titleAr: 'تسجيل الدخول الموحد | أكاديمية نور وبيان',
         titleEn: 'Unified Sign In | Noor & Bayan Academy',
-        descAr: 'تسجيل دخول الطلاب، المعلمين، أولياء الأمور، وإدارة أكاديمية نور وبيان.',
-        descEn: 'Sign in for students, teachers, guardians, and administrators at Noor & Bayan Academy.',
+        descAr: 'تسجيل دخول الطلاب، أولياء الأمور، وإدارة أكاديمية نور وبيان.',
+        descEn: 'Sign in for students, guardians, and administrators at Noor & Bayan Academy.',
       },
     };
 
@@ -393,7 +379,7 @@ function RouterContent() {
         <PublicLayout currentPath="/login" onNavigate={navigate}>
           <LoginPage
             onSuccess={() => navigate('/dashboard')}
-            onNavigateAdmission={(role) => navigate(role === 'teacher' ? '/apply-teacher' : '/apply')}
+            onNavigateAdmission={() => navigate('/apply')}
           />
         </PublicLayout>
       );
@@ -425,7 +411,6 @@ function RouterContent() {
           {user.role === 'student' && (
             <StudentDashboard activeTab={requestedTab} onLaunchGame={launchGame} />
           )}
-          {user.role === 'teacher' && <TeacherDashboard activeTab={requestedTab} />}
           {user.role === 'guardian' && <GuardianDashboard activeTab={requestedTab} />}
           {user.role === 'admin' && (
             <AdminDashboard activeTab={requestedTab} onLaunchGame={launchGame} />
@@ -447,7 +432,6 @@ function RouterContent() {
     '/placement',
     '/apply',
     '/admission',
-    '/apply-teacher',
     '/verify',
     '/how-it-works',
     '/parents',
@@ -524,13 +508,12 @@ function RouterContent() {
         />
       )}
 
-      {(path === '/apply' || path === '/admission' || path === '/apply-teacher') && (
+      {(path === '/apply' || path === '/admission') && (
         <AdmissionPage
           courses={overview?.courses || []}
           levels={overview?.levels || []}
           preselectedCourseId={preCourseId}
           preselectedLevelId={preLevelId}
-          initialMode={path === '/apply-teacher' ? 'teacher' : 'student'}
           onNavigate={navigate}
         />
       )}
@@ -564,7 +547,7 @@ function RouterContent() {
           onSuccess={() => {
             navigate('/dashboard');
           }}
-          onNavigateAdmission={(role) => navigate(role === 'teacher' ? '/apply-teacher' : '/apply')}
+          onNavigateAdmission={() => navigate('/apply')}
         />
       )}
 

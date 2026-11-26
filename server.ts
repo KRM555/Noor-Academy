@@ -58,6 +58,9 @@ import {
   getLessonMeta,
   deleteLessonMeta,
   listLessonMetas,
+  saveTeacherPhone,
+  listTeacherPhones,
+  deleteTeacherPhone,
   type LessonMetaRecord,
 } from './server/applicationVault.ts';
 import {
@@ -477,20 +480,6 @@ const admissionSchema = z.object({
   preferred_course_id: z.coerce.number().int().positive().nullable().optional(),
   recommended_level_id: z.coerce.number().int().positive().nullable().optional(),
   notes: z.string().trim().max(1000).optional(),
-  consent_accepted: z.literal(true).or(z.literal(1)).or(z.boolean().refine((v) => v === true)),
-  google_access_token: z.string().max(8192).optional(),
-  turnstileToken: z.string().max(4096).optional(),
-});
-
-const teacherApplicationSchema = z.object({
-  name_ar: z.string().trim().min(2).max(140),
-  name_en: z.string().trim().max(140).optional(),
-  email: z.string().trim().email().max(160),
-  password: z.string().min(8).max(128),
-  phone: z.string().trim().min(6).max(32),
-  specialty_ar: z.string().trim().min(2).max(200),
-  qualifications_ar: z.string().trim().min(2).max(400),
-  bio_ar: z.string().trim().max(1500).optional(),
   consent_accepted: z.literal(true).or(z.literal(1)).or(z.boolean().refine((v) => v === true)),
   google_access_token: z.string().max(8192).optional(),
   turnstileToken: z.string().max(4096).optional(),
@@ -2079,104 +2068,11 @@ app.post('/api/public/admissions', publicSubmitLimiter, asyncHandler(async (req,
   res.status(201).json({ id: inserted.id, status: 'pending', student_email: cleanStudentEmail, syncedToSupabase: true });
 }));
 
-app.post('/api/public/teacher-applications', publicSubmitLimiter, asyncHandler(async (req, res) => {
-  const parsed = teacherApplicationSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: 'All required teacher application fields (password min 8 chars) and consent must be provided.' });
-    return;
-  }
-
-  const { name_ar, name_en, email, password, phone, specialty_ar, qualifications_ar, bio_ar, google_access_token, turnstileToken } = parsed.data;
-  const captchaCheck = await verifyTurnstileToken(turnstileToken, req.ip);
-  if (!captchaCheck.ok) {
-    res.status(400).json({ error: captchaCheck.reason || 'CAPTCHA verification failed.' });
-    return;
-  }
-
-  const cleanEmail = email.toLowerCase();
-  const sb = requireSupabaseAdmin();
-
-  const { data: existingProfile } = await sb
-    .from('profiles')
-    .select('id')
-    .eq('email', cleanEmail)
-    .is('deleted_at', null)
-    .maybeSingle();
-  if (existingProfile) {
-    res.status(409).json({ error: 'This email is already registered or has a pending application.' });
-    return;
-  }
-
-  const verifiedGoogle = google_access_token ? await verifyVerifiedGoogleToken(sb, google_access_token) : null;
-  const googleVerifiedForEmail = Boolean(verifiedGoogle && verifiedGoogle.email === cleanEmail);
-  const provisioned = await provisionSupabaseAuthUser(cleanEmail, password, name_ar, 'teacher', {
-    emailConfirm: googleVerifiedForEmail,
+app.post('/api/public/teacher-applications', publicSubmitLimiter, asyncHandler(async (_req, res) => {
+  res.status(403).json({
+    error: 'Teacher self-registration has been disabled. Teachers are added directly by academy administration.',
+    code: 'TEACHER_PORTAL_DISABLED',
   });
-  let authUserId = provisioned.user.id;
-  const alreadyExisted = provisioned.alreadyExisted;
-
-  if (alreadyExisted) {
-    if (!googleVerifiedForEmail) {
-      res.status(409).json({
-        error: 'An authentication account already exists for this email. Verify ownership using Fill with Google or use another email.',
-      });
-      return;
-    }
-    const { data: upd, error: updErr } = await sb.auth.admin.updateUserById(authUserId, {
-      password,
-      email_confirm: true,
-      user_metadata: { ...(provisioned.user.user_metadata || {}), full_name: name_ar, role: 'teacher' },
-    });
-    if (updErr || !upd.user) {
-      sendInternalError(res, 'teacher-app-prepare-account', updErr, 'Failed to prepare teacher account');
-      return;
-    }
-    authUserId = upd.user.id;
-  }
-
-  const { error: profErr } = await sb.from('profiles').upsert(
-    {
-      id: authUserId,
-      email: cleanEmail,
-      full_name: name_ar,
-      role: 'teacher',
-      is_active: false,
-      preferred_lang: 'ar',
-    },
-    { onConflict: 'id' }
-  );
-  if (profErr) {
-    if (!alreadyExisted) {
-      await sb.auth.admin.deleteUser(authUserId).catch(() => {});
-    }
-    sendInternalError(res, 'teacher-app-create-profile', profErr, 'Failed to create teacher profile');
-    return;
-  }
-
-  const appId = generateApplicationId();
-  try {
-    await saveTeacherApplication(sb, {
-      id: appId,
-      profile_id: authUserId,
-      email: cleanEmail,
-      name_ar,
-      name_en: (name_en || name_ar).trim(),
-      phone,
-      specialty_ar,
-      qualifications_ar,
-      bio_ar: bio_ar || '',
-      status: 'pending',
-      created_at: new Date().toISOString(),
-    });
-  } catch (err) {
-    await deletePendingAuthProfileIfSafe(sb, authUserId);
-    throw err;
-  }
-
-  await insertConsentSafe(cleanEmail, 'terms', '1.0', req.ip || '', 'teacher');
-  void broadcastRealtimeEvent('admission:created', { kind: 'teacher_application' });
-
-  res.status(201).json({ id: appId, status: 'pending', email: cleanEmail });
 }));
 
 // ============================================================================
@@ -2200,6 +2096,14 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
   const sb = requireSupabaseAdmin();
   let profile: AuthUser | null = null;
   let tokenGuardianId: number | undefined;
+
+  if (portalRole === 'teacher') {
+    res.status(403).json({
+      error: 'Teacher portal sign-in is disabled.',
+      code: 'TEACHER_PORTAL_DISABLED',
+    });
+    return;
+  }
 
   if (!email || !password || typeof email !== 'string' || typeof password !== 'string') {
     res.status(400).json({ error: 'Email and password are required' });
@@ -2361,6 +2265,14 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req, res) => {
     if (!profileRow) {
       recordAccountFailure(lockoutKey, cleanEmail);
       res.status(401).json({ error: 'Invalid credentials' });
+      return;
+    }
+
+    if (profileRow.role === 'teacher') {
+      res.status(403).json({
+        error: 'Teacher portal sign-in is disabled.',
+        code: 'TEACHER_PORTAL_DISABLED',
+      });
       return;
     }
 
@@ -3165,6 +3077,14 @@ app.post('/api/auth/google', loginLimiter, asyncHandler(async (req, res) => {
         email: cleanEmail,
         full_name: googleName,
       },
+    });
+    return;
+  }
+
+  if (parsed.data.portalRole === 'teacher' || profile.role === 'teacher') {
+    res.status(403).json({
+      error: 'Teacher portal sign-in is disabled.',
+      code: 'TEACHER_PORTAL_DISABLED',
     });
     return;
   }
@@ -4099,7 +4019,12 @@ async function assertTeacherTeachesStudent(teacherId: number, studentId: number,
   return Boolean(data && data.length > 0);
 }
 
-app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+app.get('/api/teacher/dashboard', authenticate, asyncHandler<AuthRequest>(async (_req, res) => {
+  res.status(403).json({ error: 'Teacher portal has been disabled.', code: 'TEACHER_PORTAL_DISABLED' });
+  return;
+}));
+
+app.get('/api/teacher/_disabled_dashboard_unused', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
   const cacheKey = `teacher:${req.user!.id}`;
   const cachedPayload = getCachedRoleDashboard<Record<string, unknown>>(cacheKey);
   if (cachedPayload) {
@@ -4352,23 +4277,11 @@ app.get('/api/teacher/dashboard', authenticate, requireRole('teacher'), asyncHan
   res.json(payload);
 }));
 
-app.get('/api/teacher/students/:studentId', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
-  const teacher = await getTeacherByProfile(req.user!.id);
-  const studentId = parsePositiveIntParam(req.params.studentId, 'student id');
-  if (!teacher || !(await assertTeacherTeachesStudent(teacher.id, studentId))) {
-    res.status(403).json({ error: 'Forbidden: student is not enrolled in any of your courses' });
-    return;
-  }
-  const sb = requireSupabaseAdmin();
-  const { data: student } = await sb
-    .from('students')
-    .select('id, student_code, full_name_ar, full_name_en, age, level_id')
-    .eq('id', studentId)
-    .maybeSingle();
-  res.json({ student });
+app.get('/api/teacher/students/:studentId', authenticate, asyncHandler<AuthRequest>(async (_req, res) => {
+  res.status(403).json({ error: 'Teacher portal has been disabled.', code: 'TEACHER_PORTAL_DISABLED' });
 }));
 
-app.post('/api/teacher/attendance', authenticate, requireRole('teacher', 'admin'), asyncHandler<AuthRequest>(async (req, res) => {
+app.post('/api/teacher/attendance', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const schema = z.object({
     lesson_id: z.coerce.number().int().positive(),
     student_id: z.coerce.number().int().positive(),
@@ -4444,7 +4357,7 @@ app.post('/api/teacher/attendance', authenticate, requireRole('teacher', 'admin'
   res.json({ ok: true });
 }));
 
-app.post('/api/teacher/exam-results', authenticate, requireRole('teacher', 'admin'), asyncHandler<AuthRequest>(async (req, res) => {
+app.post('/api/teacher/exam-results', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const schema = z.object({
     exam_id: z.coerce.number().int().positive(),
     student_id: z.coerce.number().int().positive(),
@@ -4551,7 +4464,7 @@ app.post('/api/teacher/exam-results', authenticate, requireRole('teacher', 'admi
   res.json({ ok: true });
 }));
 
-app.post('/api/teacher/recitations', authenticate, requireRole('teacher', 'admin'), asyncHandler<AuthRequest>(async (req, res) => {
+app.post('/api/teacher/recitations', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const schema = z.object({
     student_id: z.coerce.number().int().positive(),
     course_id: z.coerce.number().int().positive(),
@@ -4604,7 +4517,7 @@ app.post('/api/teacher/recitations', authenticate, requireRole('teacher', 'admin
   res.status(201).json({ id: inserted.id });
 }));
 
-app.post('/api/teacher/evaluations', authenticate, requireRole('teacher', 'admin'), asyncHandler<AuthRequest>(async (req, res) => {
+app.post('/api/teacher/evaluations', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const schema = z.object({
     student_id: z.coerce.number().int().positive(),
     course_id: z.coerce.number().int().positive(),
@@ -4655,7 +4568,12 @@ app.post('/api/teacher/evaluations', authenticate, requireRole('teacher', 'admin
   res.status(201).json({ id: inserted.id });
 }));
 
-app.put('/api/teacher/payout-details', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
+app.put('/api/teacher/payout-details', authenticate, asyncHandler<AuthRequest>(async (_req, res) => {
+  res.status(403).json({ error: 'Teacher portal has been disabled.', code: 'TEACHER_PORTAL_DISABLED' });
+  return;
+}));
+
+app.put('/api/teacher/_disabled_payout_unused', authenticate, requireRole('teacher'), asyncHandler<AuthRequest>(async (req, res) => {
   const teacher = await getTeacherByProfile(req.user!.id);
   if (!teacher) {
     res.status(404).json({ error: 'Teacher not found' });
@@ -6302,7 +6220,6 @@ async function buildAdminDashboardSummaryFallback(sb: ReturnType<typeof requireS
     enrollmentsCourseIdsRes,
     examIdsRes,
     examResultsRes,
-    teacherApps,
     guardianReqs,
     suggestionsList,
   ] = await Promise.all([
@@ -6325,7 +6242,6 @@ async function buildAdminDashboardSummaryFallback(sb: ReturnType<typeof requireS
     sb.from('enrollments').select('course_id').is('deleted_at', null).limit(50000),
     sb.from('exams').select('id, courses!inner(deleted_at)').is('deleted_at', null).is('courses.deleted_at', null).limit(500),
     sb.from('exam_results').select('exam_id').limit(50000),
-    listTeacherApplications(sb),
     listGuardianRequests(sb),
     listAllSuggestions(sb),
   ]);
@@ -6395,7 +6311,6 @@ async function buildAdminDashboardSummaryFallback(sb: ReturnType<typeof requireS
       lessons: lessonsCount,
       pendingAdmissions:
         (pendingAdmissionsRes.count || 0) +
-        teacherApps.filter((t) => t.status === 'pending').length +
         guardianReqs.filter((g) => g.status === 'pending').length,
       pendingGrading,
       pendingSuggestions: pendingSuggestionsCount,
@@ -6550,43 +6465,76 @@ app.get('/api/admin/teachers', authenticate, requireRole('admin'), asyncHandler(
     const sb = requireSupabaseAdmin();
     const { page, limit, q, from, to } = parseAdminListQuery(req);
     const safeQ = sanitizePostgrestOrSearch(q);
+    const qLower = q.trim().toLowerCase();
 
-  let query = sb
-    .from('teachers')
-    .select(
-      'id, profile_id, name_ar, name_en, specialty_ar, qualifications_ar, bio_ar, hourly_rate, is_public',
-      { count: 'exact' }
-    )
-    .is('deleted_at', null);
+    const [vaultPhoneMap, { data: adminProfs }] = await Promise.all([
+      listTeacherPhones(sb),
+      sb.from('profiles').select('id').eq('role', 'admin').is('deleted_at', null).limit(100),
+    ]);
 
-  if (safeQ) {
-    query = query.or(
-      `name_ar.ilike.%${safeQ}%,name_en.ilike.%${safeQ}%,specialty_ar.ilike.%${safeQ}%`
-    );
-  }
+    const vaultMatchedTeacherIds = qLower
+      ? Array.from(vaultPhoneMap.entries())
+          .filter(([, phone]) => phone.toLowerCase().includes(qLower))
+          .map(([tid]) => tid)
+      : [];
 
-  const [{ data, count, error }, { data: adminProfs }] = await Promise.all([
-    query.order('id', { ascending: true }).range(from, to),
-    sb.from('profiles').select('id').eq('role', 'admin').is('deleted_at', null).limit(100),
-  ]);
-  if (error) {
-    throw new AppError(500, process.env.NODE_ENV === 'production' ? 'Failed to fetch teachers' : error.message);
-  }
+    const runTeacherQuery = async (includePhoneColumn: boolean) => {
+      const selectCols = includePhoneColumn
+        ? 'id, profile_id, name_ar, name_en, specialty_ar, qualifications_ar, bio_ar, phone, hourly_rate, is_public'
+        : 'id, profile_id, name_ar, name_en, specialty_ar, qualifications_ar, bio_ar, hourly_rate, is_public';
+      let query = sb.from('teachers').select(selectCols, { count: 'exact' }).is('deleted_at', null);
 
-  const adminIdSet = new Set(((adminProfs || []) as Array<{ id: string }>).map((p) => String(p.id)));
-  const items = ((data || []) as Array<Record<string, unknown>>).map(({ profile_id, ...rest }) => ({
-    ...rest,
-    is_admin: Boolean(profile_id && adminIdSet.has(String(profile_id))),
-  }));
+      if (qLower) {
+        const orParts: string[] = [];
+        if (safeQ) {
+          orParts.push(`name_ar.ilike.%${safeQ}%`, `name_en.ilike.%${safeQ}%`, `specialty_ar.ilike.%${safeQ}%`);
+          if (includePhoneColumn) {
+            orParts.push(`phone.ilike.%${safeQ}%`);
+          }
+        }
+        if (vaultMatchedTeacherIds.length > 0) {
+          orParts.push(`id.in.(${vaultMatchedTeacherIds.join(',')})`);
+        }
+        if (orParts.length > 0) {
+          query = query.or(orParts.join(','));
+        }
+      }
 
-  const total = count || 0;
-  res.json({
-    items,
-    page,
-    limit,
-    total,
-    totalPages: Math.max(1, Math.ceil(total / limit)),
-  });
+      return query.order('id', { ascending: true }).range(from, to);
+    };
+
+    let result = await runTeacherQuery(true);
+    if (
+      result.error &&
+      (String((result.error as { code?: string }).code || '') === '42703' ||
+        String((result.error as { code?: string }).code || '') === 'PGRST204' ||
+        String(result.error.message || '').toLowerCase().includes('phone'))
+    ) {
+      result = await runTeacherQuery(false);
+    }
+
+    if (result.error) {
+      throw new AppError(500, process.env.NODE_ENV === 'production' ? 'Failed to fetch teachers' : result.error.message);
+    }
+
+    const adminIdSet = new Set(((adminProfs || []) as Array<{ id: string }>).map((p) => String(p.id)));
+    const items = ((result.data || []) as unknown as Array<Record<string, unknown>>).map(({ profile_id, phone, ...rest }) => {
+      const tid = Number(rest.id);
+      return {
+        ...rest,
+        phone: String(phone || vaultPhoneMap.get(tid) || ''),
+        is_admin: Boolean(profile_id && adminIdSet.has(String(profile_id))),
+      };
+    });
+
+    const total = result.count || 0;
+    res.json({
+      items,
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    });
   } finally {
     stopTimer?.();
   }
@@ -7456,14 +7404,14 @@ app.post('/api/admin/courses', authenticate, requireRole('admin'), asyncHandler<
   const schema = z.object({
     title_ar: z.string().trim().min(2).max(180),
     title_en: z.string().trim().max(180).optional(),
-    description_ar: z.string().trim().max(2500).optional(),
+    description_ar: z.string().trim().max(2500).optional().default(''),
     description_en: z.string().trim().max(2500).optional(),
     level_id: z.coerce.number().int().positive(),
     teacher_id: teacherIdOrAdminSchema.optional().transform((v) => (v === '' || v === null || v === undefined ? null : v)),
-    schedule_ar: z.string().trim().min(1).max(180),
-    schedule_en: z.string().trim().max(180).optional(),
-    price_monthly: z.coerce.number().min(0).max(100000),
-    price_monthly_sar: z.union([z.coerce.number().min(0).max(100000), z.literal(''), z.null()]).optional().transform((v) => (v === '' || v === null || v === undefined ? null : v)),
+    schedule_ar: z.string().trim().max(180).optional().default(''),
+    schedule_en: z.string().trim().max(180).optional().default(''),
+    price_monthly: z.union([z.coerce.number().min(0).max(100000), z.literal(''), z.null()]).optional().transform((v) => (v === '' || v === null || v === undefined ? 0 : Number(v))),
+    price_monthly_sar: z.union([z.coerce.number().min(0).max(100000), z.literal(''), z.null()]).optional().transform((v) => (v === '' || v === null || v === undefined ? null : Number(v))),
     capacity: z.coerce.number().int().min(1).max(500).optional().default(10),
     cover_url: z.string().trim().max(600).nullable().optional(),
     co_teacher_ids: z.array(z.coerce.number().int().positive()).max(20).optional(),
@@ -7543,13 +7491,13 @@ app.patch('/api/admin/courses/:id', authenticate, requireRole('admin'), asyncHan
   const id = parsePositiveIntParam(req.params.id, 'course id');
   const schema = z.object({
     title_ar: z.string().trim().min(1).max(180).optional(),
-    title_en: z.string().trim().min(1).max(180).optional(),
+    title_en: z.string().trim().max(180).optional(),
     description_ar: z.string().trim().max(2000).optional(),
     description_en: z.string().trim().max(2000).optional(),
     level_id: z.coerce.number().int().positive().optional(),
     teacher_id: teacherIdOrAdminSchema.optional().transform((v) => (v === '' || v === null ? null : v)),
-    schedule_ar: z.string().trim().min(1).max(180).optional(),
-    schedule_en: z.string().trim().min(1).max(180).optional(),
+    schedule_ar: z.string().trim().max(180).optional(),
+    schedule_en: z.string().trim().max(180).optional(),
     price_monthly: z.coerce.number().min(0).max(100000).optional(),
     price_monthly_sar: z.coerce.number().min(0).max(100000).nullable().optional(),
     capacity: z.coerce.number().int().min(1).max(200).optional(),
@@ -8006,113 +7954,66 @@ app.post('/api/admin/teachers/ensure-admin', authenticate, requireRole('admin'),
 
 app.post('/api/admin/teachers', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const schema = z.object({
-    email: z.string().trim().email().max(160),
     name_ar: z.string().trim().min(2).max(160),
+    phone: z.string().trim().min(4).max(40),
+    specialty_ar: z.string().trim().min(2).max(200),
     name_en: z.string().trim().max(160).optional(),
     bio_ar: z.string().trim().max(2000).optional(),
     bio_en: z.string().trim().max(2000).optional(),
     qualifications_ar: z.string().trim().max(500).optional(),
     qualifications_en: z.string().trim().max(500).optional(),
-    specialty_ar: z.string().trim().max(200).optional(),
     specialty_en: z.string().trim().max(200).optional(),
-    hourly_rate: z.coerce.number().min(0).max(50000).optional().default(180),
+    hourly_rate: z.coerce.number().min(0).max(50000).optional().default(0),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: 'Valid teacher email, Arabic name, and hourly rate are required' });
+    res.status(400).json({ error: 'Teacher name, phone number, and subject are required.' });
     return;
   }
 
-  const { email, name_ar, name_en, bio_ar, bio_en, qualifications_ar, qualifications_en, specialty_ar, specialty_en, hourly_rate } = parsed.data;
-  const cleanEmail = email.toLowerCase();
-  const cleanName = name_ar;
+  const { name_ar, phone, specialty_ar, name_en, bio_ar, bio_en, qualifications_ar, qualifications_en, specialty_en, hourly_rate } = parsed.data;
+  const cleanName = name_ar.trim();
+  const cleanPhone = phone.trim();
+  const cleanSpecialty = specialty_ar.trim();
   const sb = requireSupabaseAdmin();
 
-  const { data: existingProfile } = await sb
-    .from('profiles')
-    .select('id, role, is_active, deleted_at')
-    .eq('email', cleanEmail)
-    .is('deleted_at', null)
-    .maybeSingle();
-
-  if (existingProfile && existingProfile.role === 'admin') {
-    const { data: existingTeacher } = await sb
-      .from('teachers')
-      .select('id')
-      .eq('profile_id', existingProfile.id)
-      .is('deleted_at', null)
-      .maybeSingle();
-    if (existingTeacher) {
-      res.status(200).json({ id: Number(existingTeacher.id), linked_existing_admin: true });
-      return;
-    }
-    const teacher = await insertRowSafe<{ id: number }>('teachers', {
-      profile_id: existingProfile.id,
-      name_ar: cleanName,
-      name_en: name_en?.trim() || cleanName,
-      bio_ar: bio_ar || '',
-      bio_en: bio_en || '',
-      qualifications_ar: qualifications_ar || '',
-      qualifications_en: qualifications_en || '',
-      specialty_ar: specialty_ar || '',
-      specialty_en: specialty_en || '',
-      avatar_url: '/assets/images/teacher_portrait_1.webp',
-      hourly_rate,
-      is_public: true,
-    });
-    invalidateOverviewCache();
-    await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_TEACHER', 'teacher', teacher.id, {
-      teacher_id: teacher.id,
-      linked_existing_admin: true,
-    });
-    res.status(201).json({ id: teacher.id, linked_existing_admin: true });
-    return;
-  }
-
-  const tempPassword = generateTempPassword();
-  const { user } = await provisionSupabaseAuthUser(cleanEmail, tempPassword, cleanName, 'teacher');
-  const { error: pErr } = await sb.from('profiles').upsert(
-    {
-      id: user.id,
-      email: cleanEmail,
-      full_name: cleanName,
-      role: 'teacher',
-      is_active: true,
-      preferred_lang: 'ar',
-    },
-    { onConflict: 'id' }
-  );
-  if (pErr) {
-    sendInternalError(res, 'admin-create-teacher-profile', pErr, 'Failed to save teacher profile');
-    return;
-  }
-
   const teacher = await insertRowSafe<{ id: number }>('teachers', {
-    profile_id: user.id,
+    profile_id: null,
     name_ar: cleanName,
     name_en: name_en?.trim() || cleanName,
     bio_ar: bio_ar || '',
     bio_en: bio_en || '',
     qualifications_ar: qualifications_ar || '',
     qualifications_en: qualifications_en || '',
-    specialty_ar: specialty_ar || '',
-    specialty_en: specialty_en || '',
+    specialty_ar: cleanSpecialty,
+    specialty_en: specialty_en?.trim() || cleanSpecialty,
     avatar_url: '/assets/images/teacher_portrait_1.webp',
     hourly_rate,
+    is_public: true,
   });
+
+  await Promise.all([
+    saveTeacherPhone(sb, teacher.id, cleanPhone),
+    sb
+      .from('teachers')
+      .update({ phone: cleanPhone })
+      .eq('id', teacher.id)
+      .then(() => undefined, () => undefined),
+  ]);
 
   invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'CREATE_TEACHER', 'teacher', teacher.id, {
     teacher_id: teacher.id,
   });
-  res.status(201).json({ id: teacher.id, temporary_password: tempPassword });
+  res.status(201).json({ id: teacher.id, name_ar: cleanName, phone: cleanPhone, specialty_ar: cleanSpecialty });
 }));
 
 app.patch('/api/admin/teachers/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = parsePositiveIntParam(req.params.id, 'teacher id');
   const schema = z.object({
     name_ar: z.string().trim().min(1).max(160).optional(),
-    name_en: z.string().trim().min(1).max(160).optional(),
+    name_en: z.string().trim().max(160).optional(),
+    phone: z.string().trim().max(40).optional(),
     specialty_ar: z.string().trim().max(200).optional(),
     specialty_en: z.string().trim().max(200).optional(),
     qualifications_ar: z.string().trim().max(500).optional(),
@@ -8128,10 +8029,25 @@ app.patch('/api/admin/teachers/:id', authenticate, requireRole('admin'), asyncHa
     return;
   }
   const sb = requireSupabaseAdmin();
-  const { error } = await sb.from('teachers').update(parsed.data).eq('id', id).is('deleted_at', null);
-  if (error) {
-    sendInternalError(res, 'admin-update-teacher', error, 'Failed to update teacher');
-    return;
+  const { phone, ...dbUpdates } = parsed.data;
+  if (Object.keys(dbUpdates).length > 0) {
+    const { error } = await sb.from('teachers').update(dbUpdates).eq('id', id).is('deleted_at', null);
+    if (error) {
+      sendInternalError(res, 'admin-update-teacher', error, 'Failed to update teacher');
+      return;
+    }
+  }
+  if (phone !== undefined) {
+    const cleanPhone = phone.trim();
+    await Promise.all([
+      saveTeacherPhone(sb, id, cleanPhone),
+      sb
+        .from('teachers')
+        .update({ phone: cleanPhone })
+        .eq('id', id)
+        .is('deleted_at', null)
+        .then(() => undefined, () => undefined),
+    ]);
   }
   invalidateOverviewCache();
   await writeAuditLog(req.user!.id, req.user!.full_name, 'UPDATE_TEACHER', 'teacher', id, {
@@ -8311,6 +8227,7 @@ async function hardDeleteTeacherCascade(
     sb.from('courses').update({ teacher_id: null }).eq('teacher_id', teacherId),
     sb.from('payroll').delete().eq('teacher_id', teacherId),
     sb.from('teacher_payout_details').delete().eq('teacher_id', teacherId),
+    deleteTeacherPhone(sb, teacherId),
     ...coTeacherTasks,
   ]);
   step1Results.forEach((res, idx) => {
@@ -8866,7 +8783,14 @@ app.post('/api/admin/admissions/:id/decision', authenticate, requireRole('admin'
   });
 }));
 
-app.post('/api/admin/teacher-applications/:id/decision', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
+app.post('/api/admin/teacher-applications/:id/decision', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (_req, res) => {
+  res.status(403).json({
+    error: 'Teacher self-registration and portal activation are disabled.',
+    code: 'TEACHER_PORTAL_DISABLED',
+  });
+}));
+
+app.post('/api/admin/teacher-applications/_disabled_decision/:id', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = parsePositiveIntParam(req.params.id, 'teacher application id');
   const schema = z.object({
     decision: z.enum(['approved', 'rejected']),
@@ -9518,7 +9442,7 @@ app.post('/api/admin/admins', authenticate, requireRole('admin'), asyncHandler<A
 app.patch('/api/admin/users/:id/role', authenticate, requireRole('admin'), asyncHandler<AuthRequest>(async (req, res) => {
   const id = String(req.params.id);
   const schema = z.object({
-    role: z.enum(['student', 'teacher', 'admin', 'guardian']).optional(),
+    role: z.enum(['student', 'admin', 'guardian']).optional(),
     is_active: z.union([z.boolean(), z.number()]).optional(),
     confirmPassword: z.string().max(128).optional(),
     confirmGoogleToken: z.string().min(20).max(8192).optional(),

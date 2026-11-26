@@ -87,6 +87,7 @@ let teacherAppsCache: { value: TeacherApplicationRecord[]; expiresAt: number } |
 let guardianReqsCache: { value: GuardianRequestRecord[]; expiresAt: number } | null = null;
 let courseMetasCache: { value: Map<number, CourseMetaRecord>; expiresAt: number } | null = null;
 let lessonMetasCache: { value: Map<number, LessonMetaRecord>; expiresAt: number } | null = null;
+let teacherPhonesCache: { value: Map<number, string>; expiresAt: number } | null = null;
 const singleCourseMetaCache = new Map<number, { value: CourseMetaRecord | null; expiresAt: number }>();
 const singleLessonMetaCache = new Map<number, { value: LessonMetaRecord | null; expiresAt: number }>();
 
@@ -567,6 +568,44 @@ export async function listLessonMetas(sb: SupabaseClient): Promise<Map<number, L
   }
   lessonMetasCache = { value: result, expiresAt: Date.now() + VAULT_CACHE_TTL_MS };
   return result;
+}
+
+export async function saveTeacherPhone(sb: SupabaseClient, teacherId: number, phone: string): Promise<void> {
+  const cleanPhone = String(phone || '').trim();
+  await writeJsonToVault(sb, `teacher-phones/${teacherId}.json`, {
+    teacher_id: teacherId,
+    phone: cleanPhone,
+    updated_at: new Date().toISOString(),
+  });
+  teacherPhonesCache = null;
+}
+
+export async function listTeacherPhones(sb: SupabaseClient): Promise<Map<number, string>> {
+  if (teacherPhonesCache && Date.now() < teacherPhonesCache.expiresAt) {
+    return teacherPhonesCache.value;
+  }
+  const result = new Map<number, string>();
+  const files = await listAllVaultFiles(sb, 'teacher-phones');
+  if (!files.length) {
+    teacherPhonesCache = { value: result, expiresAt: Date.now() + VAULT_CACHE_TTL_MS };
+    return result;
+  }
+  const rows = await Promise.all(
+    files.map((f) => readJsonFromVault<{ teacher_id?: number; phone?: string }>(sb, `teacher-phones/${f.name}`))
+  );
+  for (const row of rows) {
+    if (row && typeof row.teacher_id === 'number') {
+      result.set(row.teacher_id, String(row.phone || '').trim());
+    }
+  }
+  teacherPhonesCache = { value: result, expiresAt: Date.now() + VAULT_CACHE_TTL_MS };
+  return result;
+}
+
+export async function deleteTeacherPhone(sb: SupabaseClient, teacherId: number): Promise<void> {
+  await ensureApplicationVaultBucket(sb);
+  await sb.storage.from(APPLICATION_VAULT_BUCKET).remove([`teacher-phones/${teacherId}.json`]).catch(() => {});
+  teacherPhonesCache = null;
 }
 
 /**

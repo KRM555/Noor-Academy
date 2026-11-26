@@ -24,7 +24,6 @@ export const queryKeys = {
   teacherDetail: (teacherId: number) => ['public', 'teachers', teacherId] as const,
   notifications: (userId?: string | number) => ['notifications', userId ?? 'anon'] as const,
   studentDashboard: (userId?: string | number) => ['dashboard', 'student', userId ?? 'anon'] as const,
-  teacherDashboard: (userId?: string | number) => ['dashboard', 'teacher', userId ?? 'anon'] as const,
   guardianDashboard: (userId?: string | number) => ['dashboard', 'guardian', userId ?? 'anon'] as const,
   adminSummary: (userId?: string | number) => ['admin', 'summary', userId ?? 'anon'] as const,
   adminList: (

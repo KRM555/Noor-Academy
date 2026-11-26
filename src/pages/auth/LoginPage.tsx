@@ -2,7 +2,6 @@ import React, { useEffect, useState } from 'react';
 import {
   LogIn,
   ShieldCheck,
-  UserCheck,
   GraduationCap,
   Heart,
   KeyRound,
@@ -28,7 +27,7 @@ import { TurnstileWidget } from '../../components/ui/TurnstileWidget';
 import type { AuthUser } from '../../types';
 import { Card, PrimaryButton, SecondaryButton, AcademyLogo } from '../../components/ui/CommonUI';
 
-type PortalChoice = 'student' | 'teacher' | 'guardian' | 'admin';
+type PortalChoice = 'student' | 'guardian' | 'admin';
 
 function GoogleMark() {
   return (
@@ -46,7 +45,7 @@ export function LoginPage({
   onNavigateAdmission,
 }: {
   onSuccess: () => void;
-  onNavigateAdmission?: (role?: 'student' | 'teacher') => void;
+  onNavigateAdmission?: (role?: 'student') => void;
 }) {
   const { lang, loginWithCredentials, setAuthSession, toast } = useApp();
   const [selectedPortal, setSelectedPortal] = useState<PortalChoice>('student');
@@ -210,7 +209,7 @@ export function LoginPage({
     }
     if (raw.includes('PORTAL_ROLE_MISMATCH')) {
       return lang === 'ar'
-        ? 'هذا الحساب لا ينتمي إلى البوابة المختارة. تأكد من اختيار الصفة الصحيحة (طالب · معلم · ولي أمر · إدارة).'
+        ? 'هذا الحساب لا ينتمي إلى البوابة المختارة. تأكد من اختيار الصفة الصحيحة (طالب · ولي أمر · إدارة).'
         : 'This account belongs to a different portal. Please select the matching role tab.';
     }
     if (raw.includes('GUARDIAN_PASSWORD_REQUIRED') || lower.includes('guardian portal requires')) {
@@ -496,7 +495,7 @@ export function LoginPage({
   };
 
   const portalOptions: Array<{
-    id: 'student' | 'teacher' | 'guardian';
+    id: 'student' | 'guardian';
     title_ar: string;
     title_en: string;
     desc_ar: string;
@@ -510,14 +509,6 @@ export function LoginPage({
       desc_ar: 'الحصص والاختبارات والشهادات',
       desc_en: 'Classes, exams & progress',
       icon: GraduationCap,
-    },
-    {
-      id: 'teacher',
-      title_ar: 'معلم',
-      title_en: 'Teacher',
-      desc_ar: 'إدارة الحلقات ورصد الدرجات',
-      desc_en: 'Circles, grading & attendance',
-      icon: UserCheck,
     },
     {
       id: 'guardian',
@@ -625,9 +616,9 @@ export function LoginPage({
           </p>
         </div>
 
-        {/* 3 Role Cards (Student · Teacher · Guardian) — crisp rectangles, zero pills */}
+        {/* 2 Role Cards (Student · Guardian) — crisp rectangles, zero pills */}
         {selectedPortal !== 'admin' && (
-          <div className="grid grid-cols-3 gap-2.5">
+          <div className="grid grid-cols-2 gap-2.5">
             {portalOptions.map((opt) => {
               const Icon = opt.icon;
               const active = selectedPortal === opt.id;
@@ -839,8 +830,6 @@ export function LoginPage({
                     ? lang === 'ar' ? 'جاري التحقق...' : 'Signing in...'
                     : selectedPortal === 'student'
                     ? lang === 'ar' ? 'دخول بوابة الطالب' : 'Sign In as Student'
-                    : selectedPortal === 'teacher'
-                    ? lang === 'ar' ? 'دخول بوابة المعلم' : 'Sign In as Teacher'
                     : selectedPortal === 'guardian'
                     ? lang === 'ar' ? 'دخول بوابة ولي الأمر' : 'Sign In as Guardian'
                     : lang === 'ar' ? 'دخول الإدارة' : 'Director Sign In'}
@@ -886,7 +875,6 @@ export function LoginPage({
               </form>
             )}
 
-            {/* New Applicant Callout for Student or Teacher */}
             {selectedPortal === 'student' && onNavigateAdmission && (
               <div className="p-3.5 rounded-xl border border-[#E5DEC9] dark:border-[#233C63] bg-[#FAF8F3] dark:bg-[#091529] flex flex-wrap items-center justify-between gap-2 text-xs">
                 <span className="text-slate-600 dark:text-slate-300 font-medium">
@@ -898,22 +886,6 @@ export function LoginPage({
                   className="inline-flex items-center gap-1 font-extrabold text-[#0F766E] dark:text-[#2DD4BF] hover:underline cursor-pointer"
                 >
                   <span>{lang === 'ar' ? 'قدّم طلب طالب واختر كلمة مرورك' : 'Apply as Student'}</span>
-                  <NavArrow className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            )}
-
-            {selectedPortal === 'teacher' && onNavigateAdmission && (
-              <div className="p-3.5 rounded-xl border border-[#E5DEC9] dark:border-[#233C63] bg-[#FAF8F3] dark:bg-[#091529] flex flex-wrap items-center justify-between gap-2 text-xs">
-                <span className="text-slate-600 dark:text-slate-300 font-medium">
-                  {lang === 'ar' ? 'معلم جديد وترغب بالانضمام لهيئة التدريس؟' : 'New teacher interested in joining?'}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => onNavigateAdmission('teacher')}
-                  className="inline-flex items-center gap-1 font-extrabold text-[#C98A1E] hover:underline cursor-pointer"
-                >
-                  <span>{lang === 'ar' ? 'قدّم طلب معلم جديد' : 'Apply as Teacher'}</span>
                   <NavArrow className="w-3.5 h-3.5" />
                 </button>
               </div>
@@ -998,24 +970,21 @@ export function LoginPage({
                       <PrimaryButton
                         type="button"
                         onClick={() => {
-                          const targetRole = selectedPortal === 'teacher' ? 'teacher' : 'student';
                           try {
                             sessionStorage.setItem(
                               'nb_google_prefill',
-                              JSON.stringify({ ...unregisteredGoogle, role: targetRole })
+                              JSON.stringify({ ...unregisteredGoogle, role: 'student' })
                             );
                           } catch {
                             // ignore
                           }
                           if (onNavigateAdmission) {
-                            onNavigateAdmission(targetRole);
+                            onNavigateAdmission('student');
                           }
                         }}
                       >
                         <span>
-                          {selectedPortal === 'teacher'
-                            ? lang === 'ar' ? 'تقديم طلب معلم جديد' : 'Apply as Teacher'
-                            : lang === 'ar' ? 'تقديم طلب التحاق طالب' : 'Apply as Student'}
+                          {lang === 'ar' ? 'تقديم طلب التحاق طالب' : 'Apply as Student'}
                         </span>
                       </PrimaryButton>
                     </div>
@@ -1218,7 +1187,7 @@ export function LoginPage({
               }}
               className="text-xs font-semibold text-[#0F766E] dark:text-[#2DD4BF] hover:underline cursor-pointer"
             >
-              {lang === 'ar' ? 'العودة لاختيار (طالب · معلم · ولي أمر)' : 'Back to Student · Teacher · Guardian'}
+              {lang === 'ar' ? 'العودة لاختيار (طالب · ولي أمر)' : 'Back to Student · Guardian'}
             </button>
           )}
         </div>

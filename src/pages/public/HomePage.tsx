@@ -41,7 +41,6 @@ import {
 } from '../../components/dashboard/MyCommunityPanel';
 
 import { getCourseImageUrl } from '../../lib/courseImages';
-import { formatCoursePriceSummary, type DisplayCurrency } from '../../lib/currency';
 
 const nightHeroImg = '/assets/images/hero_noor_night.webp';
 const CLIENT_BANNER_IMG = '/assets/images/academy_banner.webp';
@@ -115,7 +114,7 @@ export function HomePage({
   onNavigate: (path: string) => void;
   onLaunchGame: (slug: string) => void;
 }) {
-  const { lang, theme, toggleTheme, currency, setCurrency, user, toast } = useApp();
+  const { lang, theme, toggleTheme, user, toast } = useApp();
   const qc = useQueryClient();
   const t = dict[lang];
   const [openFaq, setOpenFaq] = useState<number | null>(0);
@@ -454,28 +453,6 @@ export function HomePage({
               <p className="text-sm sm:text-base text-slate-600 dark:text-slate-300">{t.coursesSubtitle}</p>
             </div>
             <div className="flex flex-wrap items-center gap-3 shrink-0">
-              <div className="inline-flex rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] p-1 text-xs font-bold">
-                {(
-                  [
-                    { id: 'BOTH', ar: 'ج.م + ر.س', en: 'EGP + SAR' },
-                    { id: 'EGP', ar: 'ج.م', en: 'EGP' },
-                    { id: 'SAR', ar: 'ر.س', en: 'SAR' },
-                  ] as Array<{ id: DisplayCurrency; ar: string; en: string }>
-                ).map((opt) => (
-                  <button
-                    key={opt.id}
-                    type="button"
-                    onClick={() => setCurrency(opt.id)}
-                    className={`px-2.5 py-1 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                      currency === opt.id
-                        ? 'bg-[#0F213E] text-white dark:bg-[#C98A1E]'
-                        : 'text-slate-600 dark:text-slate-300 hover:text-[#0F213E]'
-                    }`}
-                  >
-                    {lang === 'ar' ? opt.ar : opt.en}
-                  </button>
-                ))}
-              </div>
               <button
                 onClick={() => onNavigate('/courses')}
                 className="text-sm font-bold text-[#0F766E] dark:text-[#2DD4BF] hover:underline whitespace-nowrap shrink-0 cursor-pointer"
@@ -529,12 +506,11 @@ export function HomePage({
                     </div>
 
                     <div className="p-5 pt-4 mt-2 border-t border-[#EFEAD8] dark:border-[#1D355B] space-y-3">
-                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
-                        <span>{tField(course as unknown as Record<string, unknown>, 'schedule', lang)}</span>
-                        <span className="font-bold text-sm text-[#0F213E] dark:text-[#F8F5EC] tabular-nums">
-                          {formatCoursePriceSummary(course, lang, currency)}
-                        </span>
-                      </div>
+                      {tField(course as unknown as Record<string, unknown>, 'schedule', lang) && (
+                        <div className="text-xs text-slate-500 dark:text-slate-400">
+                          {tField(course as unknown as Record<string, unknown>, 'schedule', lang)}
+                        </div>
+                      )}
                       <div className="flex gap-2">
                         <button
                           onClick={() => onNavigate(`/courses/${course.id}`)}
@@ -838,8 +814,8 @@ export function HomePage({
             </div>
             <p className="text-xs text-slate-500 max-w-md mx-auto">
               {lang === 'ar'
-                ? 'لضمان المصداقية، تُتاح التعليقات للأعضاء المسجلين في الأكاديمية (الطلاب، أولياء الأمور، والمعلمين) فقط.'
-                : 'To guarantee authenticity, only registered students, guardians, and teachers can post reviews.'}
+                ? 'لضمان المصداقية، تُتاح التعليقات للأعضاء المسجلين في الأكاديمية (الطلاب وأولياء الأمور) فقط.'
+                : 'To guarantee authenticity, only registered students and guardians can post reviews.'}
             </p>
           </Card>
         ) : (

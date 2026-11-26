@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS public.teachers (
   qualifications_en TEXT NOT NULL,
   specialty_ar TEXT NOT NULL,
   specialty_en TEXT NOT NULL,
+  phone TEXT NOT NULL DEFAULT '',
   avatar_url TEXT NOT NULL,
   hourly_rate NUMERIC(10,2) NOT NULL DEFAULT 150,
   is_public BOOLEAN NOT NULL DEFAULT TRUE,
@@ -1150,3 +1151,13 @@ $$;
 
 REVOKE ALL ON FUNCTION public.get_admin_dashboard_summary() FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.get_admin_dashboard_summary() TO service_role;
+
+ALTER TABLE public.teachers
+  ADD COLUMN IF NOT EXISTS phone TEXT NOT NULL DEFAULT '';
+
+REVOKE SELECT ON public.teachers FROM PUBLIC, anon, authenticated;
+GRANT SELECT (
+  id, profile_id, name_ar, name_en, bio_ar, bio_en,
+  qualifications_ar, qualifications_en, specialty_ar, specialty_en,
+  avatar_url, hourly_rate, is_public, created_at, deleted_at
+) ON public.teachers TO anon, authenticated;

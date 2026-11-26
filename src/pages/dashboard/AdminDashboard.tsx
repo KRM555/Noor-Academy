@@ -53,7 +53,6 @@ import {
   waitForGoogleOAuthToken,
 } from '../../lib/supabase';
 import { PRESET_COURSE_COVERS, getCourseImageUrl } from '../../lib/courseImages';
-import { formatCoursePriceSummary, estimateSarFromEgp } from '../../lib/currency';
 import { compressImageFileToWebPDataUrl } from '../../lib/imageCompression';
 import { tField } from '../../i18n/translations';
 import {
@@ -143,11 +142,12 @@ interface AdminTeacherItem {
   id: number;
   name_ar: string;
   name_en: string;
+  phone?: string;
   specialty_ar: string;
   specialty_en?: string;
   qualifications_ar?: string;
   bio_ar?: string;
-  hourly_rate: number;
+  hourly_rate?: number;
   is_public?: boolean;
   is_admin?: boolean;
 }
@@ -237,19 +237,6 @@ interface AdminAdmissionItem {
   course_title_ar: string | null;
   level_name_ar: string | null;
   status: string;
-}
-
-interface AdminTeacherApplicationItem {
-  id: number;
-  email: string;
-  name_ar: string;
-  name_en: string;
-  phone: string;
-  specialty_ar: string;
-  qualifications_ar: string;
-  bio_ar: string;
-  status: 'pending' | 'approved' | 'rejected';
-  created_at: string;
 }
 
 interface AdminGuardianRequestItem {
@@ -519,7 +506,6 @@ export function AdminDashboard({
   const [debouncedAdmissionSearch, setDebouncedAdmissionSearch] = useState('');
   const [admissionFilter, setAdmissionFilter] = useState<'all' | 'pending' | 'approved' | 'rejected'>('all');
   const [admissionPage, setAdmissionPage] = useState(1);
-  const [teacherAppPage, setTeacherAppPage] = useState(1);
   const [guardianReqPage, setGuardianReqPage] = useState(1);
 
   const [announcementSearch, setAnnouncementSearch] = useState('');
@@ -565,8 +551,6 @@ export function AdminDashboard({
     level_id: string;
     teacher_id: string;
     schedule_ar: string;
-    price_monthly: string;
-    price_monthly_sar: string;
     capacity: string;
     is_featured: boolean;
     co_teacher_ids: number[];
@@ -654,17 +638,17 @@ export function AdminDashboard({
   const [teacherEdit, setTeacherEdit] = useState({
     name_ar: '',
     name_en: '',
+    phone: '',
     specialty_ar: '',
     qualifications_ar: '',
-    hourly_rate: '180',
     bio_ar: '',
     is_public: true,
   });
 
   // Create Form states
-  const [newCourse, setNewCourse] = useState({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '', schedule_ar: 'الإثنين · 5:00 م', price_monthly: '350', price_monthly_sar: '', capacity: '12' });
+  const [newCourse, setNewCourse] = useState({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '', schedule_ar: '', capacity: '12' });
   const [newStudent, setNewStudent] = useState({ email: '', full_name_ar: '', age: '8', level_id: '1', guardian_name: '', guardian_phone: '', guardian_email: '', course_id: '1' });
-  const [newTeacher, setNewTeacher] = useState({ email: '', name_ar: '', specialty_ar: 'نور البيان والقرآن', qualifications_ar: 'إجازة حفص', hourly_rate: '180' });
+  const [newTeacher, setNewTeacher] = useState({ name_ar: '', phone: '', specialty_ar: '' });
   const [enrollPair, setEnrollPair] = useState({ student_id: '1', course_id: '1' });
   const [newAnn, setNewAnn] = useState<{ title_ar: string; body_ar: string; target_scope: 'all_students' | 'course' | 'specific_students'; target_course_id: string; student_ids: number[] }>({
     title_ar: '',
@@ -736,7 +720,6 @@ export function AdminDashboard({
     const timer = window.setTimeout(() => {
       setDebouncedAdmissionSearch(admissionSearch.trim());
       setAdmissionPage(1);
-      setTeacherAppPage(1);
       setGuardianReqPage(1);
     }, 220);
     return () => window.clearTimeout(timer);
@@ -841,14 +824,6 @@ export function AdminDashboard({
     enabled: activeTab === 'admissions',
   });
 
-  const teacherAppsList = useAdminList<AdminTeacherApplicationItem>('teacher-applications', {
-    page: teacherAppPage,
-    limit: ADMIN_PAGE_LIMIT,
-    q: debouncedAdmissionSearch,
-    status: admissionFilter,
-    enabled: activeTab === 'admissions',
-  });
-
   const guardianReqsList = useAdminList<AdminGuardianRequestItem>('guardian-requests', {
     page: guardianReqPage,
     limit: ADMIN_PAGE_LIMIT,
@@ -909,7 +884,6 @@ export function AdminDashboard({
       coursesList.error ||
       courseWorkspaceQuery.error ||
       admissionsList.error ||
-      teacherAppsList.error ||
       guardianReqsList.error ||
       announcementsList.error ||
       examsList.error ||
@@ -928,7 +902,6 @@ export function AdminDashboard({
     coursesList.error,
     courseWorkspaceQuery.error,
     admissionsList.error,
-    teacherAppsList.error,
     guardianReqsList.error,
     announcementsList.error,
     examsList.error,
@@ -996,7 +969,6 @@ export function AdminDashboard({
         break;
       case 'admissions':
         void qc.invalidateQueries({ queryKey: queryKeys.adminList('admissions') });
-        void qc.invalidateQueries({ queryKey: queryKeys.adminList('teacher-applications') });
         void qc.invalidateQueries({ queryKey: queryKeys.adminList('guardian-requests') });
         void qc.invalidateQueries({ queryKey: queryKeys.adminList('students'), refetchType: 'none' });
         void qc.invalidateQueries({ queryKey: queryKeys.adminList('teachers'), refetchType: 'none' });
@@ -2065,18 +2037,15 @@ export function AdminDashboard({
     const createTeacher = async (e: React.FormEvent) => {
       e.preventDefault();
       try {
-        const res = await apiFetch<{ id: number; temporary_password?: string; linked_existing_admin?: boolean }>('/api/admin/teachers', { method: 'POST', body: JSON.stringify(newTeacher) });
+        await apiFetch<{ id: number }>('/api/admin/teachers', {
+          method: 'POST',
+          body: JSON.stringify(newTeacher),
+        });
         toast(
-          res.linked_existing_admin
-            ? lang === 'ar'
-              ? 'تم ربط حساب المدير بقائمة المعلمين مع الإبقاء على صلاحياته الإدارية الكاملة'
-              : 'Admin profile linked as teacher while preserving full admin access'
-            : lang === 'ar'
-            ? `تم إنشاء المعلم — كلمة المرور المؤقتة: ${res.temporary_password}`
-            : `Teacher created — Temp password: ${res.temporary_password}`,
+          lang === 'ar' ? 'تمت إضافة المعلم بنجاح' : 'Teacher added successfully',
           'success'
         );
-        setNewTeacher({ email: '', name_ar: '', specialty_ar: 'نور البيان والقرآن', qualifications_ar: 'إجازة حفص', hourly_rate: '180' });
+        setNewTeacher({ name_ar: '', phone: '', specialty_ar: '' });
         loadData();
       } catch (err: unknown) {
         toast(err instanceof Error ? err.message : 'Error', 'error');
@@ -2109,9 +2078,9 @@ export function AdminDashboard({
       setTeacherEdit({
         name_ar: t.name_ar || '',
         name_en: t.name_en || '',
+        phone: t.phone || '',
         specialty_ar: t.specialty_ar || '',
         qualifications_ar: t.qualifications_ar || '',
-        hourly_rate: String(t.hourly_rate || 180),
         bio_ar: t.bio_ar || '',
         is_public: t.is_public !== false,
       });
@@ -2123,10 +2092,7 @@ export function AdminDashboard({
       try {
         await apiFetch(`/api/admin/teachers/${editingTeacherId}`, {
           method: 'PATCH',
-          body: JSON.stringify({
-            ...teacherEdit,
-            hourly_rate: Number(teacherEdit.hourly_rate),
-          }),
+          body: JSON.stringify(teacherEdit),
         });
         toast(lang === 'ar' ? 'تم تحديث بيانات المعلم' : 'Teacher updated', 'success');
         setEditingTeacherId(null);
@@ -2177,12 +2143,33 @@ export function AdminDashboard({
 
         <Card className="p-6 space-y-4">
           <h2 className="text-lg font-extrabold">{lang === 'ar' ? 'إضافة معلم جديد (المدير فقط)' : 'Add Teacher (Admin Only)'}</h2>
-          <form onSubmit={createTeacher} className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-            <input placeholder={lang === 'ar' ? 'اسم المعلم' : 'Teacher Name'} value={newTeacher.name_ar} onChange={(e) => setNewTeacher({ ...newTeacher, name_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
-            <input type="email" placeholder={lang === 'ar' ? 'البريد الإلكتروني' : 'Email'} value={newTeacher.email} onChange={(e) => setNewTeacher({ ...newTeacher, email: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
-            <input placeholder={lang === 'ar' ? 'التخصص' : 'Specialty'} value={newTeacher.specialty_ar} onChange={(e) => setNewTeacher({ ...newTeacher, specialty_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
-            <input type="number" placeholder={lang === 'ar' ? 'الأجر/ساعة' : 'Rate/hr'} value={newTeacher.hourly_rate} onChange={(e) => setNewTeacher({ ...newTeacher, hourly_rate: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
-            <div className="sm:col-span-4"><PrimaryButton type="submit">{lang === 'ar' ? 'إنشاء معلم' : 'Create Teacher'}</PrimaryButton></div>
+          <form onSubmit={createTeacher} className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <input
+              placeholder={lang === 'ar' ? 'اسم المعلم *' : 'Teacher Name *'}
+              value={newTeacher.name_ar}
+              onChange={(e) => setNewTeacher({ ...newTeacher, name_ar: e.target.value })}
+              required
+              className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm"
+            />
+            <input
+              type="tel"
+              dir="ltr"
+              placeholder={lang === 'ar' ? 'رقم الهاتف *' : 'Phone Number *'}
+              value={newTeacher.phone}
+              onChange={(e) => setNewTeacher({ ...newTeacher, phone: e.target.value })}
+              required
+              className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm font-mono-tabular text-start"
+            />
+            <input
+              placeholder={lang === 'ar' ? 'المادة / التخصص *' : 'Subject / Specialty *'}
+              value={newTeacher.specialty_ar}
+              onChange={(e) => setNewTeacher({ ...newTeacher, specialty_ar: e.target.value })}
+              required
+              className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm"
+            />
+            <div className="sm:col-span-3">
+              <PrimaryButton type="submit">{lang === 'ar' ? 'إضافة معلم' : 'Add Teacher'}</PrimaryButton>
+            </div>
           </form>
         </Card>
 
@@ -2195,16 +2182,16 @@ export function AdminDashboard({
               </button>
             </div>
             <form onSubmit={saveTeacherEdit} className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <input placeholder={lang === 'ar' ? 'الاسم بالعربية' : 'Arabic Name'} value={teacherEdit.name_ar} onChange={(e) => setTeacherEdit({ ...teacherEdit, name_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
-              <input placeholder={lang === 'ar' ? 'الاسم بالإنجليزية' : 'English Name'} value={teacherEdit.name_en} onChange={(e) => setTeacherEdit({ ...teacherEdit, name_en: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
-              <input type="number" placeholder={lang === 'ar' ? 'الأجر/ساعة' : 'Hourly Rate'} value={teacherEdit.hourly_rate} onChange={(e) => setTeacherEdit({ ...teacherEdit, hourly_rate: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
-              <input placeholder={lang === 'ar' ? 'التخصص' : 'Specialty'} value={teacherEdit.specialty_ar} onChange={(e) => setTeacherEdit({ ...teacherEdit, specialty_ar: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
-              <input placeholder={lang === 'ar' ? 'المؤهلات والإجازات' : 'Qualifications'} value={teacherEdit.qualifications_ar} onChange={(e) => setTeacherEdit({ ...teacherEdit, qualifications_ar: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <input placeholder={lang === 'ar' ? 'اسم المعلم' : 'Teacher Name'} value={teacherEdit.name_ar} onChange={(e) => setTeacherEdit({ ...teacherEdit, name_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <input type="tel" dir="ltr" placeholder={lang === 'ar' ? 'رقم الهاتف' : 'Phone Number'} value={teacherEdit.phone} onChange={(e) => setTeacherEdit({ ...teacherEdit, phone: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm font-mono-tabular text-start" />
+              <input placeholder={lang === 'ar' ? 'المادة / التخصص' : 'Subject / Specialty'} value={teacherEdit.specialty_ar} onChange={(e) => setTeacherEdit({ ...teacherEdit, specialty_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <input placeholder={lang === 'ar' ? 'الاسم بالإنجليزية (اختياري)' : 'English Name (optional)'} value={teacherEdit.name_en} onChange={(e) => setTeacherEdit({ ...teacherEdit, name_en: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <input placeholder={lang === 'ar' ? 'المؤهلات (اختياري)' : 'Qualifications (optional)'} value={teacherEdit.qualifications_ar} onChange={(e) => setTeacherEdit({ ...teacherEdit, qualifications_ar: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
               <label className="inline-flex items-center gap-2 text-xs font-semibold cursor-pointer px-2">
                 <input type="checkbox" checked={teacherEdit.is_public} onChange={(e) => setTeacherEdit({ ...teacherEdit, is_public: e.target.checked })} />
                 <span>{lang === 'ar' ? 'ظاهر في صفحة المعلمين العامة' : 'Visible publicly'}</span>
               </label>
-              <textarea rows={2} placeholder={lang === 'ar' ? 'نبذة عن المعلم' : 'Bio'} value={teacherEdit.bio_ar} onChange={(e) => setTeacherEdit({ ...teacherEdit, bio_ar: e.target.value })} className="sm:col-span-3 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+              <textarea rows={2} placeholder={lang === 'ar' ? 'نبذة عن المعلم (اختياري)' : 'Bio (optional)'} value={teacherEdit.bio_ar} onChange={(e) => setTeacherEdit({ ...teacherEdit, bio_ar: e.target.value })} className="sm:col-span-3 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
               <div className="sm:col-span-3 flex gap-2">
                 <PrimaryButton type="submit">{lang === 'ar' ? 'حفظ التعديلات' : 'Save Teacher'}</PrimaryButton>
                 <SecondaryButton type="button" onClick={() => setEditingTeacherId(null)}>{lang === 'ar' ? 'إلغاء' : 'Cancel'}</SecondaryButton>
@@ -2216,7 +2203,7 @@ export function AdminDashboard({
         <AdminListSearchHeader
           search={teacherSearch}
           onSearchChange={setTeacherSearch}
-          searchPlaceholder={lang === 'ar' ? 'ابحث باسم المعلم أو التخصص...' : 'Search by teacher name or specialty...'}
+          searchPlaceholder={lang === 'ar' ? 'ابحث باسم المعلم أو رقم الهاتف أو المادة...' : 'Search by name, phone, or subject...'}
           total={teacherTotal}
           isFetching={teachersList.isFetching}
           lang={lang}
@@ -2243,8 +2230,16 @@ export function AdminDashboard({
                   </span>
                 ),
               },
-              { key: 'spec', header: lang === 'ar' ? 'التخصص' : 'Specialty', render: (r) => r.specialty_ar },
-              { key: 'rate', header: lang === 'ar' ? 'الأجر/ساعة' : 'Rate/hr', align: 'end', render: (r) => r.hourly_rate },
+              {
+                key: 'phone',
+                header: lang === 'ar' ? 'رقم الهاتف' : 'Phone',
+                render: (r) => (
+                  <span dir="ltr" className="font-mono-tabular text-xs">
+                    {r.phone || '—'}
+                  </span>
+                ),
+              },
+              { key: 'spec', header: lang === 'ar' ? 'المادة / التخصص' : 'Subject', render: (r) => r.specialty_ar || '—' },
               {
                 key: 'act',
                 header: '',
@@ -2299,11 +2294,6 @@ export function AdminDashboard({
         level_id: String(c.level_id || 1),
         teacher_id: c.teacher_id ? String(c.teacher_id) : '',
         schedule_ar: c.schedule_ar || '',
-        price_monthly: String(c.price_monthly ?? 0),
-        price_monthly_sar:
-          c.price_monthly_sar !== undefined && c.price_monthly_sar !== null
-            ? String(c.price_monthly_sar)
-            : '',
         capacity: String(c.capacity ?? 12),
         is_featured: Boolean(c.is_featured),
         co_teacher_ids: c.co_teacher_ids || [],
@@ -2380,11 +2370,6 @@ export function AdminDashboard({
               level_id: Number(courseEdit.level_id),
               teacher_id: courseEdit.teacher_id || null,
               schedule_ar: courseEdit.schedule_ar,
-              price_monthly: Number(courseEdit.price_monthly),
-              price_monthly_sar:
-                courseEdit.price_monthly_sar.trim() !== ''
-                  ? Number(courseEdit.price_monthly_sar)
-                  : null,
               capacity: Number(courseEdit.capacity),
               is_featured: courseEdit.is_featured,
               co_teacher_ids: courseEdit.co_teacher_ids.filter(
@@ -2397,7 +2382,7 @@ export function AdminDashboard({
             }),
           });
           setCourseEdit((prev) => (prev ? { ...prev, co_teacher_admin_ids: [] } : prev));
-          toast(lang === 'ar' ? 'تم حفظ تعديلات الكورس والسعر والمعلمين بنجاح' : 'Course settings updated', 'success');
+          toast(lang === 'ar' ? 'تم حفظ تعديلات الكورس والمعلمين بنجاح' : 'Course settings updated', 'success');
           loadData();
         } catch (err) {
           toast(err instanceof Error ? err.message : 'Error', 'error');
@@ -2786,11 +2771,6 @@ export function AdminDashboard({
                   </div>
                 </div>
               </div>
-              <div className="flex items-center gap-3 shrink-0">
-                <div className="text-xs sm:text-sm font-extrabold px-4 py-2 rounded-xl bg-[#FAF8F3] dark:bg-[#091529] border border-[#E5DEC9] dark:border-[#233C63] tabular-nums whitespace-nowrap">
-                  {formatCoursePriceSummary(selectedCourse, lang)}
-                </div>
-              </div>
             </div>
 
             {/* Hub Sub-Navigation Tabs */}
@@ -2813,7 +2793,7 @@ export function AdminDashboard({
                 },
                 {
                   id: 'settings' as const,
-                  label: lang === 'ar' ? 'الصورة والسعر والمعلمون' : 'Cover, Price & Teachers',
+                  label: lang === 'ar' ? 'الصورة والإعدادات والمعلمون' : 'Cover, Settings & Teachers',
                   icon: ImagePlus,
                 },
                 {
@@ -3531,7 +3511,7 @@ export function AdminDashboard({
               </Card>
 
               <Card className="p-6 space-y-5">
-                <h3 className="text-base font-extrabold">{lang === 'ar' ? 'السعر الشهري، البيانات، والمعلمون المسؤولون عن الكورس' : 'Pricing, Schedule & Responsible Teachers'}</h3>
+                <h3 className="text-base font-extrabold">{lang === 'ar' ? 'البيانات الأساسية والمعلمون المسؤولون عن الكورس' : 'Course Details & Responsible Teachers'}</h3>
                 <form onSubmit={saveCourseDetails} className="space-y-4">
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <div className="space-y-1">
@@ -3539,11 +3519,11 @@ export function AdminDashboard({
                       <input value={courseEdit.title_ar} onChange={(e) => setCourseEdit({ ...courseEdit, title_ar: e.target.value })} required className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
                     </div>
                     <div className="space-y-1">
-                      <label className="text-xs font-bold">{lang === 'ar' ? 'عنوان الكورس (إنجليزي)' : 'Title (EN)'}</label>
-                      <input value={courseEdit.title_en} onChange={(e) => setCourseEdit({ ...courseEdit, title_en: e.target.value })} required className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+                      <label className="text-xs font-bold">{lang === 'ar' ? 'عنوان الكورس (إنجليزي - اختياري)' : 'Title (EN - optional)'}</label>
+                      <input value={courseEdit.title_en} onChange={(e) => setCourseEdit({ ...courseEdit, title_en: e.target.value })} className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
                     </div>
                     <div className="space-y-1">
-                      <label className="text-xs font-bold">{lang === 'ar' ? 'المعلم الأساسي المسؤول' : 'Lead Teacher'}</label>
+                      <label className="text-xs font-bold">{lang === 'ar' ? 'المعلم الأساسي (اختياري)' : 'Lead Teacher (optional)'}</label>
                       <select value={courseEdit.teacher_id} onChange={(e) => setCourseEdit({ ...courseEdit, teacher_id: e.target.value })} className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
                         <option value="">{lang === 'ar' ? 'بدون معلم معيّن' : 'Unassigned'}</option>
                         {teacherOptions.map((t) => <option key={t.id} value={String(t.id)}>{t.label}</option>)}
@@ -3557,29 +3537,12 @@ export function AdminDashboard({
                       </select>
                     </div>
                     <div className="space-y-1">
-                      <label className="text-xs font-bold">{lang === 'ar' ? 'جدول المواعيد العام' : 'Schedule'}</label>
-                      <input value={courseEdit.schedule_ar} onChange={(e) => setCourseEdit({ ...courseEdit, schedule_ar: e.target.value })} required className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+                      <label className="text-xs font-bold">{lang === 'ar' ? 'جدول المواعيد (اختياري)' : 'Schedule (optional)'}</label>
+                      <input value={courseEdit.schedule_ar} onChange={(e) => setCourseEdit({ ...courseEdit, schedule_ar: e.target.value })} placeholder={lang === 'ar' ? 'اختياري' : 'Optional'} className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
                     </div>
-                    <div className="grid grid-cols-3 gap-2">
-                      <div className="space-y-1">
-                        <label className="text-xs font-bold">{lang === 'ar' ? 'السعر (جنيه)' : 'Price (EGP)'}</label>
-                        <input type="number" min={0} value={courseEdit.price_monthly} onChange={(e) => setCourseEdit({ ...courseEdit, price_monthly: e.target.value })} required className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
-                      </div>
-                      <div className="space-y-1">
-                        <label className="text-xs font-bold">{lang === 'ar' ? 'السعر (ريال)' : 'Price (SAR)'}</label>
-                        <input
-                          type="number"
-                          min={0}
-                          placeholder={String(estimateSarFromEgp(Number(courseEdit.price_monthly || 0)))}
-                          value={courseEdit.price_monthly_sar}
-                          onChange={(e) => setCourseEdit({ ...courseEdit, price_monthly_sar: e.target.value })}
-                          className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums"
-                        />
-                      </div>
-                      <div className="space-y-1">
-                        <label className="text-xs font-bold">{lang === 'ar' ? 'السعة القصوى' : 'Capacity'}</label>
-                        <input type="number" min={1} value={courseEdit.capacity} onChange={(e) => setCourseEdit({ ...courseEdit, capacity: e.target.value })} required className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
-                      </div>
+                    <div className="space-y-1">
+                      <label className="text-xs font-bold">{lang === 'ar' ? 'السعة القصوى' : 'Capacity'}</label>
+                      <input type="number" min={1} value={courseEdit.capacity} onChange={(e) => setCourseEdit({ ...courseEdit, capacity: e.target.value })} required className="w-full rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
                     </div>
                   </div>
 
@@ -3657,7 +3620,7 @@ export function AdminDashboard({
                   </div>
 
                   <div>
-                    <PrimaryButton type="submit">{lang === 'ar' ? 'حفظ السعر وتعديلات الكورس' : 'Save Course Changes'}</PrimaryButton>
+                    <PrimaryButton type="submit">{lang === 'ar' ? 'حفظ تعديلات الكورس' : 'Save Course Changes'}</PrimaryButton>
                   </div>
                 </form>
               </Card>
@@ -3727,10 +3690,8 @@ export function AdminDashboard({
           body: JSON.stringify({
             ...newCourse,
             teacher_id: newCourse.teacher_id || null,
-            price_monthly_sar:
-              newCourse.price_monthly_sar.trim() !== ''
-                ? Number(newCourse.price_monthly_sar)
-                : null,
+            price_monthly: 0,
+            price_monthly_sar: null,
             cover_url: newCourseCoverFile ? undefined : newCourseCoverUrl || undefined,
             co_teacher_ids: newCourseCoTeacherIds,
             co_teacher_admin_ids: newCourseCoTeacherAdminIds.filter(
@@ -3750,7 +3711,7 @@ export function AdminDashboard({
           });
         }
         toast(lang === 'ar' ? 'تم إنشاء الكورس وإضافته للصفحة الرئيسية بنجاح' : 'Course created & added to showcase', 'success');
-        setNewCourse({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '', schedule_ar: 'الإثنين · 5:00 م', price_monthly: '350', price_monthly_sar: '', capacity: '12' });
+        setNewCourse({ title_ar: '', title_en: '', description_ar: '', level_id: '1', teacher_id: '', schedule_ar: '', capacity: '12' });
         setNewCourseCoverUrl('');
         setNewCourseCoverFile(null);
         setNewCourseCoTeacherIds([]);
@@ -3776,8 +3737,8 @@ export function AdminDashboard({
             <h2 className="text-xl font-extrabold">{lang === 'ar' ? `كورساتي في الأكاديمية (${courseTotal})` : `My Academy Courses (${courseTotal})`}</h2>
             <p className="text-xs text-slate-500">
               {lang === 'ar'
-                ? 'اضغط على أي كورس لإضافة دروسه وروابطه وملفات الـ PDF ونشرها لطلاب الكورس، أو إضافة امتحاناته وتعديل السعر والصورة.'
-                : 'Select any course to manage lessons, PDFs, exams, cover image, price, and responsible teachers.'}
+                ? 'اضغط على أي كورس لإضافة دروسه وروابطه وملفات الـ PDF ونشرها لطلاب الكورس، أو إضافة امتحاناته وتعديل الصورة والمعلمين.'
+                : 'Select any course to manage lessons, PDFs, exams, cover image, and responsible teachers.'}
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -3787,8 +3748,8 @@ export function AdminDashboard({
               onClick={() =>
                 exportCsv(
                   'courses.csv',
-                  ['Title', 'Level', 'Teacher', 'Schedule', 'Monthly Price', 'Capacity'],
-                  courseItems.map((c) => [c.title_ar, c.level_name_ar, c.teacher_name_ar, c.schedule_ar, c.price_monthly, c.capacity])
+                  ['Title', 'Level', 'Teacher', 'Schedule', 'Capacity'],
+                  courseItems.map((c) => [c.title_ar, c.level_name_ar, c.teacher_name_ar, c.schedule_ar, c.capacity])
                 )
               }
             >
@@ -3804,7 +3765,7 @@ export function AdminDashboard({
 
         {showCreateCourseForm && (
           <Card className="p-6 space-y-4 border-2 border-[#C98A1E]/50">
-            <h3 className="text-base font-extrabold">{lang === 'ar' ? 'إضافة كورس جديد للأكاديمية (بالسعر والصورة)' : 'Create New Course'}</h3>
+            <h3 className="text-base font-extrabold">{lang === 'ar' ? 'إضافة كورس جديد للأكاديمية' : 'Create New Course'}</h3>
             <form onSubmit={createCourse} className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <input placeholder={lang === 'ar' ? 'عنوان الكورس *' : 'Course Title *'} value={newCourse.title_ar} onChange={(e) => setNewCourse({ ...newCourse, title_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
@@ -3812,17 +3773,13 @@ export function AdminDashboard({
                   {levelOptions.map((l) => <option key={l.id} value={l.id}>{l.name_ar}</option>)}
                 </select>
                 <select value={newCourse.teacher_id} onChange={(e) => setNewCourse({ ...newCourse, teacher_id: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm">
-                  <option value="">{lang === 'ar' ? 'بدون معلم معيّن' : 'Unassigned'}</option>
+                  <option value="">{lang === 'ar' ? 'بدون معلم معيّن (اختياري)' : 'Unassigned (optional)'}</option>
                   {teacherOptions.map((t) => <option key={t.id} value={String(t.id)}>{t.label}</option>)}
                   {unlinkedAdminOptions.map((a) => <option key={a.profile_id} value={`admin:${a.profile_id}`}>{a.label}</option>)}
                 </select>
-                <input placeholder={lang === 'ar' ? 'المواعيد (مثال: الإثنين والأربعاء 5 م)' : 'Schedule'} value={newCourse.schedule_ar} onChange={(e) => setNewCourse({ ...newCourse, schedule_ar: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
-                <div className="grid grid-cols-2 gap-2">
-                  <input type="number" min={0} placeholder={lang === 'ar' ? 'السعر (جنيه) *' : 'EGP *'} value={newCourse.price_monthly} onChange={(e) => setNewCourse({ ...newCourse, price_monthly: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
-                  <input type="number" min={0} placeholder={lang === 'ar' ? `السعر (ريال ≈ ${estimateSarFromEgp(Number(newCourse.price_monthly || 0))})` : 'SAR (opt)'} value={newCourse.price_monthly_sar} onChange={(e) => setNewCourse({ ...newCourse, price_monthly_sar: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
-                </div>
+                <input placeholder={lang === 'ar' ? 'المواعيد (اختياري)' : 'Schedule (optional)'} value={newCourse.schedule_ar} onChange={(e) => setNewCourse({ ...newCourse, schedule_ar: e.target.value })} className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
                 <input type="number" min={1} placeholder={lang === 'ar' ? 'السعة' : 'Capacity'} value={newCourse.capacity} onChange={(e) => setNewCourse({ ...newCourse, capacity: e.target.value })} required className="rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm tabular-nums" />
-                <input placeholder={lang === 'ar' ? 'وصف مختصر للكورس' : 'Course description'} value={newCourse.description_ar} onChange={(e) => setNewCourse({ ...newCourse, description_ar: e.target.value })} required className="sm:col-span-3 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
+                <input placeholder={lang === 'ar' ? 'وصف مختصر للكورس (اختياري)' : 'Course description (optional)'} value={newCourse.description_ar} onChange={(e) => setNewCourse({ ...newCourse, description_ar: e.target.value })} className="sm:col-span-3 rounded-xl border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#091529] px-3 py-2 text-sm" />
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start pt-2 border-t border-[#E5DEC9] dark:border-[#233C63]">
@@ -3947,9 +3904,6 @@ export function AdminDashboard({
                         className="w-full h-full object-cover"
                         fallbackTitle={c.title_ar}
                       />
-                      <div className="absolute bottom-2.5 start-2.5 rounded-lg bg-[#0F213E]/90 text-white px-2.5 py-1 text-[11px] font-extrabold tabular-nums">
-                        {formatCoursePriceSummary(c, lang)}
-                      </div>
                     </div>
                     <div className="p-4 space-y-2">
                       <h3 className="font-extrabold text-base leading-snug line-clamp-1">{c.title_ar}</h3>
@@ -3984,7 +3938,7 @@ export function AdminDashboard({
                       type="button"
                       onClick={() => openCourseWorkspace(c, 'settings')}
                       className="inline-flex items-center justify-center gap-1 rounded-xl px-2.5 py-2 text-xs font-bold border border-[#D6CDB4] dark:border-[#294A7D] hover:border-[#C98A1E] cursor-pointer"
-                      title={lang === 'ar' ? 'تعديل الصورة والسعر' : 'Edit Cover & Price'}
+                      title={lang === 'ar' ? 'تعديل الصورة والإعدادات' : 'Edit Cover & Settings'}
                     >
                       <Pencil className="w-3.5 h-3.5 text-[#C98A1E]" />
                     </button>
@@ -4292,28 +4246,6 @@ export function AdminDashboard({
       }
     };
 
-    const decideTeacherApp = async (id: number, decision: 'approved' | 'rejected') => {
-      try {
-        await apiFetch(`/api/admin/teacher-applications/${id}/decision`, {
-          method: 'POST',
-          body: JSON.stringify({ decision }),
-        });
-        toast(
-          decision === 'approved'
-            ? lang === 'ar'
-              ? 'تم قبول المعلم وتفعيل حسابه بصلاحيات المعلم'
-              : 'Teacher approved and portal activated'
-            : lang === 'ar'
-            ? 'تم رفض طلب المعلم'
-            : 'Teacher application rejected',
-          'success'
-        );
-        loadData();
-      } catch (err: unknown) {
-        toast(err instanceof Error ? err.message : 'Error', 'error');
-      }
-    };
-
     const decideGuardianRequest = async (id: number, decision: 'approved' | 'rejected') => {
       try {
         await apiFetch(`/api/admin/guardian-requests/${id}/decision`, {
@@ -4340,10 +4272,6 @@ export function AdminDashboard({
     const admissionTotal = admissionsList.data?.total ?? 0;
     const admissionTotalPages = admissionsList.data?.totalPages ?? 1;
 
-    const teacherAppItems = teacherAppsList.data?.items || [];
-    const teacherAppTotal = teacherAppsList.data?.total ?? 0;
-    const teacherAppTotalPages = teacherAppsList.data?.totalPages ?? 1;
-
     const guardianReqItems = guardianReqsList.data?.items || [];
     const guardianReqTotal = guardianReqsList.data?.total ?? 0;
     const guardianReqTotalPages = guardianReqsList.data?.totalPages ?? 1;
@@ -4351,7 +4279,7 @@ export function AdminDashboard({
     return (
       <div className="space-y-6">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-xl font-extrabold">{lang === 'ar' ? 'طلبات التقديم (طلاب ومعلمون وأولياء أمور)' : 'Applications (Students, Teachers & Guardians)'}</h2>
+          <h2 className="text-xl font-extrabold">{lang === 'ar' ? 'طلبات التقديم (طلاب وأولياء أمور)' : 'Applications (Students & Guardians)'}</h2>
           <SecondaryButton
             type="button"
             className="text-xs"
@@ -4377,7 +4305,6 @@ export function AdminDashboard({
                 onClick={() => {
                   setAdmissionFilter(st);
                   setAdmissionPage(1);
-                  setTeacherAppPage(1);
                   setGuardianReqPage(1);
                 }}
                 className={`px-3 py-1.5 rounded-xl text-xs font-bold border cursor-pointer ${
@@ -4471,74 +4398,6 @@ export function AdminDashboard({
             limit={ADMIN_PAGE_LIMIT}
             isFetching={admissionsList.isFetching}
             onPageChange={setAdmissionPage}
-            lang={lang}
-          />
-        </div>
-
-        <div className="space-y-3 pt-2">
-          <div className="flex items-center justify-between gap-2">
-            <h3 className="text-base font-extrabold">{lang === 'ar' ? 'طلبات انضمام المعلمين' : 'Teacher Faculty Applications'}</h3>
-            <span className="text-xs font-bold text-slate-500 tabular-nums">
-              {teacherAppTotal} {lang === 'ar' ? 'طلب' : 'requests'}
-            </span>
-          </div>
-          {teacherAppsList.isLoading && !teacherAppsList.data ? (
-            <AdminTableSkeleton rows={4} />
-          ) : (
-            <ResponsiveTable
-              data={teacherAppItems}
-              emptyTitle={lang === 'ar' ? 'لا توجد طلبات معلمين' : 'No teacher applications'}
-              columns={[
-                {
-                  key: 'teacher',
-                  header: lang === 'ar' ? 'المعلم' : 'Applicant',
-                  render: (r) => (
-                    <div className="text-xs">
-                      <div className="font-bold">{r.name_ar}</div>
-                      <div className="text-[#0F766E] dark:text-[#2DD4BF] font-mono-tabular">{r.email}</div>
-                      <div className="text-slate-500 font-mono-tabular">{r.phone}</div>
-                    </div>
-                  ),
-                },
-                {
-                  key: 'specialty',
-                  header: lang === 'ar' ? 'التخصص والمؤهل' : 'Specialty & Qualifications',
-                  render: (r) => (
-                    <div className="text-xs max-w-xs">
-                      <div className="font-semibold">{r.specialty_ar}</div>
-                      <div className="text-slate-500">{r.qualifications_ar}</div>
-                    </div>
-                  ),
-                },
-                { key: 'status', header: lang === 'ar' ? 'الحالة' : 'Status', render: (r) => r.status },
-                {
-                  key: 'act',
-                  header: lang === 'ar' ? 'القرار' : 'Action',
-                  align: 'end',
-                  render: (r) =>
-                    r.status === 'pending' ? (
-                      <div className="inline-flex gap-2">
-                        <button onClick={() => decideTeacherApp(r.id, 'approved')} className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-bold bg-[#0F766E] text-white cursor-pointer">
-                          <CheckCircle2 className="w-3.5 h-3.5" /> {lang === 'ar' ? 'اعتماد معلم' : 'Approve'}
-                        </button>
-                        <button onClick={() => decideTeacherApp(r.id, 'rejected')} className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-bold bg-red-700 text-white cursor-pointer">
-                          <XCircle className="w-3.5 h-3.5" /> {lang === 'ar' ? 'رفض' : 'Reject'}
-                        </button>
-                      </div>
-                    ) : (
-                      <span>—</span>
-                    ),
-                },
-              ]}
-            />
-          )}
-          <AdminListPagination
-            page={teacherAppPage}
-            totalPages={teacherAppTotalPages}
-            total={teacherAppTotal}
-            limit={ADMIN_PAGE_LIMIT}
-            isFetching={teacherAppsList.isFetching}
-            onPageChange={setTeacherAppPage}
             lang={lang}
           />
         </div>
@@ -5217,7 +5076,7 @@ export function AdminDashboard({
   const profileTotal = profilesList.data?.total ?? 0;
   const profileTotalPages = profilesList.data?.totalPages ?? 1;
 
-  const changeRole = async (userId: string | number, role: 'student' | 'teacher' | 'admin' | 'guardian') => {
+  const changeRole = async (userId: string | number, role: 'student' | 'admin' | 'guardian') => {
     try {
       await runWithAdminReauth(
         {
@@ -5386,11 +5245,15 @@ export function AdminDashboard({
                 <select
                   value={r.role}
                   disabled={String(r.id) === String(user?.id)}
-                  onChange={(e) => changeRole(r.id, e.target.value as 'student' | 'teacher' | 'admin' | 'guardian')}
+                  onChange={(e) => changeRole(r.id, e.target.value as 'student' | 'admin' | 'guardian')}
                   className="rounded-lg border border-[#D6CDB4] dark:border-[#294A7D] bg-[#FAF8F3] dark:bg-[#13284A] px-2.5 py-1 text-xs font-bold disabled:opacity-60"
                 >
+                  {r.role === 'teacher' && (
+                    <option value="teacher" disabled>
+                      teacher (disabled)
+                    </option>
+                  )}
                   <option value="student">student</option>
-                  <option value="teacher">teacher</option>
                   <option value="admin">admin</option>
                   <option value="guardian">guardian</option>
                 </select>
